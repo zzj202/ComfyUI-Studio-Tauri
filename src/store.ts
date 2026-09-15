@@ -224,8 +224,52 @@ export async function init() {
   }
   await checkConnection()
   connectWs()
+  void restoreQueueFromServer()
   pollProcStatus()
   state.ready = true
+}
+
+/**
+ * 刷新/重启后从 ComfyUI /queue 恢复还没跑完的任务（真相源在服务端，本地不存队列）。
+ * 恢复成队列条目后，实时进度继续由 WebSocket 推送驱动，完成时照常落资产 + 弹通知。
+ * 工作流名取提交时写进 extra_data 的 workflow_name；旧任务没有则显示占位。
+ */
+async function restoreQueueFromServer() {
+  if (!state.settings.baseUrl) return
+  try {
+    const q = await api.queue(state.settings.baseUrl)
+    const runningRows: any[] = Array.isArray(q?.queue_running) ? q.queue_running : []
+    const pendingRows: any[] = Array.isArray(q?.queue_pending) ? q.queue_pending : []
+    let restored = 0
+    for (const [rows, status] of [
+      [runningRows, 'running'],
+      [pendingRows, 'queued'],
+    ] as const) {
+      for (const row of rows) {
+        // 行结构：[number, prompt_id, prompt, extra_data, outputs_to_execute]
+        const promptId = row?.[1]
+        if (!promptId || typeof promptId !== 'string') continue
+        if (state.jobs.some((j) => j.promptId === promptId)) continue
+        const graph = row?.[2]
+        const nodeCount = graph && typeof graph === 'object' ? Object.keys(graph).length : 0
+        state.jobs.unshift({
+          promptId,
+          workflow: String(row?.[3]?.workflow_name ?? '刷新前的任务'),
+          status,
+          value: 0,
+          max: nodeCount,
+          startedAt: Date.now(),
+          outputs: [],
+        })
+        restored++
+      }
+    }
+    if (restored) {
+      notify(`已恢复队列里 ${restored} 个未完成任务，进度继续跟踪`, 'info', 6000)
+    }
+  } catch {
+    /* 服务器不可达时静默跳过 */
+  }
 }
 
 export async function loadWorkflows() {
@@ -610,7 +654,19 @@ export function submit(batch = 1) {
   const reroll = activeChains > 0
   activeChains++
   state.busy = true
-  void runChain(total, count, multi?.key, imgs, reroll)
+  // 按下提交这一刻的参数快照：随任务挂到每个产出上，供灯箱「载入参数」一键回填
+  const paramsSnapshot = collectParamsSnapshot()
+  void runChain(total, count, multi?.key, imgs, reroll, paramsSnapshot)
+}
+
+/** 当前表单全部字段值收成普通对象（JSON 可序列化，可塞进资产持久化） */
+function collectParamsSnapshot(): Record<string, any> | undefined {
+  if (!state.fields.length) return undefined
+  const o: Record<string, any> = {}
+  for (const f of state.fields) {
+    o[f.key] = Array.isArray(f.value) ? [...f.value] : f.value
+  }
+  return o
 }
 
 /** 一条提交链的执行体：busy 由链生命周期管理，计数归零才复位 */
@@ -619,7 +675,8 @@ async function runChain(
   count: number,
   multiKey: string | undefined,
   imgs: string[],
-  reroll: boolean
+  reroll: boolean,
+  params?: Record<string, any>
 ) {
   let ok = 0
   const ids: string[] = []
@@ -631,7 +688,7 @@ async function runChain(
       const graph = applyValues(state.graph, values)
       // 第 1 个任务沿用表单上的种子（可复现）；其余每个都全量换新种子，整批不重样
       if (i > 0 || reroll) randomizeHiddenSeeds(graph)
-      const res = await api.submit(state.settings.baseUrl, graph)
+      const res = await api.submit(state.settings.baseUrl, graph, state.currentWorkflow ?? undefined)
       const err = extractSubmitError(res, graph)
       if (err) {
         notify(err, 'error', 12000)
@@ -646,6 +703,7 @@ async function runChain(
         max: 0,
         startedAt: Date.now(),
         outputs: [],
+        params,
       })
       if (state.jobs.length > 50) state.jobs.length = 50
       ids.push(res.prompt_id)
@@ -727,6 +785,7 @@ function addAssets(job: Job) {
       createdAt: Date.now(),
       read: false,
       pinned: false,
+      params: job.params,
     })
     added++
   }
@@ -755,11 +814,12 @@ function restoreAssets() {
 
 /** 清空资产：固定的保留 */
 export function clearAssets() {
-  const kept = state.assets.filter((a) => a.pinned)
+  // 未读（还没看过的新产出）和固定的都不清，只清已看过的
+  const kept = state.assets.filter((a) => a.pinned || !a.read)
   const removed = state.assets.length - kept.length
   state.assets = kept
   persistAssets()
-  if (removed) notify(`已清空 ${removed} 个资产（固定的保留）`, 'ok', 3000)
+  if (removed) notify(`已清空 ${removed} 个资产（未读、固定的保留）`, 'ok', 3000)
 }
 
 export function togglePinAsset(a: Asset) {
@@ -773,6 +833,31 @@ export function renameAsset(a: Asset, alias: string) {
   if (name) a.alias = name
   else delete a.alias
   persistAssets()
+}
+
+/**
+ * 把资产保存的参数快照回填到当前表单（key 相同的字段才命中，跨工作流也能命中同名输入）。
+ * 命中后立即收进持久化缓存——缓存只在 buildFields 同步，直接改 f.value 不落盘的话
+ * 400ms 防抖前刷新就会丢（阶段 18 的教训）。
+ */
+export function applyAssetParams(a: Asset) {
+  if (!a.params) {
+    notify('该资产没有参数快照（旧版本产出的）', 'warn')
+    return
+  }
+  let n = 0
+  for (const f of state.fields) {
+    const v = a.params[f.key]
+    if (v === undefined) continue
+    f.value = Array.isArray(v) ? [...v] : v
+    n++
+  }
+  snapshotFieldValues()
+  if (n) {
+    notify(`已载入「${a.alias || a.filename}」的参数（命中 ${n} 项）`, 'ok', 4000)
+  } else {
+    notify('当前表单没有匹配的字段（工作流可能不同）', 'warn', 5000)
+  }
 }
 
 /** 在放大预览里看过 → 已读 */

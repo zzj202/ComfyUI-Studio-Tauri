@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 import { api } from '../api/tauri'
 import { open } from '@tauri-apps/plugin-dialog'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -11,8 +11,14 @@ function onDropZone(item: { asset?: any; path?: string }) {
   if (item.asset) openAssetWorkflow(item.asset)
   else if (item.path) ui.assetInspect = item.path
 }
-onMounted(() => dropZones.set('workflow-panel', onDropZone))
+onMounted(() => {
+  dropZones.set('workflow-panel', onDropZone)
+  // 便携模式：数据根目录跟随程序所在位置，动态显示真实路径
+  api.appDataDir().then((d) => (dataDir.value = d)).catch(() => {})
+})
 onUnmounted(() => dropZones.delete('workflow-panel'))
+
+const dataDir = ref('')
 
 async function importWorkflow() {
   const picked = await open({
@@ -102,8 +108,9 @@ async function openDir() {
 
     <footer class="foot">
       <span class="faint">
-        工作流与模板保存在
-        <code>%APPDATA%\ComfyUI Studio</code>
+        工作流与模板保存在程序旁
+        <code :title="dataDir">{{ dataDir || 'data\\' }}</code>
+        （便携模式：整个程序文件夹拷走数据跟着走）
       </span>
     </footer>
   </section>

@@ -9,3 +9,6 @@ src-tauri/gen/schemas/
 
 # WorkBuddy 本地记忆（不上传）
 .workbuddy/
+
+# 便携数据目录（用户工作流/模板/设置/WebView 数据）
+data/

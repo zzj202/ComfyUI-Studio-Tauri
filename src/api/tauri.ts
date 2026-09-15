@@ -62,7 +62,8 @@ export const api = {
   interrupt: (base: string) => invoke<any>('comfy_interrupt', { base }),
   free: (base: string, unload?: boolean) =>
     invoke<any>('comfy_free', { base, unload: unload ?? null }),
-  submit: (base: string, graph: any) => invoke<any>('comfy_submit', { base, graph }),
+  submit: (base: string, graph: any, workflowName?: string) =>
+    invoke<any>('comfy_submit', { base, graph, workflowName: workflowName ?? null }),
   uploadImage: (
     base: string,
     path: string,

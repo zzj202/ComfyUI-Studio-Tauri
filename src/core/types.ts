@@ -102,6 +102,8 @@ export interface Job {
   finishedAt?: number
   error?: string
   outputs: OutputItem[]
+  /** 提交时的参数快照（key → 字段值），完成时随产出写入资产 */
+  params?: Record<string, any>
 }
 
 export interface OutputItem {
@@ -129,4 +131,6 @@ export interface Asset {
   pinned: boolean
   /** 本地重命名的显示名；空 = 用原始文件名 */
   alias?: string
+  /** 提交时的参数快照（key → 字段值），灯箱「载入参数」一键回填表单用 */
+  params?: Record<string, any>
 }

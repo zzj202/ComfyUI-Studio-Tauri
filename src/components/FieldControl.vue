@@ -430,7 +430,14 @@ if (props.field.kind === 'image') loadImageOptions()
     </label>
 
     <!-- 单图：缩略图卡片 + 服务器文件选择；缩略卡也是拖拽上传 / Ctrl+V 粘贴的落点 -->
-    <div v-else-if="field.kind === 'image'" class="img-card" :data-image-key="field.key" tabindex="0" @paste="onCardPaste">
+    <div
+      v-else-if="field.kind === 'image'"
+      class="img-card"
+      :data-image-key="field.key"
+      tabindex="0"
+      title="可把图片文件直接拖到卡片上；点卡片后按 Ctrl+V 也能粘贴"
+      @paste="onCardPaste"
+    >
       <button
         class="thumb"
         :title="uploading ? '上传中…' : '点击上传，或直接把图片拖到这张卡片上'"
@@ -468,8 +475,7 @@ if (props.field.kind === 'image') loadImageOptions()
             📋 粘贴
           </button>
           <button class="btn sm ghost" title="清空已选的参考图" @click="clearImages">⌫ 清空</button>
-          <button class="btn sm ghost" @click="refreshImages">刷新列表</button>
-          <span class="drag-hint">可拖图片文件到卡片，或点卡片后按 Ctrl+V</span>
+          <button class="btn sm ghost" title="重新拉取服务器图片列表" @click="refreshImages">⟳</button>
         </div>
       </div>
     </div>
@@ -629,14 +635,17 @@ if (props.field.kind === 'image') loadImageOptions()
   gap: 6px;
   min-width: 0;
 }
+/* 下拉/输入框统一撑满右侧列，长文件名不再把控件撑溢出 */
+.img-side > .select,
+.img-side > .input {
+  width: 100%;
+  min-width: 0;
+}
 .img-btns {
   display: flex;
   align-items: center;
-  gap: 8px;
-}
-.drag-hint {
-  font-size: 11px;
-  color: var(--text-faint);
+  flex-wrap: wrap;
+  gap: 6px 8px;
 }
 
 /* 多图节点 */

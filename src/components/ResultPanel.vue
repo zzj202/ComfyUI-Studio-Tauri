@@ -5,6 +5,7 @@ import { downloadDir } from '@tauri-apps/api/path'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import type { Asset, Job } from '../core/types'
 import {
+  applyAssetParams,
   beginDrag,
   clearAssets,
   isDragClick,
@@ -186,20 +187,58 @@ function openLb(a: Asset) {
 
 function closeLb() {
   lightbox.value = -1
+  lbEditing.value = false
 }
 
 function stepLb(d: number) {
   const n = assets.value.length
   if (!n) return
   lightbox.value = (lightbox.value + d + n) % n
+  lbEditing.value = false
   markAssetRead(assets.value[lightbox.value])
+}
+
+// ---- 灯箱内重命名（确认后自动固定：起名保存 = 要收藏） ----
+const lbEditing = ref(false)
+const lbEditName = ref('')
+
+function startLbRename() {
+  const a = lbAsset.value
+  if (!a) return
+  lbEditName.value = a.alias ?? ''
+  lbEditing.value = true
+  nextTick(() => {
+    const el = document.getElementById('lb-rename') as HTMLInputElement | null
+    el?.focus()
+    el?.select()
+  })
+}
+
+function confirmLbRename() {
+  if (!lbEditing.value) return
+  const a = lbAsset.value
+  if (a) {
+    renameAsset(a, lbEditName.value)
+    if (!a.pinned) togglePinAsset(a)
+  }
+  lbEditing.value = false
+}
+
+/** 灯箱里移除当前资产（列表会自动跳到相邻项之前先关掉，行为明确） */
+function removeCurrent() {
+  const a = lbAsset.value
+  if (!a) return
+  removeAsset(a)
+  closeLb()
 }
 
 function onKey(e: KeyboardEvent) {
   if (lightbox.value < 0) return
-  if (e.key === 'Escape') closeLb()
-  else if (e.key === 'ArrowLeft') stepLb(-1)
-  else if (e.key === 'ArrowRight') stepLb(1)
+  if (lbEditing.value) return // 重命名输入中：键盘留给输入框（Esc 由输入框自己处理）
+  const k = e.key
+  if (k === 'Escape') closeLb()
+  else if (k === 'ArrowLeft' || k === 'a' || k === 'A') stepLb(-1)
+  else if (k === 'ArrowRight' || k === 'd' || k === 'D') stepLb(1)
 }
 
 // ---------------------------------------------------------------- 应用内拖拽 / 右键菜单
@@ -289,7 +328,9 @@ onUnmounted(() => {
           全部标为已读（{{ unreadCount }}）
         </button>
         <span class="spacer" />
-        <button class="btn sm" :disabled="!assets.length" @click="clearAssets">清空资产</button>
+        <button class="btn sm" :disabled="!assets.length" title="只清掉已看过的；未读和 📌 固定的保留" @click="clearAssets">
+          清空资产
+        </button>
       </header>
       <!-- 筛选条：工作流下拉 + 未读/收藏 chip；灯箱翻页跟随筛选结果 -->
       <div class="r-filter">
@@ -371,7 +412,7 @@ onUnmounted(() => {
 
     <!-- 放大预览：左右翻页 / 方向键 / Esc -->
     <div v-if="lbAsset" class="lightbox" @click.self="closeLb">
-      <button class="nav prev" title="上一张（←）" @click="stepLb(-1)">‹</button>
+      <button class="nav prev" title="上一张（← / A）" @click="stepLb(-1)">‹</button>
       <div class="stage" @click.self="closeLb">
         <video
           v-if="lbAsset.kind === 'video'"
@@ -384,19 +425,37 @@ onUnmounted(() => {
         />
         <img v-else :key="lbAsset.key" :src="assetUrl(lbAsset)" :alt="displayName(lbAsset)" />
       </div>
-      <button class="nav next" title="下一张（→）" @click="stepLb(1)">›</button>
+      <button class="nav next" title="下一张（→ / D）" @click="stepLb(1)">›</button>
       <footer class="lb-foot" @click.stop>
-        <span v-if="lbAsset.pinned" class="lb-pin">📌</span>
-        <span class="lb-name" :title="lbAsset.filename">{{ displayName(lbAsset) }}</span>
+        <template v-if="lbEditing">
+          <input
+            id="lb-rename"
+            v-model="lbEditName"
+            class="lb-rename"
+            placeholder="输入名称，回车确认"
+            @keydown.enter.prevent="confirmLbRename"
+            @keydown.esc.prevent="lbEditing = false"
+            @blur="confirmLbRename"
+          />
+        </template>
+        <template v-else>
+          <span v-if="lbAsset.pinned" class="lb-pin">📌</span>
+          <span class="lb-name" :title="lbAsset.filename">{{ displayName(lbAsset) }}</span>
+        </template>
         <span class="faint">{{ lightbox + 1 }} / {{ assets.length }}</span>
         <span class="spacer" />
+        <button v-if="lbAsset.params" class="btn sm" title="把这张图提交时的参数回填到左侧表单" @click="applyAssetParams(lbAsset)">
+          ⤴ 载入参数
+        </button>
         <button v-if="lbAsset.kind === 'image'" class="btn sm" @click="openAssetWorkflow(lbAsset)">
           打开工作流
         </button>
+        <button class="btn sm" @click="startLbRename">✎ 重命名</button>
         <button class="btn sm" @click="downloadOne(lbAsset)">下载</button>
         <button class="btn sm" :class="{ on: lbAsset.pinned }" @click="togglePinAsset(lbAsset)">
           {{ lbAsset.pinned ? '取消固定' : '固定' }}
         </button>
+        <button class="btn sm danger" @click="removeCurrent">移除</button>
         <button class="btn sm ghost" @click="closeLb">关闭</button>
       </footer>
     </div>
@@ -412,6 +471,7 @@ onUnmounted(() => {
       @contextmenu.prevent
     >
       <button class="ctx-item" @click="ctxRun(openLb)">🔍 打开预览</button>
+      <button class="ctx-item" @click="ctxRun(applyAssetParams)" title="把提交这张图时的参数回填到表单">⤴ 载入参数</button>
       <button class="ctx-item" @click="ctxRun(openAssetWorkflow)">📂 打开工作流</button>
       <button class="ctx-item" @click="ctxRun(downloadOne)">⬇ 下载到本地</button>
       <button class="ctx-item" @click="ctxRun(startRename)">✎ 重命名</button>
@@ -804,6 +864,15 @@ onUnmounted(() => {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.lb-rename {
+  width: 300px;
+  font-size: 12.5px;
+  padding: 4px 8px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
 }
 .btn.on {
   border-color: var(--accent);

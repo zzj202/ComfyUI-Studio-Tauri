@@ -16,8 +16,9 @@ export default defineConfig({
     host: host || false,
     hmr: host ? { protocol: 'ws', host, port: 1421 } : undefined,
     watch: {
-      // src-tauri 由 cargo 自己监听，交给 vite 会疯狂触发重编译
-      ignored: ['**/src-tauri/**'],
+      // src-tauri 由 cargo 自己监听，交给 vite 会疯狂触发重编译；
+      // data/ 是便携数据目录（webview 缓存会持续写入），忽略防止页面反复刷新
+      ignored: ['**/src-tauri/**', '**/data/**'],
     },
   },
 

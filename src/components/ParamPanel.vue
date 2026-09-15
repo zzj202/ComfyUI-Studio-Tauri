@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import FieldControl from './FieldControl.vue'
 import type { FieldSchema } from '../core/types'
 import { notify, randomizeSeeds, setActiveTemplate, state, submit, interrupt } from '../store'
@@ -72,8 +72,22 @@ const modeLabel = computed(() =>
   state.activeTemplate?.mode === 'custom' ? '定制模式' : '通用模式'
 )
 
-/** 批次数量：批次为 2 就是提交 2 次 */
+/** 批次数量：批次为 2 就是提交 2 次；选择持久化，刷新后保持上次的选择 */
+const BATCH_KEY = 'comfyui-studio.batch:v1'
 const batch = ref(1)
+try {
+  const saved = parseInt(localStorage.getItem(BATCH_KEY) ?? '', 10)
+  if (saved >= 1 && saved <= 10) batch.value = saved
+} catch {
+  /* 忽略读取失败 */
+}
+watch(batch, (v) => {
+  try {
+    localStorage.setItem(BATCH_KEY, String(v))
+  } catch {
+    /* 忽略写入失败 */
+  }
+})
 
 /** 多图字段当前已有的图片张数 */
 const multiCount = computed(() => {

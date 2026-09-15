@@ -1,20 +1,108 @@
 //! 应用数据持久化：设置 / 工作流 / 参数模板。
 //!
-//! 存放位置（Windows）：%APPDATA%\ComfyUI Studio\
+//! 存放位置（便携模式）：程序所在目录\data\
 //!   ├─ settings.json
 //!   ├─ workflows\   导入的 API 格式工作流
 //!   ├─ templates\   参数绑定模板（定制工作流）
-//!   └─ outputs\     默认导出目录
+//!   ├─ outputs\     默认导出目录
+//!   ├─ assets-tmp\  粘贴/上传的临时图片
+//!   └─ webview\     WebView2 用户数据（资产、已填参数、主题等 localStorage）
+//! 整个 data\ 拷走即完成迁移；开发模式下 data\ 在项目根目录。
+//! 首次运行时自动把旧版 %APPDATA%\ComfyUI Studio 里的数据搬过来（原目录保留作备份）。
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use serde_json::{json, Value};
 use tauri::command;
 
+/// 便携数据根目录：exe 同级 data\；开发模式用项目根目录的 data\（exe 在 target 深处）
 pub fn app_root() -> Result<PathBuf, String> {
-    let base = dirs::data_dir().ok_or_else(|| "无法定位系统应用数据目录".to_string())?;
-    Ok(base.join("ComfyUI Studio"))
+    if cfg!(debug_assertions) {
+        // CARGO_MANIFEST_DIR = src-tauri\，取父目录 = 项目根
+        let project = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let base = project.parent().unwrap_or(&project);
+        return Ok(base.join("data"));
+    }
+    let exe = std::env::current_exe().map_err(|e| format!("无法定位程序目录：{}", e))?;
+    let dir = exe
+        .parent()
+        .ok_or_else(|| "无法定位程序目录".to_string())?
+        .to_path_buf();
+    Ok(dir.join("data"))
+}
+
+/// 旧版本的数据目录：%APPDATA%\ComfyUI Studio
+fn legacy_root() -> Option<PathBuf> {
+    dirs::data_dir().map(|d| d.join("ComfyUI Studio"))
+}
+
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)?.flatten() {
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else {
+            let _ = fs::copy(&from, &to);
+        }
+    }
+    Ok(())
+}
+
+/// 首次切换到便携目录时的一次性迁移（进程内只跑一次）：
+/// 1) 旧 AppData 的用户文件（settings/工作流/模板/输出/临时图）整体搬进 data\
+/// 2) settings.json 里指向旧 outputs\ 的默认导出目录改写为新位置
+/// 3) 旧 WebView2 数据（资产、已填参数、主题的 localStorage）拷进 data\webview\
+/// 旧目录原样保留作备份，不删除。
+pub fn migrate_from_legacy() {
+    static DONE: OnceLock<()> = OnceLock::new();
+    if DONE.set(()).is_err() {
+        return;
+    }
+    let Ok(root) = app_root() else { return };
+    let _ = fs::create_dir_all(&root);
+
+    // ---- 1. 文件数据 ----
+    if let Some(old) = legacy_root() {
+        if old != root && old.exists() && !root.join("settings.json").exists() {
+            let moved = fs::rename(&old, &root)
+                .or_else(|_| copy_dir_recursive(&old, &root))
+                .is_ok();
+            if moved {
+                eprintln!("已从 {} 迁移数据到 {}", old.display(), root.display());
+                // ---- 2. 修正 settings.json 里的默认导出目录指向 ----
+                let sf = root.join("settings.json");
+                if let Ok(text) = fs::read_to_string(&sf) {
+                    if let Ok(mut v) = serde_json::from_str::<Value>(&text) {
+                        let old_out = old.join("outputs").to_string_lossy().to_string();
+                        if v.get("outputDir").and_then(|s| s.as_str()) == Some(old_out.as_str()) {
+                            v["outputDir"] =
+                                json!(root.join("outputs").to_string_lossy().to_string());
+                            let _ = fs::write(
+                                &sf,
+                                serde_json::to_string_pretty(&v).unwrap_or_default(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ---- 3. WebView2 用户数据（localStorage：资产/字段值/主题等） ----
+    let webview_dir = root.join("webview");
+    if !webview_dir.join("EBWebView").exists() {
+        if let Some(local) = dirs::data_local_dir() {
+            // 旧默认位置：bundle identifier 命名的目录（内含 EBWebView）
+            let old_wv = local.join("com.studio.comfyui");
+            if old_wv.join("EBWebView").exists() {
+                let _ = copy_dir_recursive(&old_wv, &webview_dir);
+            }
+        }
+    }
 }
 
 fn ensure_dirs() -> Result<PathBuf, String> {

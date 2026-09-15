@@ -230,9 +230,18 @@ pub async fn comfy_free(base: String, unload: Option<bool>) -> Result<Value, Str
 /// 把原始响应（含 node_errors）整体回传，附带 `_ok` / `_http_status` 标记，
 /// 由前端统一翻译成人话。
 #[command]
-pub async fn comfy_submit(base: String, graph: Value) -> Result<Value, String> {
+pub async fn comfy_submit(
+    base: String,
+    graph: Value,
+    workflow_name: Option<String>,
+) -> Result<Value, String> {
     let url = join_url(&base, "/prompt");
-    let body = json!({ "prompt": graph, "client_id": "comfyui-studio" });
+    let mut body = json!({ "prompt": graph, "client_id": "comfyui-studio" });
+    // 工作流名放进 extra_data：ComfyUI 会原样保存并在 /queue 里带回来，
+    // 应用刷新后靠它把「刷新前提交的任务」恢复成带名字的队列条目
+    if let Some(name) = workflow_name {
+        body["extra_data"] = json!({ "workflow_name": name });
+    }
     let resp = client()
         .post(&url)
         .json(&body)
