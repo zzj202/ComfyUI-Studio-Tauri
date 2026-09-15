@@ -14,6 +14,19 @@ fn show_main(app: &tauri::AppHandle) {
     }
 }
 
+/// Alt+2 专用：隐藏或最小化 → 呼出；可见 → 最小化（呼出/最小化切换）
+fn toggle_main(app: &tauri::AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let minimized = w.is_minimized().unwrap_or(false);
+        let visible = w.is_visible().unwrap_or(false);
+        if minimized || !visible {
+            show_main(app);
+        } else {
+            let _ = w.minimize();
+        }
+    }
+}
+
 /// 桌面版 ComfyUI 工作流操作平台入口。
 ///
 /// 分层约定：
@@ -68,7 +81,7 @@ pub fn run() {
                     if event.state != ShortcutState::Pressed {
                         return;
                     }
-                    show_main(app);
+                    toggle_main(app);
                 }) {
                     eprintln!("注册 Alt+2 全局快捷键失败（可能被其他程序占用）：{e}");
                 }
