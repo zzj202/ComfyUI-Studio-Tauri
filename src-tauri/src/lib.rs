@@ -1,0 +1,87 @@
+mod asset;
+mod comfy;
+mod launcher;
+mod store;
+
+/// 桌面版 ComfyUI 工作流操作平台入口。
+///
+/// 分层约定：
+/// - `comfy`    : ComfyUI 原生 HTTP API 客户端（所有请求走 Rust，规避 WebView 跨域限制）
+/// - `launcher` : 本地 ComfyUI 进程探测 / 启动 / 停止 / 日志
+/// - `store`    : 应用数据目录下的设置、工作流、模板持久化
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_opener::init())
+        // 全局快捷键插件：setup 里的 app.global_shortcut() 依赖它先被 manage（否则启动即 panic）
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
+        // 系统通知（出图完成提醒，窗口在后台时用）
+        .plugin(tauri_plugin_notification::init())
+        .setup(|app| {
+            // Alt+2 全局热键：呼出 / 最小化主窗口（应用不在焦点时也能触发）。
+            // 注册失败（热键被其他程序占用）不阻塞启动，只打日志。
+            #[cfg(desktop)]
+            {
+                use tauri::Manager;
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+                if let Err(e) = app.global_shortcut().on_shortcut("Alt+2", |app, _s, event| {
+                    if event.state != ShortcutState::Pressed {
+                        return;
+                    }
+                    if let Some(w) = app.get_webview_window("main") {
+                        let minimized = w.is_minimized().unwrap_or(false);
+                        let visible = w.is_visible().unwrap_or(false);
+                        if minimized || !visible {
+                            let _ = w.unminimize();
+                            let _ = w.show();
+                            let _ = w.set_focus();
+                        } else {
+                            let _ = w.minimize();
+                        }
+                    }
+                }) {
+                    eprintln!("注册 Alt+2 全局快捷键失败（可能被其他程序占用）：{e}");
+                }
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![
+            // ---- 存储 ----
+            store::app_data_dir,
+            store::save_temp_bytes,
+            store::clipboard_file_paths,
+            store::get_settings,
+            store::save_settings,
+            store::list_workflows,
+            store::read_workflow,
+            store::save_workflow,
+            store::delete_workflow,
+            store::import_workflow,
+            store::list_templates,
+            store::save_template,
+            store::delete_template,
+            // ---- 资产（拖入产出图反查工作流） ----
+            asset::read_asset,
+            asset::import_asset_workflow,
+            // ---- ComfyUI 原生 API ----
+            comfy::comfy_system_stats,
+            comfy::comfy_object_info,
+            comfy::comfy_history,
+            comfy::comfy_history_item,
+            comfy::comfy_queue,
+            comfy::comfy_interrupt,
+            comfy::comfy_free,
+            comfy::comfy_submit,
+            comfy::comfy_upload_image,
+            comfy::comfy_copy_output_to_input,
+            comfy::comfy_save_output,
+            comfy::detect_local_comfy,
+            // ---- 本地进程 ----
+            launcher::start_comfy,
+            launcher::stop_comfy,
+            launcher::comfy_proc_status,
+            launcher::comfy_proc_logs,
+        ])
+        .run(tauri::generate_context!())
+        .expect("启动 Tauri 应用失败");
+}
