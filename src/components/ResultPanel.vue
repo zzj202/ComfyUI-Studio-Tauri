@@ -82,8 +82,36 @@ const assets = computed(() =>
 
 const unreadCount = computed(() => state.assets.filter((a) => !a.read).length)
 
+/**
+ * 预览地址缓存（key → { base, url }）。
+ * viewUrl 每次调用都带新时间戳参数，若模板直接绑定，组件每次重渲染
+ * （进度轮询 / 标已读 / 收藏切换…）src 都会变 → 视频图片全部重新加载 → 闪烁卡顿。
+ * 同一资产的 URL 只算一次；换 baseUrl 才重算（资产 key 含文件名，内容不会变）。
+ */
+const urlCache = new Map<string, { base: string; url: string }>()
+
 function assetUrl(a: Asset) {
-  return viewUrl(state.settings.baseUrl, a.filename, a.subfolder, a.type)
+  const base = state.settings.baseUrl
+  const hit = urlCache.get(a.key)
+  if (hit && hit.base === base) return hit.url
+  const url = viewUrl(base, a.filename, a.subfolder, a.type)
+  urlCache.set(a.key, { base, url })
+  return url
+}
+
+/** 网格视频默认只停在首帧（多视频同时循环解码会卡整机），悬停才播放 */
+function hoverPlay(e: Event) {
+  void (e.currentTarget as HTMLVideoElement | null)?.play().catch(() => {})
+}
+function hoverStop(e: Event) {
+  const v = e.currentTarget as HTMLVideoElement | null
+  if (!v) return
+  v.pause()
+  try {
+    v.currentTime = 0
+  } catch {
+    /* 元数据未就绪时忽略 */
+  }
 }
 
 function displayName(a: Asset) {
@@ -299,8 +327,11 @@ onUnmounted(() => {
                 :src="assetUrl(a)"
                 muted
                 loop
-                autoplay
                 playsinline
+                preload="metadata"
+                title="悬停播放"
+                @mouseenter="hoverPlay($event)"
+                @mouseleave="hoverStop($event)"
               />
               <img v-else :src="assetUrl(a)" :alt="displayName(a)" loading="lazy" />
               <span v-if="!a.read" class="unread-pill">未读</span>
