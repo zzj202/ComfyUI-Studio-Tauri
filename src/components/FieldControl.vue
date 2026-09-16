@@ -336,6 +336,55 @@ function clearText() {
   props.field.value = ''
 }
 
+// ---- 常用提示词快捷按钮：所有文本字段共用一份库，localStorage 持久化 ----
+
+const QUICK_KEY = 'comfyui-studio.quickPrompts:v1'
+
+function loadQuick(): string[] {
+  try {
+    const raw = localStorage.getItem(QUICK_KEY)
+    const arr = raw ? JSON.parse(raw) : null
+    return Array.isArray(arr) ? arr.map(String).filter(Boolean).slice(0, 60) : []
+  } catch {
+    return []
+  }
+}
+
+const quickPrompts = ref<string[]>(loadQuick())
+const quickAdding = ref(false)
+const quickInput = ref('')
+
+function saveQuick() {
+  localStorage.setItem(QUICK_KEY, JSON.stringify(quickPrompts.value))
+}
+
+function addQuick() {
+  const t = quickInput.value.trim()
+  if (!t) {
+    quickAdding.value = false
+    return
+  }
+  if (!quickPrompts.value.includes(t)) {
+    quickPrompts.value.push(t)
+    saveQuick()
+  }
+  quickInput.value = ''
+  quickAdding.value = false
+}
+
+function removeQuick(p: string) {
+  quickPrompts.value = quickPrompts.value.filter((x) => x !== p)
+  saveQuick()
+}
+
+/** 点常用短语：追加到当前值（逗号衔接），不覆盖已有内容 */
+function applyQuick(p: string) {
+  const cur = String(props.field.value ?? '').trim()
+  if (!cur) props.field.value = p
+  else if (/[,，;；\n]$/.test(cur)) props.field.value = cur + ' ' + p
+  else props.field.value = cur + ', ' + p
+}
+
 /** 交换对：A→B、B→A（单趟正则同时替换，避免互相污染） */
 function swapText() {
   const [a, b] = props.field.swap ?? []
@@ -515,6 +564,39 @@ if (props.field.kind === 'image') loadImageOptions()
     <!-- 兜底：单行文本 -->
     <input v-else v-model="field.value" class="input" :placeholder="field.placeholder || ''" />
 
+    <!-- 用户自定义常用提示词：点一下追加到输入框（所有文本字段共用一份库，悬停 chip 出 × 删除） -->
+    <div v-if="field.kind === 'textarea' || field.kind === 'text'" class="quick-row">
+      <button
+        v-for="p in quickPrompts"
+        :key="p"
+        class="chip quick"
+        :title="`追加「${p}」到输入框`"
+        @click="applyQuick(p)"
+      >
+        <span class="q-text">{{ p }}</span>
+        <span class="q-del" title="从常用列表删除" @click.stop="removeQuick(p)">×</span>
+      </button>
+      <button
+        v-if="!quickAdding"
+        class="chip quick-add"
+        title="把一段提示词存成常用按钮"
+        @click="quickAdding = true"
+      >
+        ＋ 常用
+      </button>
+      <span v-else class="quick-editor">
+        <input
+          v-model="quickInput"
+          class="input"
+          placeholder="输入常用提示词，回车保存"
+          @keydown.enter.prevent="addQuick"
+          @keydown.esc="quickAdding = false"
+        />
+        <button class="btn sm" @click="addQuick">保存</button>
+        <button class="btn sm ghost" @click="quickAdding = false">取消</button>
+      </span>
+    </div>
+
     <!-- 模板配置的预设值：点一下就填入 -->
     <div v-if="field.presets?.length" class="presets">
       <button v-for="p in field.presets" :key="p" class="chip" @click="applyPreset(p)">
@@ -547,6 +629,52 @@ if (props.field.kind === 'image') loadImageOptions()
   gap: 8px;
   cursor: pointer;
   color: var(--text-dim);
+}
+
+/* 常用提示词快捷按钮 */
+.quick-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+.chip.quick {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 240px;
+}
+.quick .q-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+}
+.quick .q-del {
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1;
+  padding: 0 2px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.quick:hover .q-del {
+  opacity: 1;
+}
+.quick .q-del:hover {
+  color: var(--err);
+}
+.chip.quick-add {
+  color: var(--text-faint);
+}
+.quick-editor {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.quick-editor .input {
+  width: 220px;
 }
 
 /* 文本工具条 */
