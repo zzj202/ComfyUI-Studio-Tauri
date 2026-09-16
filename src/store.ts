@@ -1,4 +1,4 @@
-import { reactive, watch } from 'vue'
+import { reactive, ref, watch } from 'vue'
 import { api } from './api/tauri'
 import { ComfyWs } from './api/comfyWs'
 import {
@@ -142,12 +142,9 @@ export function isDragClick(): boolean {
   return dragClickAt > 0
 }
 
-/** 把一份结果资产的工作流打开：优先输出目录直读，不行就下载到应用数据目录再解析 */
+/** 把一份结果资产的工作流打开：优先输出目录直读，不行就下载到应用数据目录再解析。
+ *  视频和图片走同一条链路——ComfyUI 的视频产物同样内嵌 API 图（Rust 侧二进制扫描能捞到） */
 export async function openAssetWorkflow(a: Asset) {
-  if (a.kind !== 'image') {
-    notify('只有图片里才内嵌工作流', 'warn')
-    return
-  }
   async function openImported(name: string) {
     await loadWorkflows()
     await selectWorkflow(name)
@@ -252,14 +249,21 @@ async function restoreQueueFromServer() {
         if (state.jobs.some((j) => j.promptId === promptId)) continue
         const graph = row?.[2]
         const nodeCount = graph && typeof graph === 'object' ? Object.keys(graph).length : 0
+        // 提交时随 extra_data 存的参数快照（有的话）：恢复的任务完成后，产出资产照样能「载入参数」
+        const extra = row?.[3]
+        const params =
+          extra && typeof extra === 'object' && extra.params && typeof extra.params === 'object'
+            ? (extra.params as Record<string, any>)
+            : undefined
         state.jobs.unshift({
           promptId,
-          workflow: String(row?.[3]?.workflow_name ?? '刷新前的任务'),
+          workflow: String(extra?.workflow_name ?? '刷新前的任务'),
           status,
           value: 0,
           max: nodeCount,
           startedAt: Date.now(),
           outputs: [],
+          params,
         })
         restored++
       }
@@ -630,12 +634,71 @@ let activeChains = 0
  * - 带「多图」节点时：外层循环图片、内层循环批次
  *   （2 张图 × 批次 2 → 图1×2 次 → 图2×2 次，共 4 个任务）
  */
-export function submit(batch = 1) {
+// ---- 提示词历史：最近提交过的文本字段值（去重置顶，全局一份，localStorage 持久化） ----
+
+const PROMPT_HIST_KEY = 'comfyui-studio.promptHistory:v1'
+const PROMPT_HIST_MAX = 50
+
+function loadPromptHistory(): string[] {
+  try {
+    const raw = localStorage.getItem(PROMPT_HIST_KEY)
+    const arr = raw ? JSON.parse(raw) : null
+    return Array.isArray(arr) ? arr.map(String).filter(Boolean).slice(0, PROMPT_HIST_MAX) : []
+  } catch {
+    return []
+  }
+}
+
+export const promptHistory = ref<string[]>(loadPromptHistory())
+
+/** 提交时调用：把当前所有文本字段的值收进历史（去重、最近优先） */
+export function recordPromptHistory() {
+  let changed = false
+  for (const f of state.fields) {
+    if ((f.kind === 'text' || f.kind === 'textarea') && typeof f.value === 'string') {
+      const t = f.value.trim()
+      if (!t) continue
+      const i = promptHistory.value.indexOf(t)
+      if (i > 0) promptHistory.value.splice(i, 1)
+      if (i !== 0) {
+        promptHistory.value.unshift(t)
+        changed = true
+      }
+    }
+  }
+  if (promptHistory.value.length > PROMPT_HIST_MAX) {
+    promptHistory.value.length = PROMPT_HIST_MAX
+    changed = true
+  }
+  if (changed) localStorage.setItem(PROMPT_HIST_KEY, JSON.stringify(promptHistory.value))
+}
+
+// ---- 批次数量：全局共享（提交按钮 / 一键粘贴提交等入口都用它），localStorage 持久化 ----
+
+const BATCH_KEY = 'comfyui-studio.batch:v1'
+
+export const submitBatch = ref(1)
+try {
+  const saved = parseInt(localStorage.getItem(BATCH_KEY) ?? '', 10)
+  if (saved >= 1 && saved <= 10) submitBatch.value = saved
+} catch {
+  /* 忽略读取失败 */
+}
+watch(submitBatch, (v) => {
+  try {
+    localStorage.setItem(BATCH_KEY, String(v))
+  } catch {
+    /* 忽略写入失败 */
+  }
+})
+
+export function submit(batch = submitBatch.value) {
   ensureAudio() // 用户手势时机预热 AudioContext（完成音效需要）
   if (!state.graph) {
     notify('请先选择一个工作流', 'warn')
     return
   }
+  recordPromptHistory() // 每次成功发起提交时记录本次用过的提示词
   const count = Math.max(1, Math.min(50, Math.floor(batch) || 1))
   const multi = state.fields.find((f) => f.kind === 'multiimage')
   const imgs = multi
@@ -688,7 +751,12 @@ async function runChain(
       const graph = applyValues(state.graph, values)
       // 第 1 个任务沿用表单上的种子（可复现）；其余每个都全量换新种子，整批不重样
       if (i > 0 || reroll) randomizeHiddenSeeds(graph)
-      const res = await api.submit(state.settings.baseUrl, graph, state.currentWorkflow ?? undefined)
+      const res = await api.submit(
+        state.settings.baseUrl,
+        graph,
+        state.currentWorkflow ?? undefined,
+        params ? JSON.stringify(params) : undefined
+      )
       const err = extractSubmitError(res, graph)
       if (err) {
         notify(err, 'error', 12000)

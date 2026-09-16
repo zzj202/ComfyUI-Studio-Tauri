@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import FieldControl from './FieldControl.vue'
 import type { FieldSchema } from '../core/types'
-import { notify, randomizeSeeds, setActiveTemplate, state, submit, interrupt } from '../store'
+import { notify, randomizeSeeds, setActiveTemplate, state, submit, submitBatch, interrupt } from '../store'
 import { ui } from '../ui'
 
 const collapsed = ref<Record<string, boolean>>({})
@@ -72,22 +72,7 @@ const modeLabel = computed(() =>
   state.activeTemplate?.mode === 'custom' ? '定制模式' : '通用模式'
 )
 
-/** 批次数量：批次为 2 就是提交 2 次；选择持久化，刷新后保持上次的选择 */
-const BATCH_KEY = 'comfyui-studio.batch:v1'
-const batch = ref(1)
-try {
-  const saved = parseInt(localStorage.getItem(BATCH_KEY) ?? '', 10)
-  if (saved >= 1 && saved <= 10) batch.value = saved
-} catch {
-  /* 忽略读取失败 */
-}
-watch(batch, (v) => {
-  try {
-    localStorage.setItem(BATCH_KEY, String(v))
-  } catch {
-    /* 忽略写入失败 */
-  }
-})
+/** 批次数量：存在 store 里全局共享并持久化（提交按钮 / 一键粘贴提交等入口共用） */
 
 /** 多图字段当前已有的图片张数 */
 const multiCount = computed(() => {
@@ -99,7 +84,7 @@ const multiCount = computed(() => {
 
 /** 本次提交总任务数：有图走 图数 × 批次，否则就是批次数 */
 const totalCount = computed(() =>
-  multiCount.value > 0 ? multiCount.value * batch.value : batch.value
+  multiCount.value > 0 ? multiCount.value * submitBatch.value : submitBatch.value
 )
 
 const submitLabel = computed(() =>
@@ -110,7 +95,7 @@ const submitLabel = computed(() =>
 function onKeydown(e: KeyboardEvent) {
   if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === 'Enter') {
     e.preventDefault()
-    if (state.currentWorkflow && state.fields.length) submit(batch.value)
+    if (state.currentWorkflow && state.fields.length) submit()
   }
 }
 onMounted(() => window.addEventListener('keydown', onKeydown))
@@ -185,7 +170,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       </div>
       <div class="right">
         <select
-          v-model.number="batch"
+          v-model.number="submitBatch"
           class="select batch-select"
           :disabled="!state.fields.length"
           title="批次数量：批次为 2 即提交 2 次（每次自动随机种子）"
@@ -198,7 +183,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           class="btn primary"
           :disabled="!state.fields.length"
           title="Ctrl+Enter 也可提交"
-          @click="submit(batch)"
+          @click="submit()"
         >
           {{ submitLabel }}
         </button>

@@ -234,13 +234,21 @@ pub async fn comfy_submit(
     base: String,
     graph: Value,
     workflow_name: Option<String>,
+    params_json: Option<String>,
 ) -> Result<Value, String> {
     let url = join_url(&base, "/prompt");
     let mut body = json!({ "prompt": graph, "client_id": "comfyui-studio" });
-    // 工作流名放进 extra_data：ComfyUI 会原样保存并在 /queue 里带回来，
-    // 应用刷新后靠它把「刷新前提交的任务」恢复成带名字的队列条目
-    if let Some(name) = workflow_name {
-        body["extra_data"] = json!({ "workflow_name": name });
+    // 工作流名 + 参数快照放进 extra_data：ComfyUI 会原样保存并在 /queue 里带回来，
+    // 应用刷新后恢复任务时既能拿到工作流名，也能拿到当时的表单参数（资产快照回填用）
+    if workflow_name.is_some() || params_json.is_some() {
+        let mut extra = json!({});
+        if let Some(n) = workflow_name {
+            extra["workflow_name"] = json!(n);
+        }
+        if let Some(p) = params_json {
+            extra["params"] = serde_json::from_str::<Value>(&p).unwrap_or(json!(null));
+        }
+        body["extra_data"] = extra;
     }
     let resp = client()
         .post(&url)

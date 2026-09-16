@@ -10,7 +10,7 @@ import {
   filesFromClipboardData,
 } from '../core/clipboard'
 import { open } from '@tauri-apps/plugin-dialog'
-import { assetDropTargets, imageDropTargets, notify, state } from '../store'
+import { assetDropTargets, imageDropTargets, notify, promptHistory, state, submit } from '../store'
 import { randomSeed } from '../core/parseWorkflow'
 
 const props = defineProps<{ field: FieldSchema }>()
@@ -336,6 +336,22 @@ function clearText() {
   props.field.value = ''
 }
 
+/** 一键粘贴提交：读剪贴板文本填入本框（覆盖），按面板上的批次设置立即提交 */
+async function pasteAndSubmit() {
+  try {
+    const t = await navigator.clipboard.readText()
+    if (!t || !t.trim()) {
+      notify('剪贴板里没有文本', 'warn', 3000)
+      return
+    }
+    props.field.value = t.trim()
+    submit()
+    notify('已粘贴并提交', 'ok', 2000)
+  } catch {
+    notify('读取剪贴板失败，可手动 Ctrl+V 后再提交', 'warn', 4000)
+  }
+}
+
 // ---- 常用提示词快捷按钮：所有文本字段共用一份库，localStorage 持久化 ----
 
 const QUICK_KEY = 'comfyui-studio.quickPrompts:v1'
@@ -385,6 +401,58 @@ function applyQuick(p: string) {
   else props.field.value = cur + ', ' + p
 }
 
+// ---- 提示词历史：输入框光标在最开头时按 ↑ 弹出最近提交过的提示词，选中即填入 ----
+
+const histOpen = ref(false)
+const histSel = ref(-1)
+
+/** 光标在文本最开头（含空输入）时 ↑ 才弹历史，平时 ↑ 移动光标不受影响 */
+function histCanOpen(el: HTMLTextAreaElement | HTMLInputElement): boolean {
+  const s = el.selectionStart ?? 0
+  const e = el.selectionEnd ?? s
+  return s === 0 && e === 0
+}
+
+function onTextKeydown(e: KeyboardEvent) {
+  const el = e.target as HTMLTextAreaElement
+  if (e.key === 'ArrowUp') {
+    if (histOpen.value || histCanOpen(el)) {
+      e.preventDefault()
+      if (!promptHistory.value.length) return
+      histOpen.value = true
+      histSel.value = -1
+    }
+  } else if (histOpen.value) {
+    if (e.key === 'ArrowDown') {
+      e.preventDefault()
+      histSel.value = Math.min(histSel.value + 1, promptHistory.value.length - 1)
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault()
+      histSel.value = Math.max(histSel.value - 1, 0)
+    } else if (e.key === 'Enter') {
+      e.preventDefault()
+      if (histSel.value >= 0) applyHistory(promptHistory.value[histSel.value])
+      else histOpen.value = false
+    } else if (e.key === 'Escape') {
+      histOpen.value = false
+    }
+  }
+}
+
+function applyHistory(t: string) {
+  props.field.value = t
+  histOpen.value = false
+  histSel.value = -1
+  nextTick(() => {
+    const el = ta.value
+    if (el) {
+      el.focus()
+      const end = String(props.field.value ?? '').length
+      el.setSelectionRange(end, end)
+    }
+  })
+}
+
 /** 交换对：A→B、B→A（单趟正则同时替换，避免互相污染） */
 function swapText() {
   const [a, b] = props.field.swap ?? []
@@ -430,14 +498,39 @@ if (props.field.kind === 'image') loadImageOptions()
         >
           ⇄ 交换
         </button>
+        <button
+          class="tbtn go"
+          title="读取剪贴板文本填入本框（覆盖现有内容），并按当前批次设置立即提交"
+          @click="pasteAndSubmit"
+        >
+          ⚡ 粘贴提交
+        </button>
       </div>
-      <textarea
-        ref="ta"
-        v-model="field.value"
-        class="textarea"
-        :placeholder="field.placeholder || field.label"
-        rows="7"
-      />
+      <div class="ta-wrap">
+        <textarea
+          ref="ta"
+          v-model="field.value"
+          class="textarea"
+          :placeholder="field.placeholder || field.label"
+          rows="7"
+          @keydown="onTextKeydown"
+          @input="histOpen = false"
+        />
+        <!-- 提示词历史下拉：↑ 唤出，选中即覆盖填入 -->
+        <div v-if="histOpen && promptHistory.length" class="prompt-hist" @mousedown.prevent>
+          <button
+            v-for="(h, i) in promptHistory"
+            :key="i"
+            class="ph-item"
+            :class="{ sel: i === histSel }"
+            :title="`填入这条历史（${i + 1}/${promptHistory.length}）`"
+            @click="applyHistory(h)"
+          >
+            <span class="ph-text">{{ h }}</span>
+          </button>
+          <div class="ph-hint">↑↓ 选择 · Enter 填入 · Esc 关闭</div>
+        </div>
+      </div>
     </template>
 
     <!-- 随机种子 -->
@@ -562,7 +655,28 @@ if (props.field.kind === 'image') loadImageOptions()
     </div>
 
     <!-- 兜底：单行文本 -->
-    <input v-else v-model="field.value" class="input" :placeholder="field.placeholder || ''" />
+    <div v-else class="ta-wrap">
+      <input
+        v-model="field.value"
+        class="input"
+        :placeholder="field.placeholder || ''"
+        @keydown="onTextKeydown"
+        @input="histOpen = false"
+      />
+      <div v-if="histOpen && promptHistory.length" class="prompt-hist" @mousedown.prevent>
+        <button
+          v-for="(h, i) in promptHistory"
+          :key="i"
+          class="ph-item"
+          :class="{ sel: i === histSel }"
+          :title="`填入这条历史（${i + 1}/${promptHistory.length}）`"
+          @click="applyHistory(h)"
+        >
+          <span class="ph-text">{{ h }}</span>
+        </button>
+        <div class="ph-hint">↑↓ 选择 · Enter 填入 · Esc 关闭</div>
+      </div>
+    </div>
 
     <!-- 用户自定义常用提示词：点一下追加到输入框（所有文本字段共用一份库，悬停 chip 出 × 删除） -->
     <div v-if="field.kind === 'textarea' || field.kind === 'text'" class="quick-row">
@@ -629,6 +743,56 @@ if (props.field.kind === 'image') loadImageOptions()
   gap: 8px;
   cursor: pointer;
   color: var(--text-dim);
+}
+
+/* 提示词历史下拉（相对输入框定位的浮层） */
+.ta-wrap {
+  position: relative;
+}
+.prompt-hist {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 100%;
+  margin-top: 4px;
+  z-index: 60;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  padding: 4px;
+}
+.ph-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 6px 8px;
+  border: 0;
+  border-radius: 4px;
+  background: none;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.ph-item:hover,
+.ph-item.sel {
+  background: var(--bg-3, var(--bg-1));
+}
+.ph-text {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ph-hint {
+  padding: 4px 8px 2px;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  border-top: 1px solid var(--border);
+  margin-top: 2px;
 }
 
 /* 常用提示词快捷按钮 */
@@ -700,6 +864,12 @@ if (props.field.kind === 'image') loadImageOptions()
 .tbtn.swap {
   border-color: var(--accent);
   color: var(--accent);
+}
+.tbtn.go {
+  margin-left: auto; /* 单独顶到工具条最右侧 */
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 600;
 }
 
 /* 功能按钮（模板配置的 actions） */
