@@ -174,28 +174,38 @@ function cancelRename() {
 
 // ---------------------------------------------------------------- 放大预览 + 左右翻页
 
-const lightbox = ref(-1) // 在排序后列表里的下标；-1 = 关闭
-const lbAsset = computed(() => (lightbox.value >= 0 ? assets.value[lightbox.value] : null))
+const lightboxKey = ref<string | null>(null) // 当前预览的资产 key；null = 关闭。
+// 用 key 而不是下标定位：后台任务出图会把新资产插到列表头部，若记下标，
+// 视图会瞬间跳到别张图上；按 key 定位则始终跟着原来那张走。
+const lbIndex = computed(() =>
+  lightboxKey.value ? assets.value.findIndex((a) => a.key === lightboxKey.value) : -1
+)
+const lbAsset = computed(() => (lbIndex.value >= 0 ? assets.value[lbIndex.value] : null))
 
 function openLb(a: Asset) {
   if (isDragClick()) return // 拖拽结束在原卡上时浏览器仍会派发 click，别误开预览
-  const i = assets.value.indexOf(a)
-  if (i < 0) return
-  lightbox.value = i
+  if (!assets.value.includes(a)) return
+  lightboxKey.value = a.key
   markAssetRead(a)
 }
 
 function closeLb() {
-  lightbox.value = -1
+  lightboxKey.value = null
   lbEditing.value = false
 }
 
 function stepLb(d: number) {
   const n = assets.value.length
   if (!n) return
-  lightbox.value = (lightbox.value + d + n) % n
+  const i = lbIndex.value
+  if (i < 0) {
+    // 当前资产已被移除或被筛掉：关掉而不是跳到随机位置
+    closeLb()
+    return
+  }
+  lightboxKey.value = assets.value[(i + d + n) % n].key
   lbEditing.value = false
-  markAssetRead(assets.value[lightbox.value])
+  markAssetRead(assets.value[lbIndex.value])
 }
 
 // ---- 灯箱内重命名（确认后自动固定：起名保存 = 要收藏） ----
@@ -233,7 +243,7 @@ function removeCurrent() {
 }
 
 function onKey(e: KeyboardEvent) {
-  if (lightbox.value < 0) return
+  if (lbIndex.value < 0) return
   if (lbEditing.value) return // 重命名输入中：键盘留给输入框（Esc 由输入框自己处理）
   const k = e.key
   if (k === 'Escape') closeLb()
@@ -442,7 +452,7 @@ onUnmounted(() => {
           <span v-if="lbAsset.pinned" class="lb-pin">📌</span>
           <span class="lb-name" :title="lbAsset.filename">{{ displayName(lbAsset) }}</span>
         </template>
-        <span class="faint">{{ lightbox + 1 }} / {{ assets.length }}</span>
+        <span class="faint">{{ lbIndex + 1 }} / {{ assets.length }}</span>
         <span class="spacer" />
         <button v-if="lbAsset.params" class="btn sm" title="把这张图提交时的参数回填到左侧表单" @click="applyAssetParams(lbAsset)">
           ⤴ 载入参数

@@ -19,8 +19,8 @@ function dismiss(id: number) {
 <style scoped>
 .toasts {
   position: fixed;
-  right: 16px;
-  bottom: 16px;
+  left: 16px;
+  top: 16px;
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -45,7 +45,7 @@ function dismiss(id: number) {
 @keyframes slide-in {
   from {
     opacity: 0;
-    transform: translateX(12px);
+    transform: translateX(-12px);
   }
   to {
     opacity: 1;
