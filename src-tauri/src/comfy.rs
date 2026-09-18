@@ -7,8 +7,9 @@
 //! 反之，WebSocket(`/ws`) 不受同源策略约束、`<img src>` 也不走 CORS 检查，
 //! 因此实时进度和图片预览仍放在前端直接连，省一次中转。
 
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
@@ -83,21 +84,25 @@ pub async fn comfy_system_stats(base: String) -> Result<Value, String> {
     serde_json::from_str(&text).map_err(|e| format!("响应不是合法 JSON：{}", e))
 }
 
-// /object_info 是几 MB 的大 JSON，且节点定义几乎不变 → 进程内缓存 10 分钟。
-static OI_CACHE: Mutex<Option<(u64, Value)>> = Mutex::new(None);
+// /object_info 是几 MB 的大 JSON，且节点定义几乎不变 → 进程内按 base 缓存 10 分钟
+// （多节点：每台机器各一份节点定义，必须分键，不能共用）
+static OI_CACHE: LazyLock<Mutex<HashMap<String, (u64, Value)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 const OI_TTL_SECS: u64 = 10 * 60;
 
-fn oi_get() -> Option<Value> {
+fn oi_get(base: &str) -> Option<Value> {
     let guard = OI_CACHE.lock().ok()?;
-    match guard.as_ref() {
-        Some((at, data)) if now_secs().saturating_sub(*at) < OI_TTL_SECS => Some(data.clone()),
-        _ => None,
+    let (at, data) = guard.get(base)?;
+    if now_secs().saturating_sub(*at) < OI_TTL_SECS {
+        Some(data.clone())
+    } else {
+        None
     }
 }
 
-fn oi_put(data: Value) {
+fn oi_put(base: &str, data: Value) {
     if let Ok(mut guard) = OI_CACHE.lock() {
-        *guard = Some((now_secs(), data));
+        guard.insert(base.to_string(), (now_secs(), data));
     }
 }
 
@@ -110,7 +115,7 @@ pub async fn comfy_object_info(base: String, node: Option<String>) -> Result<Val
     };
     // 只有拉全量时才用缓存；单节点定义可能因为上传新图片而变化，每次现拉（响应很小）
     if node.is_none() || node.as_deref().unwrap_or("").trim().is_empty() {
-        if let Some(cached) = oi_get() {
+        if let Some(cached) = oi_get(&base) {
             return Ok(cached);
         }
     }
@@ -127,7 +132,7 @@ pub async fn comfy_object_info(base: String, node: Option<String>) -> Result<Val
     }
     let value: Value = serde_json::from_str(&text).map_err(|e| format!("响应不是合法 JSON：{}", e))?;
     if node.is_none() {
-        oi_put(value.clone());
+        oi_put(&base, value.clone());
     }
     Ok(value)
 }
@@ -191,6 +196,27 @@ pub async fn comfy_interrupt(base: String) -> Result<Value, String> {
     let url = join_url(&base, "/interrupt");
     let resp = client()
         .post(&url)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|e| conn_err(&url, &e.to_string()))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(http_err(&url, status, &text));
+    }
+    Ok(json!({ "ok": true }))
+}
+
+/// POST /queue —— 把任务从远端待队列里删掉（对正在运行的任务无效，运行中要用 /interrupt）。
+/// 支持一次删多个 prompt id（「全部中断」按节点批量清队用）。
+#[command]
+pub async fn comfy_queue_delete(base: String, promptids: Vec<String>) -> Result<Value, String> {
+    let url = join_url(&base, "/queue");
+    let body = json!({ "delete": promptids });
+    let resp = client()
+        .post(&url)
+        .json(&body)
         .timeout(Duration::from_secs(10))
         .send()
         .await
@@ -438,6 +464,70 @@ pub async fn comfy_copy_output_to_input(
     }
 
     let up_url = join_url(&base, "/upload/image");
+    let up = client()
+        .post(&up_url)
+        .multipart(form)
+        .timeout(Duration::from_secs(120))
+        .send()
+        .await
+        .map_err(|e| conn_err(&up_url, &e.to_string()))?;
+    let up_status = up.status().as_u16();
+    let up_text = up.text().await.map_err(|e| format!("读取响应失败：{}", e))?;
+    if !(200..300).contains(&up_status) {
+        return Err(http_err(&up_url, up_status, &up_text));
+    }
+    serde_json::from_str(&up_text).map_err(|e| format!("响应不是合法 JSON：{}", e))
+}
+
+/// 跨机转存参考图：从源机 GET /view?type=input 拉字节 → POST /upload/image 存进目标机 input。
+/// 用途：多节点派发时把参考图同步到非源机器（前端按 (value, workerId) 缓存去重）。
+/// 两段错误各自带完整 URL，用户能区分「源机取不到」还是「目标机传不上」。
+#[command]
+pub async fn comfy_transfer_input(
+    srcbase: String,
+    dstbase: String,
+    filename: String,
+    subfolder: Option<String>,
+) -> Result<Value, String> {
+    let sub = subfolder.unwrap_or_default();
+    let view_url = with_query(
+        &join_url(&srcbase, "/view"),
+        &[
+            ("filename", filename.as_str()),
+            ("subfolder", sub.as_str()),
+            ("type", "input"),
+        ],
+    );
+    let resp = client()
+        .get(&view_url)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await
+        .map_err(|e| conn_err(&view_url, &e.to_string()))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(http_err(&view_url, status, &text));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("读取源机文件失败：{}", e))?
+        .to_vec();
+
+    let part = reqwest::multipart::Part::bytes(bytes)
+        .file_name(filename.clone())
+        .mime_str(mime_for(&filename))
+        .map_err(|e| format!("构造上传数据失败：{}", e))?;
+    let mut form = reqwest::multipart::Form::new()
+        .part("image", part)
+        .text("overwrite", "true")
+        .text("type", "input");
+    if !sub.trim().is_empty() {
+        form = form.text("subfolder", sub.trim().to_string());
+    }
+
+    let up_url = join_url(&dstbase, "/upload/image");
     let up = client()
         .post(&up_url)
         .multipart(form)

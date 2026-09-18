@@ -8,9 +8,10 @@ import {
   randomSeed,
 } from './core/parseWorkflow'
 import { extractSubmitError, normalizeOutputs } from './core/errors'
+import { cooldownWorker, selectWorker } from './core/scheduler'
 import { ensureAudio, playChime } from './core/chime'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
-import type { Asset, FieldSchema, Job, ParamTemplate, WorkflowMeta } from './core/types'
+import type { Asset, FieldSchema, Job, ParamTemplate, WorkflowMeta, WorkerProfile } from './core/types'
 import { ui } from './ui'
 
 export const state = reactive({
@@ -23,6 +24,8 @@ export const state = reactive({
     outputDir: '',
     autoRefreshQueue: true,
     theme: 'dark',
+    /** 计算节点池（旧配置迁移前为空数组，见 migrateWorkers） */
+    workers: [] as WorkerProfile[],
   } as Record<string, any>,
 
   connection: 'unknown' as 'unknown' | 'ok' | 'error',
@@ -50,7 +53,10 @@ export const state = reactive({
   toasts: [] as { id: number; type: 'ok' | 'error' | 'warn' | 'info'; text: string }[],
 })
 
-let ws: ComfyWs | null = null
+/** 每个启用节点一条 WS 实时进度连接（key = base；进度/完成/出错按 base 闭包路由） */
+const wss = new Map<string, ComfyWs>()
+/** 各节点自报的队列余量（WS status 消息），TopBar 显示启用节点之和 */
+const perBaseQueue = new Map<string, number>()
 let toastSeq = 0
 
 /**
@@ -170,7 +176,7 @@ export async function openAssetWorkflow(a: Asset) {
     }
     // ② 下载到 assets-tmp 再解析：这里的文件一定真实存在，解析失败进查看器也不会「读取失败」
     const tempPath = `${dir}/assets-tmp/${a.filename}`
-    await api.saveOutput(state.settings.baseUrl, a.filename, a.subfolder, a.type, tempPath)
+    await api.saveOutput(a.base ?? primaryBase(), a.filename, a.subfolder, a.type, tempPath)
     try {
       const r = await api.importAssetWorkflow(tempPath)
       await openImported(r.name)
@@ -198,6 +204,123 @@ export function notify(
   }
 }
 
+// ---------------------------------------------------------------- 计算节点
+
+/** 所有启用的节点（base 非空；按配置顺序 = 优先级） */
+export function enabledWorkers(): WorkerProfile[] {
+  const list: WorkerProfile[] = Array.isArray(state.settings.workers)
+    ? state.settings.workers
+    : []
+  return list.filter((w) => w && w.enabled !== false && w.base)
+}
+
+/** 主节点 base：首个启用的 worker → 兜底 workers[0] → 兜底旧 baseUrl（迁移前/兼容场景） */
+export function primaryBase(): string {
+  const list = enabledWorkers()
+  if (list[0]?.base) return list[0].base
+  const any = Array.isArray(state.settings.workers) ? state.settings.workers[0] : null
+  return any?.base ?? state.settings.baseUrl ?? ''
+}
+
+/** 节点显示名：找不到（被删）时退回 host，任务/资产上仍可辨识来源 */
+export function workerName(base: string): string {
+  const list: WorkerProfile[] = Array.isArray(state.settings.workers)
+    ? state.settings.workers
+    : []
+  const w = list.find((x) => x.base === base)
+  if (w?.name) return w.name
+  try {
+    return new URL(base).host
+  } catch {
+    return base
+  }
+}
+
+// ------------------------------------------------ 节点健康检查（30s 轮询 + WS 断连联动）
+// key = base。WS onOpen/onClose 提供实时信号，30s 轮询 /system_stats 兜底校正；
+// 掉线节点自动退出调度池（全部掉线时仍尝试派发，避免网络抖动把任务憋死）。
+
+export const nodeHealth = ref<Record<string, 'up' | 'down' | 'unknown'>>({})
+
+let healthTimer: number | null = null
+
+function setHealth(base: string, h: 'up' | 'down') {
+  if (nodeHealth.value[base] !== h) nodeHealth.value = { ...nodeHealth.value, [base]: h }
+}
+
+export function healthOf(base: string): 'up' | 'down' | 'unknown' {
+  return nodeHealth.value[base] ?? 'unknown'
+}
+
+async function pingAllNodes() {
+  const list = enabledWorkers()
+  await Promise.all(
+    list.map(async (w) => {
+      try {
+        await api.systemStats(w.base)
+        setHealth(w.base, 'up')
+      } catch {
+        setHealth(w.base, 'down')
+      }
+    })
+  )
+}
+
+function startHealthLoop() {
+  if (healthTimer != null) return
+  void pingAllNodes()
+  healthTimer = window.setInterval(() => void pingAllNodes(), 30_000)
+}
+
+/** 可参与调度的节点：启用且未掉线；全部掉线时回落全部启用（网络抖动不憋死任务） */
+export function schedulableWorkers(): WorkerProfile[] {
+  const all = enabledWorkers()
+  const alive = all.filter((w) => healthOf(w.base) !== 'down')
+  return alive.length ? alive : all
+}
+
+// ------------------------------------------------ 参考图上传源追踪（多机跨机转存用）
+// 图片字段 value 是「上传源机器 input 目录里的相对路径」（如 studio/xxx.png），
+// 只在源机器有效；派发到其他节点前要先转存过去（scheduler.ensureOnWorker）。
+// imageOrigin 记录每个 value 最初传到了哪台机器，localStorage 持久化保证重启后可溯源。
+
+const IMAGE_ORIGIN_KEY = 'comfyui-studio.imageOrigin:v1'
+const IMAGE_ORIGIN_MAX = 1000
+const imageOrigin = new Map<string, string>()
+
+function loadImageOrigin() {
+  try {
+    const raw = localStorage.getItem(IMAGE_ORIGIN_KEY)
+    if (!raw) return
+    for (const [k, v] of Object.entries<any>(JSON.parse(raw))) {
+      if (typeof v === 'string') imageOrigin.set(k, v)
+    }
+  } catch {
+    /* 忽略损坏的历史数据 */
+  }
+}
+
+/** 记录一个图片 value 的上传源机器（FieldControl 所有写图片 value 的入口都要调） */
+export function recordImageOrigin(value: string, base: string) {
+  if (!value || !base || imageOrigin.get(value) === base) return
+  // 简单封顶：超限删最早的，防无限增长（转存缓存丢了也只是重新转存一次）
+  if (imageOrigin.size >= IMAGE_ORIGIN_MAX) {
+    const oldest = imageOrigin.keys().next().value
+    if (oldest != null) imageOrigin.delete(oldest)
+  }
+  imageOrigin.set(value, base)
+  try {
+    localStorage.setItem(IMAGE_ORIGIN_KEY, JSON.stringify(Object.fromEntries(imageOrigin)))
+  } catch {
+    /* 存储失败不影响主流程 */
+  }
+}
+
+/** 查一个图片 value 的上传源；没记录时按主节点处理（旧数据/单机零变化） */
+export function imageOriginBase(value: string): string {
+  return imageOrigin.get(value) ?? primaryBase()
+}
+
 // ---------------------------------------------------------------- 初始化
 
 export async function init() {
@@ -206,6 +329,8 @@ export async function init() {
   } catch (e) {
     notify(`读取设置失败：${e}`, 'error')
   }
+  await migrateWorkers()
+  loadImageOrigin()
   restoreAssets()
   loadPersistedFieldValues()
   await Promise.all([loadWorkflows(), loadTemplates()])
@@ -221,58 +346,86 @@ export async function init() {
   }
   await checkConnection()
   connectWs()
+  startHealthLoop()
   void restoreQueueFromServer()
   pollProcStatus()
   state.ready = true
 }
 
+/** 旧配置迁移：workers 为空时把 baseUrl 包装成第一个节点（单机用户无感知）。
+ *  直接走 api.saveSettings 落盘，不走 saveSettings()（避免 init 中途触发 WS/连接检查）。 */
+async function migrateWorkers() {
+  const list = state.settings.workers
+  if (Array.isArray(list) && list.length) return
+  const base = state.settings.baseUrl
+  if (!base) return
+  const workers = [{ id: crypto.randomUUID(), name: '默认节点', base, enabled: true, weight: 1 }]
+  state.settings = { ...state.settings, workers }
+  try {
+    state.settings = await api.saveSettings({ workers })
+  } catch (e) {
+    notify(`保存节点列表失败：${e}`, 'error')
+  }
+}
+
 /**
- * 刷新/重启后从 ComfyUI /queue 恢复还没跑完的任务（真相源在服务端，本地不存队列）。
- * 恢复成队列条目后，实时进度继续由 WebSocket 推送驱动，完成时照常落资产 + 弹通知。
- * 工作流名取提交时写进 extra_data 的 workflow_name；旧任务没有则显示占位。
+ * 刷新/重启后从各节点 /queue 恢复还没跑完的任务（真相源在服务端，本地不存队列）。
+ * 每台节点各查各的队列；恢复成队列条目后，实时进度继续由该节点的 WebSocket 推送驱动，
+ * 完成时照常落资产 + 弹通知。工作流名取提交时写进 extra_data 的 workflow_name。
  */
 async function restoreQueueFromServer() {
-  if (!state.settings.baseUrl) return
-  try {
-    const q = await api.queue(state.settings.baseUrl)
-    const runningRows: any[] = Array.isArray(q?.queue_running) ? q.queue_running : []
-    const pendingRows: any[] = Array.isArray(q?.queue_pending) ? q.queue_pending : []
-    let restored = 0
-    for (const [rows, status] of [
-      [runningRows, 'running'],
-      [pendingRows, 'queued'],
-    ] as const) {
-      for (const row of rows) {
-        // 行结构：[number, prompt_id, prompt, extra_data, outputs_to_execute]
-        const promptId = row?.[1]
-        if (!promptId || typeof promptId !== 'string') continue
-        if (state.jobs.some((j) => j.promptId === promptId)) continue
-        const graph = row?.[2]
-        const nodeCount = graph && typeof graph === 'object' ? Object.keys(graph).length : 0
-        // 提交时随 extra_data 存的参数快照（有的话）：恢复的任务完成后，产出资产照样能「载入参数」
-        const extra = row?.[3]
-        const params =
-          extra && typeof extra === 'object' && extra.params && typeof extra.params === 'object'
-            ? (extra.params as Record<string, any>)
-            : undefined
-        state.jobs.unshift({
-          promptId,
-          workflow: String(extra?.workflow_name ?? '刷新前的任务'),
-          status,
-          value: 0,
-          max: nodeCount,
-          startedAt: Date.now(),
-          outputs: [],
-          params,
-        })
-        restored++
+  const targets = enabledWorkers().map((w) => ({ base: w.base, id: w.id }))
+  if (!targets.length && state.settings.baseUrl) {
+    targets.push({ base: state.settings.baseUrl, id: '' })
+  }
+  if (!targets.length) return
+  let restored = 0
+  for (const { base, id } of targets) {
+    try {
+      const q = await api.queue(base)
+      const runningRows: any[] = Array.isArray(q?.queue_running) ? q.queue_running : []
+      const pendingRows: any[] = Array.isArray(q?.queue_pending) ? q.queue_pending : []
+      for (const [rows, status] of [
+        [runningRows, 'running'],
+        [pendingRows, 'queued'],
+      ] as const) {
+        for (const row of rows) {
+          // 行结构：[number, prompt_id, prompt, extra_data, outputs_to_execute]
+          const promptId = row?.[1]
+          if (!promptId || typeof promptId !== 'string') continue
+          // 同一台机器上 promptId 才是唯一键；跨机同名 promptId 互不冲突
+          if (state.jobs.some((j) => j.base === base && j.promptId === promptId)) continue
+          const graph = row?.[2]
+          const nodeCount = graph && typeof graph === 'object' ? Object.keys(graph).length : 0
+          // 提交时随 extra_data 存的参数快照（有的话）：恢复的任务完成后，产出资产照样能「载入参数」
+          const extra = row?.[3]
+          const params =
+            extra && typeof extra === 'object' && extra.params && typeof extra.params === 'object'
+              ? (extra.params as Record<string, any>)
+              : undefined
+          state.jobs.unshift({
+            promptId,
+            workflow: String(extra?.workflow_name ?? '刷新前的任务'),
+            status,
+            value: 0,
+            max: nodeCount,
+            startedAt: Date.now(),
+            outputs: [],
+            params,
+            base,
+            workerId: id || undefined,
+            // 留存服务器队列里的原图：恢复来的任务也能「改派」到别的节点
+            graph: graph && typeof graph === 'object' ? graph : undefined,
+          })
+          restored++
+        }
       }
+    } catch {
+      /* 该节点不可达时跳过，不影响其他节点恢复 */
     }
-    if (restored) {
-      notify(`已恢复队列里 ${restored} 个未完成任务，进度继续跟踪`, 'info', 6000)
-    }
-  } catch {
-    /* 服务器不可达时静默跳过 */
+  }
+  if (restored) {
+    notify(`已恢复队列里 ${restored} 个未完成任务，进度继续跟踪`, 'info', 6000)
   }
 }
 
@@ -313,7 +466,7 @@ export async function checkConnection() {
   state.connection = 'unknown'
   state.connText = '正在检测…'
   try {
-    const stats = await api.systemStats(state.settings.baseUrl)
+    const stats = await api.systemStats(primaryBase())
     state.stats = stats
     state.connection = 'ok'
     const dev = stats?.devices?.[0]?.name ?? ''
@@ -341,7 +494,7 @@ export async function saveSettings(patch: Record<string, any>) {
 
 async function loadObjectInfo() {
   try {
-    const oi = await api.objectInfo(state.settings.baseUrl)
+    const oi = await api.objectInfo(primaryBase())
     state.objectInfo = oi
     buildFields() // 有了节点定义，控件类型和下拉选项会更准
   } catch {
@@ -350,46 +503,71 @@ async function loadObjectInfo() {
 }
 
 function connectWs() {
-  ws?.dispose()
-  if (!state.settings.baseUrl) return
-  ws = new ComfyWs(state.settings.baseUrl, 'comfyui-studio', {
-    onOpen: () => {
-      state.queueRemaining = state.queueRemaining // no-op，状态由 status 消息驱动
-    },
-    onStatus: ({ queueRemaining }) => {
-      state.queueRemaining = queueRemaining
-    },
-    onProgress: ({ promptId, node, value, max }) => {
-      const job = state.jobs.find((j) => j.promptId === promptId)
-      if (!job) return
-      job.status = 'running'
-      job.value = value
-      job.max = max
-      if (node) job.node = node
-    },
-    onExecuting: ({ promptId, node }) => {
-      if (!node) {
-        // 该任务整体结束 → 去 /history 取产出
-        finishJob(promptId)
-      } else {
-        const job = state.jobs.find((j) => j.promptId === promptId)
-        if (job) {
-          job.status = 'running'
-          job.node = node
+  for (const w of wss.values()) w.dispose()
+  wss.clear()
+  perBaseQueue.clear()
+  // 每个启用节点一条 WS；兼容兜底：节点池为空时至少连旧地址（理论上 init 已迁移）
+  const bases = enabledWorkers().map((w) => w.base)
+  if (!bases.length && state.settings.baseUrl) bases.push(state.settings.baseUrl)
+  for (const base of new Set(bases)) {
+    const conn = new ComfyWs(base, 'comfyui-studio', {
+      onOpen: () => {
+        setHealth(base, 'up')
+        // 重连后（睡眠唤醒/网络抖动）也对一遍账：该机队列空了就把幽灵任务清出去
+        void reapStaleJobs(base)
+      },
+      onClose: () => {
+        // WS 断开 ≠ 节点必然挂了（可能只是 WS 抖动）：先标 down 让调度避开，30s 轮询会校正
+        setHealth(base, 'down')
+      },
+      onStatus: ({ queueRemaining }) => {
+        perBaseQueue.set(base, queueRemaining)
+        // 实时维护每节点明细（队列头悬停 tooltip 用）
+        queueByBase.value = { ...queueByBase.value, [base]: queueRemaining }
+        let total = 0
+        for (const [b, n] of perBaseQueue) {
+          if (wss.has(b)) total += n // 已从节点池删除的不计入
         }
-      }
-    },
-    onError: ({ promptId, message }) => {
-      const job = state.jobs.find((j) => j.promptId === promptId)
-      if (job) {
-        job.status = 'error'
-        job.error = message
-        job.finishedAt = Date.now()
-      }
-      notify(`任务出错：${message}`, 'error', 8000)
-    },
-  })
-  ws.connect()
+        state.queueRemaining = total
+        // 该机队列已空 → 应用内还挂在它名下的 queued/running 就是幽灵任务，安排清理
+        if (queueRemaining === 0) {
+          window.clearTimeout(reapTimer)
+          reapTimer = window.setTimeout(() => void reapStaleJobs(base), 1500)
+        }
+      },
+      onProgress: ({ promptId, node, value, max }) => {
+        const job = state.jobs.find((j) => j.base === base && j.promptId === promptId)
+        if (!job) return
+        job.status = 'running'
+        job.value = value
+        job.max = max
+        if (node) job.node = node
+      },
+      onExecuting: ({ promptId, node }) => {
+        if (!node) {
+          // 该任务整体结束 → 去它所在节点的 /history 取产出
+          finishJob(promptId, base)
+        } else {
+          const job = state.jobs.find((j) => j.base === base && j.promptId === promptId)
+          if (job) {
+            job.status = 'running'
+            job.node = node
+          }
+        }
+      },
+      onError: ({ promptId, message }) => {
+        const job = state.jobs.find((j) => j.base === base && j.promptId === promptId)
+        if (job) {
+          job.status = 'error'
+          job.error = message
+          job.finishedAt = Date.now()
+        }
+        notify(`任务出错：${message}`, 'error', 8000)
+      },
+    })
+    wss.set(base, conn)
+    conn.connect()
+  }
 }
 
 // ---- 系统通知：窗口在后台/最小化时出图完成弹原生 toast；前台时不打扰 ----
@@ -405,11 +583,79 @@ async function systemNotify(title: string, body: string) {
   }
 }
 
-async function finishJob(promptId: string) {
-  const job = state.jobs.find((j) => j.promptId === promptId)
+// ---- 幽灵任务清理：服务器重启/清队会把恢复来的任务永远卡在 queued，----
+// ---- 堵死「队列已空」判定（完成音效、系统通知全不触发）----
+
+let reapTimer = 0
+
+/**
+ * 对照「某一台节点」的服务器队列清理幽灵任务。WS 报告该机 queue_remaining=0 时触发；
+ * 两轮确认（首次只记 staleSince，10s 后复查仍在才动手）防止把
+ * 「刚从运行队列摘下、正要写历史」的瞬间误判成消失。
+ * 各机各查各的队列——A 机清空不会误杀 B 机名下的任务。
+ */
+async function reapStaleJobs(base: string) {
+  const candidates = state.jobs.filter(
+    (j) => j.base === base && (j.status === 'queued' || j.status === 'running')
+  )
+  if (!candidates.length) return
+  try {
+    const q = await api.queue(base)
+    const alive = new Set<string>()
+    for (const row of [...(q?.queue_running ?? []), ...(q?.queue_pending ?? [])]) {
+      const id = row?.[1]
+      if (id) alive.add(String(id))
+    }
+    const now = Date.now()
+    let needSecondRound = false
+    let reaped = 0
+    for (const j of candidates) {
+      if (alive.has(j.promptId)) {
+        j.staleSince = undefined
+        continue
+      }
+      if (!j.staleSince) {
+        j.staleSince = now // 首次发现不在队列 → 等下一轮确认
+        needSecondRound = true
+        continue
+      }
+      if (now - j.staleSince < 10_000) {
+        needSecondRound = true
+        continue
+      }
+      // 历史里其实有 → 是刚跑完的，正常收尾（产出落库 + 音效判定）
+      try {
+        const res = await api.historyItem(base, j.promptId)
+        if (res?.[j.promptId]) {
+          await finishJob(j.promptId, base)
+          continue
+        }
+      } catch {
+        /* 查不到历史就按消失处理 */
+      }
+      j.status = 'error'
+      j.error = '任务已不在服务器队列中（服务器可能重启或清理了队列）'
+      j.finishedAt = now
+      reaped++
+    }
+    if (reaped) {
+      notify(`${reaped} 个任务在节点上已不存在，已标记为失败`, 'warn', 8000)
+    }
+    // 没有新的 status 消息来触发下一轮时，自己安排复查
+    if (needSecondRound) {
+      window.clearTimeout(reapTimer)
+      reapTimer = window.setTimeout(() => void reapStaleJobs(base), 12_000)
+    }
+  } catch {
+    /* 节点不可达时跳过，等下一次 status 消息 */
+  }
+}
+
+async function finishJob(promptId: string, base: string) {
+  const job = state.jobs.find((j) => j.base === base && j.promptId === promptId)
   if (!job || job.status === 'done' || job.status === 'error') return
   try {
-    const res = await api.historyItem(state.settings.baseUrl, promptId)
+    const res = await api.historyItem(base, promptId)
     const entry = res?.[promptId]
     if (entry) {
       job.outputs = normalizeOutputs(entry)
@@ -605,12 +851,13 @@ function randomizeHiddenSeeds(graph: any) {
   }
 }
 
-/** 等一个任务真正跑完（WS 驱动状态，这里轮询即可）：返回是否正常完成 */
-function waitForJob(promptId: string, timeoutMs = 2 * 60 * 60 * 1000): Promise<boolean> {
+/** 等一个任务真正跑完（WS 驱动状态，这里轮询即可）：返回是否正常完成。
+ *  promptId 只在单机内唯一，必须连同所在节点 base 一起定位。 */
+function waitForJob(promptId: string, base: string, timeoutMs = 2 * 60 * 60 * 1000): Promise<boolean> {
   return new Promise((resolve) => {
     const started = Date.now()
     const timer = window.setInterval(() => {
-      const job = state.jobs.find((j) => j.promptId === promptId)
+      const job = state.jobs.find((j) => j.base === base && j.promptId === promptId)
       if (!job || job.status === 'done' || job.status === 'error' || job.status === 'cancelled') {
         clearInterval(timer)
         resolve(job?.status === 'done')
@@ -692,10 +939,33 @@ watch(submitBatch, (v) => {
   }
 })
 
+// ---- 节点选择：auto = 调度器自动分配；否则固定派给该节点（ParamPanel 下拉，多节点时显示） ----
+
+const WORKER_KEY = 'comfyui-studio.worker:v1'
+
+export const submitWorkerId = ref('auto')
+try {
+  const saved = localStorage.getItem(WORKER_KEY)
+  if (saved) submitWorkerId.value = saved
+} catch {
+  /* 忽略读取失败 */
+}
+watch(submitWorkerId, (v) => {
+  try {
+    localStorage.setItem(WORKER_KEY, v)
+  } catch {
+    /* 忽略写入失败 */
+  }
+})
+
 export function submit(batch = submitBatch.value) {
   ensureAudio() // 用户手势时机预热 AudioContext（完成音效需要）
   if (!state.graph) {
     notify('请先选择一个工作流', 'warn')
+    return
+  }
+  if (!selectWorker(schedulableWorkers(), state.jobs, submitWorkerId.value)) {
+    notify('没有可用的计算节点（全部禁用或冷却中），请到设置里检查节点列表', 'warn', 6000)
     return
   }
   recordPromptHistory() // 每次成功发起提交时记录本次用过的提示词
@@ -732,7 +1002,100 @@ function collectParamsSnapshot(): Record<string, any> | undefined {
   return o
 }
 
-/** 一条提交链的执行体：busy 由链生命周期管理，计数归零才复位 */
+// ------------------------------------------------ 参考图跨机转存 + 单任务派发
+
+/** 转存去重缓存：key = `${value}|${workerId}`，值 = 进行中/已完成的转存 Promise；失败自动出缓存可重试 */
+const transferCache = new Map<string, Promise<string>>()
+
+/**
+ * 确保一个图片引用（`sub/name`）在目标节点 input 里存在；不在就从它的上传源机器转存过去。
+ * 源机 = 目标机（单机/同机）时零开销短路；同一 (value, worker) 并发派发共用同一个 Promise。
+ */
+async function ensureOnWorker(value: string, target: { id: string; base: string }): Promise<string> {
+  const origin = imageOriginBase(value)
+  if (origin === target.base) return value
+  const ck = `${value}|${target.id}`
+  const hit = transferCache.get(ck)
+  if (hit) return hit
+  const p = (async () => {
+    // value = `sub/name`，从右往左切（嵌套子目录时最后一段是文件名）
+    const i = value.lastIndexOf('/')
+    const name = i >= 0 ? value.slice(i + 1) : value
+    const sub = i >= 0 ? value.slice(0, i) : ''
+    const res = await api.transferInput(origin, target.base, name, sub || undefined)
+    const nname = String(res?.name ?? name)
+    const nsub = String(res?.subfolder ?? sub ?? '')
+    const nv = nsub ? `${nsub}/${nname}` : nname
+    recordImageOrigin(nv, target.base)
+    return nv
+  })()
+  transferCache.set(ck, p)
+  try {
+    return await p
+  } catch (e) {
+    transferCache.delete(ck)
+    throw e
+  }
+}
+
+/**
+ * 派发一个任务到节点池：选机（least-busy / 手动指定）→ 参考图按需跨机转存 → 提交。
+ * 提交或转存失败 → 该节点冷却 60s 并改派（首选 1 次 + 重派 2 轮）；全败抛出终止本链。
+ * 工作流参数校验错（node_errors）也走同一条路——换一台装了对应模型的节点有可能直接成功。
+ */
+async function dispatchOne(
+  values: Record<string, any>,
+  preferredId: string,
+  workflow: string | null,
+  params?: Record<string, any>,
+  reseed = false
+): Promise<{ promptId: string; base: string; workerId: string; graph: any }> {
+  const paramsJson = params ? JSON.stringify(params) : undefined
+  let lastErr: unknown = null
+  for (let round = 0; round < 3; round++) {
+    const target = selectWorker(schedulableWorkers(), state.jobs, round === 0 ? preferredId : undefined)
+    if (!target) {
+      throw new Error(
+        round ? '重派失败：已无可用计算节点（全部禁用或冷却中）' : '没有启用的计算节点'
+      )
+    }
+    try {
+      // 图片字段按需转存到目标机（patched 只覆盖 image/multiimage 两类，其余值原样）
+      const patched: Record<string, any> = { ...values }
+      for (const f of state.fields) {
+        if (f.kind === 'image' && typeof values[f.key] === 'string' && values[f.key]) {
+          patched[f.key] = await ensureOnWorker(values[f.key], target)
+        } else if (f.kind === 'multiimage' && Array.isArray(values[f.key])) {
+          const out: string[] = []
+          for (const v of values[f.key]) {
+            out.push(typeof v === 'string' && v ? await ensureOnWorker(v, target) : v)
+          }
+          patched[f.key] = out
+        }
+      }
+      const graph = applyValues(state.graph, patched)
+      if (reseed) randomizeHiddenSeeds(graph)
+      const res = await api.submit(target.base, graph, workflow ?? undefined, paramsJson)
+      const err = extractSubmitError(res, graph)
+      if (err) throw new Error(err)
+      // graph 一并带回：排队任务「改派」要用原图重新提交（store.requeueJob）
+      return { promptId: String(res.prompt_id), base: target.base, workerId: target.id, graph }
+    } catch (e) {
+      lastErr = e
+      cooldownWorker(target.id)
+      notify(
+        `节点「${workerName(target.base)}」派发失败，60 秒内不再派发，任务改派其他节点`,
+        'warn',
+        6000
+      )
+    }
+  }
+  throw lastErr ?? new Error('派发失败')
+}
+
+/** 一条提交链的执行体：busy 由链生命周期管理，计数归零才复位。
+ *  批次/多图展开后逐任务经 dispatchOne 派发——单任务粒度分摊到节点池，
+ *  某台失败冷却 60s 自动改派；其余（种子策略/收尾通知音效/busy 语义）与旧版一致。 */
 async function runChain(
   total: number,
   count: number,
@@ -742,29 +1105,23 @@ async function runChain(
   params?: Record<string, any>
 ) {
   let ok = 0
-  const ids: string[] = []
+  const done_ = [] as { base: string; promptId: string }[]
   try {
-    // 整批一次性入队：不等前一个跑完，ComfyUI 自己串行执行（队列面板立刻能看到排队）
     for (let i = 0; i < total; i++) {
       const values = collectValues(state.fields.filter((f) => f.kind !== 'multiimage'))
       if (multiKey) values[multiKey] = imgs[Math.floor(i / count)] // 外层图片、内层批次
-      const graph = applyValues(state.graph, values)
       // 第 1 个任务沿用表单上的种子（可复现）；其余每个都全量换新种子，整批不重样
-      if (i > 0 || reroll) randomizeHiddenSeeds(graph)
-      const res = await api.submit(
-        state.settings.baseUrl,
-        graph,
-        state.currentWorkflow ?? undefined,
-        params ? JSON.stringify(params) : undefined
+      const reseed = i > 0 || reroll
+      const r = await dispatchOne(
+        values,
+        submitWorkerId.value,
+        state.currentWorkflow,
+        params,
+        reseed
       )
-      const err = extractSubmitError(res, graph)
-      if (err) {
-        notify(err, 'error', 12000)
-        break
-      }
       ok++
       state.jobs.unshift({
-        promptId: res.prompt_id,
+        promptId: r.promptId,
         workflow: state.currentWorkflow ?? '',
         status: 'queued',
         value: 0,
@@ -772,16 +1129,19 @@ async function runChain(
         startedAt: Date.now(),
         outputs: [],
         params,
+        workerId: r.workerId,
+        base: r.base,
+        graph: r.graph,
       })
       if (state.jobs.length > 50) state.jobs.length = 50
-      ids.push(res.prompt_id)
+      done_.push({ base: r.base, promptId: r.promptId })
       // 每提交一个批次任务就把表单种子换新：下一个批次 collectValues 拿到的就是新种子，
       // 表单上也随时显示新鲜种子（与「每批次提交后随机」一致）
       randomizeSeeds()
     }
     let done = 0
-    if (ids.length) {
-      const results = await Promise.all(ids.map((id) => waitForJob(id)))
+    if (done_.length) {
+      const results = await Promise.all(done_.map(({ base, promptId }) => waitForJob(promptId, base)))
       done = results.filter(Boolean).length
     }
     if (ok > 0) {
@@ -811,20 +1171,186 @@ async function runChain(
 
 export async function interrupt() {
   try {
-    await api.interrupt(state.settings.baseUrl)
+    // 只中断主节点当前任务（「全部中断」属 P2 范围）
+    await api.interrupt(primaryBase())
     notify('已发送中断指令', 'info', 3000)
   } catch (e) {
     notify(`中断失败：${e}`, 'error')
   }
 }
 
+/** 每台启用节点的待处理数（refreshQueue 填充），队列头部悬停明细用 */
+export const queueByBase = ref<Record<string, number>>({})
+
 export async function refreshQueue() {
+  const bases = enabledWorkers().map((w) => w.base)
+  if (!bases.length && state.settings.baseUrl) bases.push(state.settings.baseUrl)
+  if (!bases.length) return
   try {
-    const q = await api.queue(state.settings.baseUrl)
-    state.queueRemaining = (q?.queue_running?.length ?? 0) + (q?.queue_pending?.length ?? 0)
+    const qs = await Promise.all(bases.map((b) => api.queue(b).catch(() => null)))
+    const detail: Record<string, number> = {}
+    let total = 0
+    bases.forEach((b, i) => {
+      const q = qs[i]
+      if (!q) return // 该节点不可达，跳过不拖累合计
+      const n = (q?.queue_running?.length ?? 0) + (q?.queue_pending?.length ?? 0)
+      detail[b] = n
+      total += n
+    })
+    queueByBase.value = detail
+    state.queueRemaining = total
   } catch {
     /* ignore */
   }
+}
+
+/**
+ * 移除一条队列记录：任务还在远端时先远端取消，再删本地记录。
+ * 真相源在服务端（刷新后会按 /queue 恢复队列），只删本地的话一刷新记录就回来了。
+ * - running → POST /interrupt（中断该节点当前正在跑的任务）
+ * - queued  → POST /queue delete（从待队列摘除；若恰好已开跑则删不动，再点一次即可中断）
+ * 任务被移除后 waitForJob 会按「任务不存在」正常返回，提交链不会卡死。
+ */
+export async function discardJob(job: Job) {
+  const base = job.base ?? primaryBase()
+  if (job.status === 'running') {
+    try {
+      await api.interrupt(base)
+      notify('已中断该节点上的任务', 'info', 4000)
+    } catch (e) {
+      notify(`中断失败：${e}`, 'error', 8000)
+    }
+  } else if (job.status === 'queued') {
+    try {
+      await api.queueDelete(base, [job.promptId])
+      notify('已从节点队列移除该任务', 'info', 4000)
+    } catch (e) {
+      notify(`取消失败：${e}`, 'error', 8000)
+    }
+  }
+  const i = state.jobs.indexOf(job)
+  if (i >= 0) state.jobs.splice(i, 1)
+  void refreshQueue()
+}
+
+/**
+ * 全部中断：对每台有活动任务的节点发 /interrupt（杀运行中），
+ * 再按节点把本地已知的排队任务从远端队列批量摘除，最后清掉本地活动记录。
+ * 只动应用内追踪的任务——不碰服务器上其他客户端提交的东西。
+ * 本地记录移除后 waitForJob 按「任务不存在」正常返回，提交链不会卡死。
+ */
+export async function interruptAll() {
+  const active = state.jobs.filter((j) => j.status === 'running' || j.status === 'queued')
+  if (!active.length) {
+    notify('没有进行中的任务', 'info', 3000)
+    return
+  }
+  const byBase = new Map<string, { run: Job[]; queued: Job[] }>()
+  for (const j of active) {
+    const b = j.base ?? primaryBase()
+    const e = byBase.get(b) ?? { run: [], queued: [] }
+    ;(j.status === 'running' ? e.run : e.queued).push(j)
+    byBase.set(b, e)
+  }
+  let stopped = 0
+  let removed = 0
+  const failed: string[] = []
+  for (const [base, { run, queued }] of byBase) {
+    if (run.length) {
+      try {
+        await api.interrupt(base)
+        stopped += run.length
+      } catch {
+        failed.push(workerName(base))
+      }
+    }
+    if (queued.length) {
+      try {
+        await api.queueDelete(
+          base,
+          queued.map((j) => j.promptId)
+        )
+        removed += queued.length
+      } catch {
+        failed.push(workerName(base))
+      }
+    }
+  }
+  for (const j of active) {
+    const i = state.jobs.indexOf(j)
+    if (i >= 0) state.jobs.splice(i, 1)
+  }
+  void refreshQueue()
+  if (failed.length) {
+    notify(
+      `已中断 ${stopped} 个、移除 ${removed} 个；这些节点操作失败：${failed.join('、')}`,
+      'warn',
+      8000
+    )
+  } else {
+    notify(`已中断 ${stopped} 个运行中、移除 ${removed} 个排队任务`, 'ok', 5000)
+  }
+}
+
+/**
+ * 排队任务改派（慢节点拥堵时用）：从原节点 /queue 摘除 → 带提交时的原图 + 参数
+ * 重新提交到 least-busy 的其他节点 → 换绑本地记录（workflow/params/产出历史全保留）。
+ * graph 是提交时内存留存的（恢复来的任务取自服务器队列 extra_data），没 graph 的任务无法改派。
+ * 已知边界：改派后的任务不在原提交链的等待列表里，不计入该链的完成音效统计（产出照常落资产）。
+ */
+export async function requeueJob(job: Job) {
+  if (job.status !== 'queued') return
+  if (!job.graph) {
+    notify('这个任务没有留存提交数据，无法改派（可移除后重新提交）', 'warn', 6000)
+    return
+  }
+  const from = job.base ?? primaryBase()
+  const candidates = schedulableWorkers().filter((w) => w.base !== from)
+  if (!candidates.length) {
+    notify('没有其他可用节点可接手', 'warn', 5000)
+    return
+  }
+  const target = selectWorker(candidates, state.jobs, 'auto')
+  if (!target) {
+    notify('其他节点都在冷却中，稍后再试', 'warn', 5000)
+    return
+  }
+  try {
+    await api.queueDelete(from, [job.promptId])
+  } catch (e) {
+    notify(`从原节点摘除失败：${e}`, 'error', 8000)
+    return
+  }
+  try {
+    const res = await api.submit(
+      target.base,
+      job.graph,
+      job.workflow || undefined,
+      job.params ? JSON.stringify(job.params) : undefined
+    )
+    const err = extractSubmitError(res, job.graph)
+    if (err) throw new Error(err)
+    const i = state.jobs.indexOf(job)
+    if (i >= 0) state.jobs.splice(i, 1)
+    state.jobs.unshift({
+      ...job,
+      promptId: String(res.prompt_id),
+      base: target.base,
+      workerId: target.id,
+      status: 'queued',
+      value: 0,
+      max: 0,
+      startedAt: Date.now(),
+      finishedAt: undefined,
+      error: undefined,
+      outputs: [],
+      staleSince: undefined,
+    })
+    notify(`已改派到「${workerName(target.base)}」`, 'ok', 4000)
+  } catch (e) {
+    notify(`改派提交失败：${e}（原任务已从队列摘除，请重新提交）`, 'error', 8000)
+  }
+  void refreshQueue()
 }
 
 // ---------------------------------------------------------------- 结果资产
@@ -832,15 +1358,17 @@ export async function refreshQueue() {
 const ASSETS_KEY = 'comfyui-studio.assets.v1'
 const ASSETS_MAX = 500
 
-function assetKey(o: { filename: string; subfolder: string; type: string }) {
-  return `${o.type}/${o.subfolder}/${o.filename}`
+/** key 带 base 前缀：不同节点的同名产出（ComfyUI_00001_.png）不会互相覆盖 */
+function assetKey(base: string, o: { filename: string; subfolder: string; type: string }) {
+  return `${base}|${o.type}/${o.subfolder}/${o.filename}`
 }
 
 /** 任务完成：把产出提升为独立资产（未读），并与 localStorage 同步 */
 function addAssets(job: Job) {
+  const base = job.base ?? primaryBase()
   let added = 0
   for (const o of job.outputs) {
-    const key = assetKey(o)
+    const key = assetKey(base, o)
     if (state.assets.some((a) => a.key === key)) continue
     state.assets.unshift({
       key,
@@ -854,6 +1382,7 @@ function addAssets(job: Job) {
       read: false,
       pinned: false,
       params: job.params,
+      base,
     })
     added++
   }
@@ -874,7 +1403,29 @@ function restoreAssets() {
     const raw = localStorage.getItem(ASSETS_KEY)
     if (!raw) return
     const list = JSON.parse(raw)
-    if (Array.isArray(list)) state.assets = list.filter((a: any) => a && a.key && a.filename)
+    if (!Array.isArray(list)) return
+    // 一次性迁移：旧条目无 base/key 无前缀 → 补主节点 base 并重写 key（撞 key 保留先到的）
+    const fb = primaryBase()
+    let migrated = false
+    const seen = new Set<string>()
+    const out: Asset[] = []
+    for (const a of list) {
+      if (!a || !a.key || !a.filename) continue
+      if (!a.base) {
+        a.base = fb
+        migrated = true
+      }
+      if (!a.key.includes('|')) {
+        const nk = assetKey(a.base, a)
+        migrated = true
+        if (seen.has(nk)) continue
+        a.key = nk
+      }
+      seen.add(a.key)
+      out.push(a)
+    }
+    state.assets = out
+    if (migrated) persistAssets()
   } catch {
     /* ignore */
   }
@@ -1010,10 +1561,14 @@ export async function fetchLogs(reset = false) {
 }
 
 export function disposeAll() {
-  ws?.dispose()
-  ws = null
+  for (const w of wss.values()) w.dispose()
+  wss.clear()
   if (procTimer != null) {
     clearInterval(procTimer)
     procTimer = null
+  }
+  if (healthTimer != null) {
+    clearInterval(healthTimer)
+    healthTimer = null
   }
 }

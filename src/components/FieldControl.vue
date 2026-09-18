@@ -10,7 +10,17 @@ import {
   filesFromClipboardData,
 } from '../core/clipboard'
 import { open } from '@tauri-apps/plugin-dialog'
-import { assetDropTargets, imageDropTargets, notify, promptHistory, state, submit } from '../store'
+import {
+  assetDropTargets,
+  imageDropTargets,
+  imageOriginBase,
+  notify,
+  primaryBase,
+  promptHistory,
+  recordImageOrigin,
+  state,
+  submit,
+} from '../store'
 import { randomSeed } from '../core/parseWorkflow'
 
 const props = defineProps<{ field: FieldSchema }>()
@@ -46,7 +56,8 @@ const hasRange = computed(
     props.field.max - props.field.min <= 4096
 )
 
-/** 服务器 input 目录里的图片预览地址（值形如 "xxx.png" 或 "子目录/xxx.png"） */
+/** 服务器 input 目录里的图片预览地址（值形如 "xxx.png" 或 "子目录/xxx.png"）。
+ *  多节点：回源到该 value 的上传源机器（无记录视为主节点） */
 function inputUrl(v: string): string | null {
   const s = String(v ?? '').trim()
   if (!s || !/\.(png|jpe?g|webp|gif|bmp)$/i.test(s)) return null
@@ -54,7 +65,7 @@ function inputUrl(v: string): string | null {
   const sub = i >= 0 ? s.slice(0, i) : ''
   const name = i >= 0 ? s.slice(i + 1) : s
   try {
-    return viewUrl(state.settings.baseUrl, name, sub, 'input')
+    return viewUrl(imageOriginBase(s), name, sub, 'input')
   } catch {
     return null
   }
@@ -79,7 +90,7 @@ function ensureList(): string[] {
 async function loadImageOptions() {
   if (imgOptions.value) return
   try {
-    const def = await api.objectInfo(state.settings.baseUrl, 'LoadImage')
+    const def = await api.objectInfo(primaryBase(), 'LoadImage')
     const list = def?.LoadImage?.input?.required?.image?.[0]
     imgOptions.value = Array.isArray(list) ? list.map(String) : []
   } catch {
@@ -92,15 +103,19 @@ async function refreshImages() {
   await loadImageOptions()
 }
 
-/** 上传一个本地文件，返回服务器上的相对路径 */
+/** 上传一个本地文件，返回服务器上的相对路径。
+ *  上传统一进主节点（派发到其他节点时由调度器按需转存），并记录上传源 */
 async function uploadOne(path: string): Promise<string | null> {
   uploading.value = true
   try {
-    const res = await api.uploadImage(state.settings.baseUrl, path, undefined, 'studio', true)
+    const base = primaryBase()
+    const res = await api.uploadImage(base, path, undefined, 'studio', true)
     const name = String(res?.name ?? '')
     const sub = String(res?.subfolder ?? 'studio')
+    const value = name ? (sub ? `${sub}/${name}` : name) : null
+    if (value) recordImageOrigin(value, base)
     imgOptions.value = null
-    return name ? (sub ? `${sub}/${name}` : name) : null
+    return value
   } catch (e) {
     notify(`上传失败：${e}`, 'error', 8000)
     return null
@@ -247,16 +262,14 @@ async function applyAsset(a: Asset) {
     let path: string
     if (a.type === 'input') {
       path = a.subfolder ? `${a.subfolder}/${a.filename}` : a.filename
+      // 引用的是某台机器 input 里已有的文件 → 上传源就是产出它的那台
+      recordImageOrigin(path, a.base ?? primaryBase())
     } else {
-      const res = await api.copyToInput(
-        state.settings.baseUrl,
-        a.filename,
-        a.subfolder,
-        a.type,
-        'studio'
-      )
+      const base = primaryBase()
+      const res = await api.copyToInput(base, a.filename, a.subfolder, a.type, 'studio')
       const sub = String(res?.subfolder ?? 'studio')
       path = sub ? `${sub}/${res.name}` : String(res.name)
+      recordImageOrigin(path, base)
       await loadImageOptions()
     }
     if (props.field.kind === 'image') {

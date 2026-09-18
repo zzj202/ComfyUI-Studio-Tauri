@@ -4,21 +4,29 @@ import { api, viewUrl } from '../api/tauri'
 import { downloadDir } from '@tauri-apps/api/path'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import type { Asset, Job } from '../core/types'
+import { IMG_EXT_RE } from '../core/clipboard'
 import {
   applyAssetParams,
   beginDrag,
   clearAssets,
+  discardJob,
+  enabledWorkers,
+  interruptAll,
   isDragClick,
   markAllAssetsRead,
   markAssetRead,
   notify,
   openAssetWorkflow,
+  primaryBase,
+  queueByBase,
   refreshQueue,
   removeAsset,
   renameAsset,
+  requeueJob,
   state,
   toggleAssetRead,
   togglePinAsset,
+  workerName,
 } from '../store'
 
 const STATUS_TEXT: Record<Job['status'], string> = {
@@ -43,15 +51,18 @@ function dur(job: Job) {
   return ((end - job.startedAt) / 1000).toFixed(1) + 's'
 }
 
-function removeJob(job: Job) {
-  const i = state.jobs.indexOf(job)
-  if (i >= 0) state.jobs.splice(i, 1)
+/** ✕ 按钮：运行中=中断并移除；排队中=取消排队并移除；已结束=仅移除记录（store.discardJob） */
+function removeHint(job: Job) {
+  if (job.status === 'running') return '中断任务并移除记录'
+  if (job.status === 'queued') return '取消排队并移除记录'
+  return '移除记录'
 }
 
 // ---------------------------------------------------------------- 结果资产
 
-// ---- 筛选：按工作流 / 只看未读 / 只看收藏（资产多了找图快） ----
+// ---- 筛选：按工作流 / 按节点 / 只看未读 / 只看收藏（资产多了找图快） ----
 const filterWf = ref('')
+const filterNode = ref('')
 const onlyUnread = ref(false)
 const onlyPinned = ref(false)
 
@@ -61,10 +72,20 @@ const wfOptions = computed(() => {
   return [...set].sort()
 })
 
-const filterActive = computed(() => !!filterWf.value || onlyUnread.value || onlyPinned.value)
+/** 有产出的节点列表（按 base 去重，显示节点名） */
+const nodeOptions = computed(() => {
+  const set = new Set<string>()
+  for (const a of state.assets) if (a.base) set.add(a.base)
+  return [...set]
+})
+
+const filterActive = computed(
+  () => !!filterWf.value || !!filterNode.value || onlyUnread.value || onlyPinned.value
+)
 
 function resetFilters() {
   filterWf.value = ''
+  filterNode.value = ''
   onlyUnread.value = false
   onlyPinned.value = false
 }
@@ -75,11 +96,19 @@ const assets = computed(() =>
     .filter(
       (a) =>
         (!filterWf.value || a.workflow === filterWf.value) &&
+        (!filterNode.value || a.base === filterNode.value) &&
         (!onlyUnread.value || !a.read) &&
         (!onlyPinned.value || a.pinned)
     )
     .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.createdAt - a.createdAt)
 )
+
+/** 队列头部悬停提示：各节点待处理明细 */
+const queueDetailTitle = computed(() => {
+  const entries = Object.entries(queueByBase.value)
+  if (!entries.length) return '各节点待处理明细（点「刷新」获取）'
+  return '各节点待处理：' + entries.map(([b, n]) => `${workerName(b)} ${n}`).join('，')
+})
 
 const unreadCount = computed(() => state.assets.filter((a) => !a.read).length)
 
@@ -92,7 +121,8 @@ const unreadCount = computed(() => state.assets.filter((a) => !a.read).length)
 const urlCache = new Map<string, { base: string; url: string }>()
 
 function assetUrl(a: Asset) {
-  const base = state.settings.baseUrl
+  // 资产属于哪台机器，就从哪台机器取预览（旧资产无 base → 回落主节点）
+  const base = a.base ?? primaryBase()
   const hit = urlCache.get(a.key)
   if (hit && hit.base === base) return hit.url
   const url = viewUrl(base, a.filename, a.subfolder, a.type)
@@ -134,7 +164,7 @@ async function downloadOne(a: Asset) {
     // 不弹窗：直接存系统「下载」目录（同名覆盖无妨，ComfyUI 文件名本身唯一）
     const dir = String(await downloadDir()).replace(/[\\/]+$/, '')
     const dest = `${dir}/${file}`
-    await api.saveOutput(state.settings.baseUrl, a.filename, a.subfolder, a.type, dest)
+    await api.saveOutput(a.base ?? primaryBase(), a.filename, a.subfolder, a.type, dest)
     notify(`已保存：${dest}`, 'ok', 4000)
   } catch (e) {
     notify(`保存失败：${e}`, 'error', 8000)
@@ -186,12 +216,14 @@ function openLb(a: Asset) {
   if (isDragClick()) return // 拖拽结束在原卡上时浏览器仍会派发 click，别误开预览
   if (!assets.value.includes(a)) return
   lightboxKey.value = a.key
+  lbPromptsOpen.value = false
   markAssetRead(a)
 }
 
 function closeLb() {
   lightboxKey.value = null
   lbEditing.value = false
+  lbPromptsOpen.value = false
 }
 
 function stepLb(d: number) {
@@ -205,7 +237,33 @@ function stepLb(d: number) {
   }
   lightboxKey.value = assets.value[(i + d + n) % n].key
   lbEditing.value = false
+  lbPromptsOpen.value = false
   markAssetRead(assets.value[lbIndex.value])
+}
+
+// ---- 灯箱提示词面板：展示资产参数快照里的文本项（正向/反向提示词等），点击复制 ----
+const lbPromptsOpen = ref(false)
+const lbPromptEntries = computed(() => {
+  const p = lbAsset.value?.params
+  if (!p) return []
+  // key 形如 nodeId::inputName：当前表单有同名字段就用它的可读标签，没有就取 inputName
+  const labels = new Map(state.fields.map((f) => [f.key, f.label] as const))
+  const out: { key: string; label: string; text: string }[] = []
+  for (const [k, v] of Object.entries(p)) {
+    if (typeof v !== 'string' || !v.trim()) continue
+    if (IMG_EXT_RE.test(v.trim())) continue // 图片引用不算提示词
+    out.push({ key: k, label: labels.get(k) ?? (k.split('::').pop() ?? k), text: v })
+  }
+  return out
+})
+
+async function copyLbPrompt(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    notify('已复制提示词', 'ok', 2000)
+  } catch {
+    notify('复制失败（剪贴板被其他程序占用？）', 'warn')
+  }
 }
 
 // ---- 灯箱内重命名（确认后自动固定：起名保存 = 要收藏） ----
@@ -302,9 +360,25 @@ onUnmounted(() => {
     <div class="queue">
       <header class="q-head">
         <h2>队列</h2>
-        <span v-if="activeJobs.length" class="live-badge">{{ activeJobs.length }} 个进行中</span>
-        <span v-else-if="state.queueRemaining" class="faint">待处理 {{ state.queueRemaining }}</span>
+        <span
+          v-if="activeJobs.length"
+          class="live-badge"
+          :title="queueDetailTitle"
+        >{{ activeJobs.length }} 个进行中</span>
+        <span
+          v-else-if="state.queueRemaining"
+          class="faint"
+          :title="queueDetailTitle"
+        >待处理 {{ state.queueRemaining }}</span>
         <span class="spacer" />
+        <button
+          v-if="activeJobs.length"
+          class="btn ghost sm q-stop"
+          title="中断所有节点上运行中的任务，并移除所有排队任务（只动本应用提交的）"
+          @click="interruptAll"
+        >
+          ■ 全部中断
+        </button>
         <button class="btn ghost sm" @click="refreshQueue">刷新</button>
         <button class="btn ghost sm" :disabled="!state.settings.outputDir" @click="openOutputDir">
           输出目录
@@ -315,6 +389,9 @@ onUnmounted(() => {
         <div v-for="job in state.jobs" :key="job.promptId" class="q-row">
           <span class="dot" :class="job.status" />
           <span class="q-wf" :title="job.workflow">{{ job.workflow || '—' }}</span>
+          <span v-if="job.base" class="q-node" :title="'节点：' + job.base">
+            <span class="q-node-dot" />{{ workerName(job.base) }}
+          </span>
           <div v-if="job.status === 'running' || job.status === 'queued'" class="q-bar">
             <div class="q-fill" :style="{ width: pct(job) + '%' }" />
           </div>
@@ -322,7 +399,15 @@ onUnmounted(() => {
             {{ job.error ? '失败' : STATUS_TEXT[job.status] }} · {{ dur(job) }}
           </span>
           <span v-if="job.outputs.length" class="faint q-files">{{ job.outputs.length }} 文件</span>
-          <button class="btn ghost sm q-x" title="移除记录" @click="removeJob(job)">✕</button>
+          <button
+            v-if="job.status === 'queued' && job.graph && enabledWorkers().length > 1"
+            class="btn ghost sm q-x"
+            title="改派：从当前节点摘除，重新提交到其他空闲节点"
+            @click="requeueJob(job)"
+          >
+            ⇄
+          </button>
+          <button class="btn ghost sm q-x" :title="removeHint(job)" @click="discardJob(job)">✕</button>
         </div>
       </div>
     </div>
@@ -347,6 +432,10 @@ onUnmounted(() => {
         <select v-model="filterWf" class="select f-wf" title="只看某个工作流的产出">
           <option value="">全部工作流</option>
           <option v-for="w in wfOptions" :key="w" :value="w">{{ w }}</option>
+        </select>
+        <select v-model="filterNode" class="select f-node" title="只看某个节点生成的产出">
+          <option value="">全部节点</option>
+          <option v-for="b in nodeOptions" :key="b" :value="b">{{ workerName(b) }}</option>
         </select>
         <button class="chip-f" :class="{ on: onlyUnread }" title="只看未读（新产出）" @click="onlyUnread = !onlyUnread">
           未读
@@ -387,6 +476,9 @@ onUnmounted(() => {
               <img v-else :src="assetUrl(a)" :alt="displayName(a)" loading="lazy" />
               <span v-if="!a.read" class="unread-pill">未读</span>
               <span v-if="a.pinned" class="pin-flag" title="已固定">📌</span>
+              <span v-if="a.base" class="a-node" :title="'生成节点：' + a.base">
+                <span class="a-node-dot" />{{ workerName(a.base) }}
+              </span>
             </div>
             <figcaption>
               <input
@@ -436,6 +528,22 @@ onUnmounted(() => {
         <img v-else :key="lbAsset.key" :src="assetUrl(lbAsset)" :alt="displayName(lbAsset)" />
       </div>
       <button class="nav next" title="下一张（→ / D）" @click="stepLb(1)">›</button>
+      <div
+        v-if="lbPromptsOpen && lbPromptEntries.length"
+        class="lb-prompts"
+        @click.stop
+      >
+        <div
+          v-for="e in lbPromptEntries"
+          :key="e.key"
+          class="lb-prompt"
+          title="点击复制"
+          @click="copyLbPrompt(e.text)"
+        >
+          <span class="lp-label">{{ e.label }}</span>
+          <span class="lp-text">{{ e.text }}</span>
+        </div>
+      </div>
       <footer class="lb-foot" @click.stop>
         <template v-if="lbEditing">
           <input
@@ -453,7 +561,19 @@ onUnmounted(() => {
           <span class="lb-name" :title="lbAsset.filename">{{ displayName(lbAsset) }}</span>
         </template>
         <span class="faint">{{ lbIndex + 1 }} / {{ assets.length }}</span>
+        <span v-if="lbAsset.base" class="a-node lb-node" :title="'生成节点：' + lbAsset.base">
+          <span class="a-node-dot" />{{ workerName(lbAsset.base) }}
+        </span>
         <span class="spacer" />
+        <button
+          v-if="lbPromptEntries.length"
+          class="btn sm"
+          :class="{ on: lbPromptsOpen }"
+          title="查看这张图提交时的提示词（点击条目复制）"
+          @click="lbPromptsOpen = !lbPromptsOpen"
+        >
+          📝 提示词
+        </button>
         <button v-if="lbAsset.params" class="btn sm" title="把这张图提交时的参数回填到左侧表单" @click="applyAssetParams(lbAsset)">
           ⤴ 载入参数
         </button>
@@ -515,7 +635,8 @@ onUnmounted(() => {
 .q-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   padding: 8px 14px 6px;
 }
 .q-head h2 {
@@ -530,6 +651,10 @@ onUnmounted(() => {
   color: var(--cyan);
   border: 1px solid #22d3ee44;
   background: #22d3ee14;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .spacer {
   flex: 1;
@@ -537,6 +662,7 @@ onUnmounted(() => {
 .q-body {
   max-height: 118px;
   overflow-y: auto;
+  overflow-x: hidden;
   padding: 0 14px 8px;
 }
 .q-empty {
@@ -547,10 +673,11 @@ onUnmounted(() => {
 .q-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   font-size: 11.5px;
   padding: 3px 0;
   min-height: 22px;
+  min-width: 0;
 }
 .dot {
   flex: none;
@@ -580,12 +707,40 @@ onUnmounted(() => {
   }
 }
 .q-wf {
-  flex: none;
-  max-width: 150px;
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 110px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-dim);
+}
+
+/* 队列行节点小胶囊：任务被派到哪台机器一目了然（带圆点标记，比纯文字醒目） */
+.q-node {
+  flex: 0 1 auto;
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 96px;
+  padding: 0 7px;
+  height: 16px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--accent-soft);
+  color: var(--text-dim);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.q-node-dot {
+  flex: none;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
 }
 .q-bar {
   flex: 1;
@@ -601,13 +756,20 @@ onUnmounted(() => {
 }
 .q-state {
   flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   color: var(--text-faint);
 }
 .q-state.err {
   color: var(--err);
 }
 .q-files {
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
 }
 .q-x {
   flex: none;
@@ -624,7 +786,8 @@ onUnmounted(() => {
 .r-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  flex-wrap: wrap;
+  gap: 4px 8px;
   padding: 9px 14px;
   flex: none;
 }
@@ -638,15 +801,32 @@ onUnmounted(() => {
 .r-filter {
   display: flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;
+  gap: 4px 6px;
   padding: 0 14px 8px;
   flex: none;
 }
 .f-wf {
-  width: 150px;
-  flex: none;
+  flex: 1 1 120px;
+  min-width: 0;
+  max-width: 180px;
   padding: 3px 24px 3px 8px;
   font-size: 12px;
+}
+.f-node {
+  flex: 1 1 96px;
+  min-width: 0;
+  max-width: 150px;
+  padding: 3px 24px 3px 8px;
+  font-size: 12px;
+}
+/* 全部中断：警示色文字，hover 加重 */
+.q-stop {
+  color: var(--err);
+}
+.q-stop:hover {
+  background: rgba(248, 113, 113, 0.12);
+  border-color: rgba(248, 113, 113, 0.4);
 }
 .chip-f {
   font-size: 11.5px;
@@ -735,6 +915,40 @@ onUnmounted(() => {
   right: 4px;
   font-size: 11px;
   filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6));
+}
+/* 资产卡左下角节点徽标：一眼辨别这张图是哪个节点生成的（叠在图片上，深色半透明底两种主题都可读） */
+.a-node {
+  position: absolute;
+  left: 6px;
+  bottom: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 96px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(13, 16, 23, 0.62);
+  color: #e7ecf5;
+  font-size: 10px;
+  line-height: 1.3;
+  overflow: hidden;
+  white-space: nowrap;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+}
+.a-node-dot {
+  flex: none;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--cyan);
+}
+/* 灯箱底栏里的同款徽标：底栏本身是深色毛玻璃，换浅描边弱化 */
+.lb-node {
+  position: static;
+  flex: none;
+  padding: 2px 8px;
+  background: rgba(255, 255, 255, 0.1);
 }
 .card figcaption {
   display: flex;
@@ -860,11 +1074,64 @@ onUnmounted(() => {
   bottom: 0;
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 10px;
   padding: 10px 16px;
   background: rgba(0, 0, 0, 0.55);
   color: #e5e5e5;
   font-size: 12.5px;
+}
+.lb-foot .btn.on {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+/* 灯箱提示词面板：footer 上方浮层，点击条目复制 */
+.lb-prompts {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 42px;
+  max-height: 38%;
+  overflow: auto;
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  background: rgba(10, 12, 18, 0.82);
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  backdrop-filter: blur(6px);
+}
+.lb-prompt {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.lb-prompt:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+.lp-label {
+  flex: none;
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+  color: #9aa3b8;
+}
+.lp-text {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: #e5e5e5;
+  word-break: break-word;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
 }
 .lb-pin {
   font-size: 13px;

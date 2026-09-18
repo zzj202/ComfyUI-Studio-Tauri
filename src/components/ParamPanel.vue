@@ -2,7 +2,17 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import FieldControl from './FieldControl.vue'
 import type { FieldSchema } from '../core/types'
-import { notify, randomizeSeeds, setActiveTemplate, state, submit, submitBatch, interrupt } from '../store'
+import {
+  enabledWorkers,
+  interrupt,
+  notify,
+  randomizeSeeds,
+  setActiveTemplate,
+  state,
+  submit,
+  submitBatch,
+  submitWorkerId,
+} from '../store'
 import { ui } from '../ui'
 
 const collapsed = ref<Record<string, boolean>>({})
@@ -91,6 +101,9 @@ const submitLabel = computed(() =>
   totalCount.value > 1 ? `提交生成 ×${totalCount.value}` : '提交生成'
 )
 
+/** 节点池 ≥2 时显示节点下拉（auto = 空闲优先自动分配） */
+const workerOptions = computed(() => enabledWorkers())
+
 /** Ctrl+Enter 快捷提交（长提示词时不用挪鼠标去点按钮） */
 function onKeydown(e: KeyboardEvent) {
   if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === 'Enter') {
@@ -169,6 +182,15 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <span v-if="state.queueRemaining > 0" class="faint">· 队列 {{ state.queueRemaining }}</span>
       </div>
       <div class="right">
+        <select
+          v-if="workerOptions.length > 1"
+          v-model="submitWorkerId"
+          class="select worker-select"
+          title="计算节点：自动分配 = 空闲优先；也可固定派给某一台"
+        >
+          <option value="auto">自动分配</option>
+          <option v-for="w in workerOptions" :key="w.id" :value="w.id">{{ w.name }}</option>
+        </select>
         <select
           v-model.number="submitBatch"
           class="select batch-select"
@@ -336,5 +358,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 }
 .batch-select {
   width: 104px;
+}
+.worker-select {
+  width: 118px;
 }
 </style>

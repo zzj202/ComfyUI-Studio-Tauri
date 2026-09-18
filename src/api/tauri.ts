@@ -60,6 +60,8 @@ export const api = {
   historyItem: (base: string, id: string) => invoke<any>('comfy_history_item', { base, id }),
   queue: (base: string) => invoke<any>('comfy_queue', { base }),
   interrupt: (base: string) => invoke<any>('comfy_interrupt', { base }),
+  queueDelete: (base: string, promptids: string[]) =>
+    invoke<any>('comfy_queue_delete', { base, promptids }),
   free: (base: string, unload?: boolean) =>
     invoke<any>('comfy_free', { base, unload: unload ?? null }),
   submit: (base: string, graph: any, workflowName?: string, paramsJson?: string) =>
@@ -111,6 +113,19 @@ export const api = {
       subfolder: subfolder ?? null,
       kind: kind ?? null,
       targetSubfolder: targetSubfolder ?? null,
+    }),
+  /** 跨机转存参考图：从源机 input 拉字节 → 存进目标机 input（多节点派发前同步用） */
+  transferInput: (
+    srcbase: string,
+    dstbase: string,
+    filename: string,
+    subfolder?: string
+  ) =>
+    invoke<{ name: string; subfolder: string }>('comfy_transfer_input', {
+      srcbase,
+      dstbase,
+      filename,
+      subfolder: subfolder ?? null,
     }),
   detectLocal: () =>
     invoke<{ running: any[]; installs: any[] }>('detect_local_comfy'),

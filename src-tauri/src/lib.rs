@@ -58,6 +58,11 @@ pub fn run() {
             .resizable(true)
             .center()
             .data_directory(store::app_root()?.join("webview"))
+            // 禁用 GPU 合成加速：排查 WebView2 启动即崩（Crashpad 有 3 份 minidump）。
+            // 注意此参数会整体替换默认 browser args，需带上 wry 默认的 feature 开关
+            .additional_browser_args(
+                "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu",
+            )
             .build()
             .map_err(|e| format!("创建主窗口失败：{e}"))?;
 
@@ -148,10 +153,12 @@ pub fn run() {
             comfy::comfy_history_item,
             comfy::comfy_queue,
             comfy::comfy_interrupt,
+            comfy::comfy_queue_delete,
             comfy::comfy_free,
             comfy::comfy_submit,
             comfy::comfy_upload_image,
             comfy::comfy_copy_output_to_input,
+            comfy::comfy_transfer_input,
             comfy::comfy_save_output,
             comfy::detect_local_comfy,
             // ---- 本地进程 ----

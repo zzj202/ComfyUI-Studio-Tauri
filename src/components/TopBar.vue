@@ -1,5 +1,14 @@
 <script setup lang="ts">
-import { checkConnection, startLocal, state, stopLocal } from '../store'
+import { computed } from 'vue'
+import {
+  checkConnection,
+  enabledWorkers,
+  healthOf,
+  primaryBase,
+  startLocal,
+  state,
+  stopLocal,
+} from '../store'
 import { soundEnabled, toggleSound } from '../core/chime'
 import { cycleTheme, themeMode } from '../core/theme'
 import { ui } from '../ui'
@@ -9,6 +18,23 @@ const THEME_UI: Record<string, { icon: string; label: string }> = {
   auto: { icon: '🌗', label: '跟随系统' },
   dark: { icon: '🌙', label: '深色' },
   light: { icon: '☀️', label: '亮色' },
+}
+
+/** 连接指示显示主节点地址；多节点时追加「+N」提示池里还有其他节点 */
+const connUrl = computed(() => {
+  const base = primaryBase()
+  const extra = enabledWorkers().length - 1
+  return extra > 0 ? `${base} +${extra}` : base
+})
+
+/** 每节点健康状态点（多节点时显示；单节点的存活状态由左侧连接胶囊表达） */
+const workers = computed(() => enabledWorkers())
+
+function healthInfo(base: string): { cls: string; text: string } {
+  const h = healthOf(base)
+  if (h === 'up') return { cls: 'up', text: '在线' }
+  if (h === 'down') return { cls: 'down', text: '离线' }
+  return { cls: 'unknown', text: '检测中' }
 }
 </script>
 
@@ -26,10 +52,22 @@ const THEME_UI: Record<string, { icon: string; label: string }> = {
       @click="checkConnection"
     >
       <span class="dot" />
-      <span class="url mono">{{ state.settings.baseUrl }}</span>
+      <span class="url mono">{{ connUrl }}</span>
       <span class="dim">·</span>
       <span>{{ state.connection === 'ok' ? '已连接' : state.connection === 'error' ? '未连接' : '检测中' }}</span>
     </button>
+
+    <!-- 每节点健康状态点：绿=在线 红=离线 灰=检测中；点击打开设置 -->
+    <span v-if="workers.length > 1" class="node-dots">
+      <button
+        v-for="w in workers"
+        :key="w.id"
+        class="node-dot"
+        :class="healthInfo(w.base).cls"
+        :title="`${w.name || w.base} · ${w.base} · ${healthInfo(w.base).text}（点击打开设置）`"
+        @click="ui.settingsOpen = true"
+      />
+    </span>
 
     <span v-if="state.stats?.devices?.[0]" class="device faint">
       {{ state.stats.devices[0].name }}
@@ -98,6 +136,33 @@ const THEME_UI: Record<string, { icon: string; label: string }> = {
   text-overflow: ellipsis;
   white-space: nowrap;
   font-size: 11.5px;
+}
+/* 每节点健康状态点 */
+.node-dots {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.node-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  padding: 0;
+  cursor: pointer;
+  flex: none;
+}
+.node-dot.up {
+  background: var(--ok);
+  border-color: transparent;
+}
+.node-dot.down {
+  background: var(--err);
+  border-color: transparent;
+}
+.node-dot.unknown {
+  background: var(--text-faint);
+  opacity: 0.45;
 }
 .device {
   font-size: 11.5px;
