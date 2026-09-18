@@ -184,6 +184,80 @@ textarea {
   font-size: 12px;
 }
 
+/* ---- 按钮触感反馈：悬停微抬 + 按压缩放（弹簧曲线）+ 点击涟漪 + 键盘焦点环 ----
+   涟漪 span 由 App.vue 的全局 pointerdown 委托注入，动画结束自动移除 */
+.btn,
+.tbtn,
+.nav {
+  position: relative;
+  overflow: hidden;
+  transition:
+    background 0.14s,
+    border-color 0.14s,
+    opacity 0.14s,
+    transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1),
+    box-shadow 0.18s;
+}
+.btn:hover:not(:disabled),
+.tbtn:hover,
+.nav:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
+}
+.btn:active:not(:disabled),
+.tbtn:active,
+.nav:active {
+  transform: translateY(0) scale(0.96);
+  box-shadow: none;
+  transition-duration: 0.05s;
+}
+.btn.primary:hover:not(:disabled) {
+  box-shadow: 0 2px 12px var(--accent-soft);
+}
+.btn.primary:active:not(:disabled) {
+  filter: brightness(0.9);
+}
+.btn:focus-visible,
+.tbtn:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.ripple {
+  position: absolute;
+  border-radius: 50%;
+  pointer-events: none;
+  background: currentColor;
+  opacity: 0.16;
+  transform: scale(0);
+  animation: ripple-expand 0.55s ease-out forwards;
+}
+@keyframes ripple-expand {
+  to {
+    transform: scale(1);
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .btn,
+  .tbtn,
+  .nav {
+    transition: background 0.14s, border-color 0.14s, opacity 0.14s;
+  }
+  .btn:hover:not(:disabled),
+  .tbtn:hover,
+  .nav:hover,
+  .btn:active:not(:disabled),
+  .tbtn:active,
+  .nav:active {
+    transform: none;
+    box-shadow: none;
+  }
+  .ripple {
+    display: none;
+  }
+}
+
 .input,
 .select,
 .textarea {

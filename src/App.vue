@@ -106,8 +106,25 @@ async function onDocPaste(e: ClipboardEvent) {
   }
 }
 
+/** 按钮触感：全局点击涟漪（事件委托到 .btn/.tbtn/.nav，动画结束自动移除） */
+function onBtnPointerDown(e: PointerEvent) {
+  const host = (e.target as HTMLElement | null)?.closest?.<HTMLElement>('.btn, .tbtn, .nav')
+  if (!host || (host as HTMLButtonElement).disabled) return
+  const rect = host.getBoundingClientRect()
+  const d = Math.max(rect.width, rect.height) * 2
+  const s = document.createElement('span')
+  s.className = 'ripple'
+  s.style.width = s.style.height = `${d}px`
+  s.style.left = `${e.clientX - rect.left - d / 2}px`
+  s.style.top = `${e.clientY - rect.top - d / 2}px`
+  host.appendChild(s)
+  s.addEventListener('animationend', () => s.remove())
+  window.setTimeout(() => s.remove(), 700) // reduced-motion 下 animationend 不来，兜底清理
+}
+
 onMounted(async () => {
   document.addEventListener('paste', onDocPaste)
+  document.addEventListener('pointerdown', onBtnPointerDown)
   await init()
   queueTimer = window.setInterval(() => {
     if (state.settings.autoRefreshQueue !== false && state.connection === 'ok') refreshQueue()
@@ -116,6 +133,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   document.removeEventListener('paste', onDocPaste)
+  document.removeEventListener('pointerdown', onBtnPointerDown)
   if (queueTimer != null) clearInterval(queueTimer)
   disposeAll()
 })
