@@ -1,12 +1,25 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue'
+import { onMounted, onUnmounted, reactive, ref, watchEffect } from 'vue'
 import { api } from '../api/tauri'
 import { open } from '@tauri-apps/plugin-dialog'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
-import { dragGhost, dropZones, loadWorkflows, notify, openAssetWorkflow, selectWorkflow, state } from '../store'
+import {
+  applyAssetToWorkflow,
+  dragGhost,
+  dropZones,
+  isDragClick,
+  loadWorkflows,
+  notify,
+  openAssetWorkflow,
+  persistWorkflowOrder,
+  selectWorkflow,
+  state,
+} from '../store'
+import type { DragItem } from '../store'
+import type { WorkflowMeta } from '../core/types'
 import { ui } from '../ui'
 
-// 拖拽落点区：结果资产 / 本地资产拖到这里 → 打开它内嵌的工作流
+// 拖拽落点区：结果资产 / 本地资产拖到「面板空白处」→ 打开它内嵌的工作流
 function onDropZone(item: { asset?: any; path?: string }) {
   if (item.asset) openAssetWorkflow(item.asset)
   else if (item.path) ui.assetInspect = item.path
@@ -17,6 +30,73 @@ onMounted(() => {
   api.appDataDir().then((d) => (dataDir.value = d)).catch(() => {})
 })
 onUnmounted(() => dropZones.delete('workflow-panel'))
+
+// 资产拖到「具体工作流卡片」= 切到该模板并设为参考图（与面板空白处的反查语义并存）。
+// 工作流列表是动态的，watchEffect 随列表变化注册/清理每个卡片的落点。
+watchEffect((onCleanup) => {
+  const keys: string[] = []
+  for (const w of state.workflows) {
+    const key = `wf:${w.name}`
+    keys.push(key)
+    dropZones.set(key, (item: DragItem) => {
+      if (item.asset) void applyAssetToWorkflow(item.asset, w.name)
+      else if (item.path) ui.assetInspect = item.path
+    })
+  }
+  onCleanup(() => {
+    for (const k of keys) dropZones.delete(k)
+  })
+})
+
+// ---- 工作流列表拖拽排序（pointer 模拟：HTML5 DnD 被 WebView2 的 dragDropEnabled 吞掉）----
+// 按下 → 纵向移动超阈值进入排序 → 实时高亮目标位 → 松手换位并持久化到 settings.workflowOrder
+const reorder = reactive({ active: false, from: -1, to: -1 })
+let reorderEndedAt = 0
+
+function idxAt(x: number, y: number): number {
+  const el = document.elementFromPoint(x, y)?.closest('[data-wf-idx]')
+  return el ? Number(el.getAttribute('data-wf-idx')) : -1
+}
+
+function onItemPointerDown(e: PointerEvent, idx: number) {
+  if (e.button !== 0) return
+  if ((e.target as HTMLElement).closest('.del')) return // 删除按钮不触发拖拽
+  const startY = e.clientY
+  let started = false
+  const move = (ev: PointerEvent) => {
+    if (!started) {
+      if (Math.abs(ev.clientY - startY) < 6) return
+      started = true
+      reorder.active = true
+      reorder.from = idx
+      reorder.to = idx
+    }
+    const t = idxAt(ev.clientX, ev.clientY)
+    if (t >= 0) reorder.to = t
+  }
+  const up = (ev: PointerEvent) => {
+    window.removeEventListener('pointermove', move)
+    window.removeEventListener('pointerup', up)
+    if (started) {
+      reorderEndedAt = Date.now()
+      const to = idxAt(ev.clientX, ev.clientY)
+      if (to >= 0 && to !== idx) {
+        const [item] = state.workflows.splice(idx, 1)
+        state.workflows.splice(to, 0, item)
+        void persistWorkflowOrder(state.workflows.map((w) => w.name))
+      }
+    }
+    reorder.active = false
+  }
+  window.addEventListener('pointermove', move)
+  window.addEventListener('pointerup', up)
+}
+
+function onWfClick(w: WorkflowMeta) {
+  // 刚结束的排序拖拽 / 资产拖拽派发的 click 不当选择处理
+  if (Date.now() - reorderEndedAt < 120 || isDragClick()) return
+  void selectWorkflow(w.name)
+}
 
 const dataDir = ref('')
 
@@ -81,7 +161,7 @@ async function openDir() {
       </div>
     </header>
 
-    <div class="body">
+    <div class="body" :class="{ reordering: reorder.active }">
       <div v-if="!state.workflows.length" class="empty">
         还没有工作流。<br />
         点「+ 导入」，选择 ComfyUI 里<br /><b>导出 (API)</b> 得到的 JSON 文件。<br /><br />
@@ -89,11 +169,19 @@ async function openDir() {
       </div>
 
       <button
-        v-for="w in state.workflows"
+        v-for="(w, i) in state.workflows"
         :key="w.name"
         class="wf-item"
-        :class="{ active: w.name === state.currentWorkflow }"
-        @click="selectWorkflow(w.name)"
+        :class="{
+          active: w.name === state.currentWorkflow,
+          dragging: reorder.active && reorder.from === i,
+          'drop-target': reorder.active && reorder.to === i && reorder.to !== reorder.from,
+        }"
+        :data-wf-idx="i"
+        :data-drop-zone="'wf:' + w.name"
+        :title="'点击载入 · 拖动排序 · 拖入结果图可设为参考图'"
+        @click="onWfClick(w)"
+        @pointerdown="onItemPointerDown($event, i)"
       >
         <span class="wf-name" :title="w.name">
           {{ w.name }}
@@ -128,6 +216,22 @@ async function openDir() {
 .panel.drag-hot {
   outline: 2px dashed var(--accent);
   outline-offset: -2px;
+}
+/* 资产拖到具体卡片上：卡片亮边提示「松手设为该模板的参考图」 */
+.panel.drag-hot .wf-item:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+/* 拖拽排序中的状态 */
+.body.reordering {
+  user-select: none;
+  cursor: grabbing;
+}
+.wf-item.dragging {
+  opacity: 0.35;
+}
+.wf-item.drop-target {
+  box-shadow: inset 0 2px 0 var(--accent);
 }
 .head {
   display: flex;

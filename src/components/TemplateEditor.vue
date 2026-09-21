@@ -202,28 +202,28 @@ async function save() {
 
         <div class="conv-hint">
           <div class="conv-title">
-            💡 <b>节点标题标识规则</b>——<b>默认所有节点都不显示</b>，标题带标识才会暴露。格式：<code>显示名 | 标识 | 标识 | …</code>（用 <code>|</code> 分隔、位置任意、不分大小写）
+            💡 <b>节点标题标识规则</b>——<b>默认所有节点都不显示</b>，标题带标识才会暴露。格式：<code>显示名 | 标识 | 标识 | …</code>（用 <code>|</code> 或全角 <code>｜</code> 分隔、位置任意、不分大小写；显示名可留空，留空沿用节点默认名，显示名里不要写 <code>|</code>）
           </div>
           <div class="conv-grid">
-            <span class="conv-item"><code>~</code>彻底隐藏（模板编辑器里也不出现）</span>
-            <span class="conv-item"><code>数字</code>排序号，<b>相同数字的参数排成一行</b>（跨节点生效）</span>
+            <span class="conv-item"><code>~</code>彻底隐藏（可贴在词前如「~调试」；模板编辑器里也不出现）</span>
+            <span class="conv-item"><code>数字</code>排序号，<b>相同数字的参数排成一行</b>（跨节点生效）；多个数字取第一个，其余当显示名；0 不算号</span>
             <span class="conv-item"><code>+</code>暴露但不编号（排在带数字的后面）</span>
-            <span class="conv-item"><code>图</code>图片上传卡（图片 / 上传 同义）</span>
-            <span class="conv-item"><code>多图</code>多图上传，多张图各跑一次（多张 同义）</span>
-            <span class="conv-item"><code>种子</code>随机种子控件（随机 同义）</span>
-            <span class="conv-item"><code>长文</code>多行文本（长文本 / 多行 同义）</span>
-            <span class="conv-item"><code>文本</code>单行文本</span>
-            <span class="conv-item"><code>数字(词)</code>数字控件（纯数字是排序号，汉字「数字」才是控件）</span>
-            <span class="conv-item"><code>选择</code>下拉框（下拉 同义）</span>
-            <span class="conv-item"><code>开关</code>开关切换（切换 同义）</span>
-            <span class="conv-item"><code>预设:a,b,c</code>常用值一键填入（=a,b,c 同义）</span>
-            <span class="conv-item"><code>交换:A,B</code>⇄ 交换按钮，两个文本内容互换（默认配多行文本）</span>
+            <span class="conv-item"><code>图</code>图片上传卡（图片 / 上传 / image / img 同义）</span>
+            <span class="conv-item"><code>多图</code>多图上传（多张 / multiimg 同义）；实际提交数 = 图数 × 批次</span>
+            <span class="conv-item"><code>种子</code>随机种子控件（随机 / seed 同义）</span>
+            <span class="conv-item"><code>长文</code>多行文本（长文本 / 多行 / textarea 同义）</span>
+            <span class="conv-item"><code>文本</code>单行文本（text 同义）</span>
+            <span class="conv-item"><code>数字(词)</code>数字控件（纯数字是排序号，汉字「数字」/ number 才是控件）</span>
+            <span class="conv-item"><code>选择</code>下拉框（下拉 / select 同义）</span>
+            <span class="conv-item"><code>开关</code>开关切换（切换 / toggle 同义）</span>
+            <span class="conv-item"><code>预设:a,b,c</code>常用值一键填入（=a,b,c 同义；分隔符可用 ,，;；、；值被 <code>|</code> 拆开如「预设:20|25|30」也会自动并回）</span>
+            <span class="conv-item"><code>交换:A,B</code>⇄ 交换按钮，两个文本内容互换（swap:A,B 同义；只写交换没写功能词时默认配多行文本）</span>
             <span class="conv-item"><code>旧写法</code>数字开头「10 宽度」、功能词:开头「图:人脸参考」仍兼容</span>
           </div>
           <div class="conv-foot">
             示例：<code>提示词|1|长文</code> · <code>人脸参考|5|图</code> · <code>参考图|多图</code> ·
             <code>步数|20|预设:20,25,30</code> · <code>负面词|3|长文|交换:正,反</code> · <code>批量|+</code> · <code>调试|~</code>
-            。优先级：<b>定制模板 &gt; 节点标题约定 &gt; 自动推断</b>
+            。优先级：<b>定制模板 &gt; 节点标题约定 &gt; 自动推断</b>（右侧行内改动保存后即成定制模板，标题再怎么改都不受影响）
           </div>
         </div>
 

@@ -22,6 +22,7 @@ import {
   refreshQueue,
   removeAsset,
   renameAsset,
+  rerunAsset,
   requeueJob,
   state,
   toggleAssetRead,
@@ -155,15 +156,18 @@ function fmtTime(ts: number) {
   return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
+/** 下载文件名：优先别名（可能不带扩展名 → 补原文件扩展名），并去掉非法字符 */
+function safeAssetFilename(a: Asset) {
+  const safe = displayName(a).replace(/[\\/:*?"<>|]/g, '_')
+  const ext = (a.filename.match(/\.[a-z0-9]+$/i)?.[0] ?? '').toLowerCase()
+  return ext && !safe.toLowerCase().endsWith(ext) ? `${safe}${ext}` : safe
+}
+
 async function downloadOne(a: Asset) {
   try {
-    const safe = displayName(a).replace(/[\\/:*?"<>|]/g, '_')
-    // 别名可能不带扩展名 → 补上原文件扩展名，避免存出无后缀文件
-    const ext = (a.filename.match(/\.[a-z0-9]+$/i)?.[0] ?? '').toLowerCase()
-    const file = ext && !safe.toLowerCase().endsWith(ext) ? `${safe}${ext}` : safe
     // 不弹窗：直接存系统「下载」目录（同名覆盖无妨，ComfyUI 文件名本身唯一）
     const dir = String(await downloadDir()).replace(/[\\/]+$/, '')
-    const dest = `${dir}/${file}`
+    const dest = `${dir}/${safeAssetFilename(a)}`
     await api.saveOutput(a.base ?? primaryBase(), a.filename, a.subfolder, a.type, dest)
     notify(`已保存：${dest}`, 'ok', 4000)
   } catch (e) {
@@ -300,10 +304,92 @@ function removeCurrent() {
   closeLb()
 }
 
+// ---- 灯箱径向菜单：右键 / 长按舞台弹出环形快捷操作（收藏/下载/重跑/删除） ----
+const radial = ref<{ x: number; y: number; asset: Asset } | null>(null)
+let radialOpenedAt = 0 // 长按松手后浏览器还会补发一个 click，用时间戳把它和正常点击区分开
+let longPressTimer = 0
+
+function openRadial(x: number, y: number, a: Asset) {
+  // 4 个按钮圆心离触发点 72px、按钮半径 22px → 留 84px 边距保证整圈都在视口内
+  const M = 84
+  radial.value = {
+    x: Math.min(Math.max(x, M), window.innerWidth - M),
+    y: Math.min(Math.max(y, M), window.innerHeight - M),
+    asset: a,
+  }
+  radialOpenedAt = Date.now()
+}
+
+function closeRadial() {
+  radial.value = null
+}
+
+function radialRun(fn: (a: Asset) => void) {
+  const a = radial.value?.asset
+  closeRadial()
+  if (a) fn(a)
+}
+
+/** 舞台空白点击：径向菜单开着 → 先只关菜单；长按补发的 click 直接吞掉 */
+function onStageClick() {
+  if (Date.now() - radialOpenedAt < 350) return
+  if (radial.value) {
+    closeRadial()
+    return
+  }
+  closeLb()
+}
+
+function onStageCtx(e: MouseEvent) {
+  const a = lbAsset.value
+  if (!a) return
+  openRadial(e.clientX, e.clientY, a)
+}
+
+/** 长按舞台 500ms 弹出径向菜单；移动超过 8px 视为拖动意图，取消 */
+function onStagePointerDown(e: PointerEvent) {
+  if (e.button !== 0) return // 右键走 contextmenu
+  const a = lbAsset.value
+  if (!a) return
+  const sx = e.clientX
+  const sy = e.clientY
+  longPressTimer = window.setTimeout(() => {
+    longPressTimer = 0
+    openRadial(sx, sy, a)
+  }, 500)
+  const cancel = () => {
+    if (longPressTimer) {
+      window.clearTimeout(longPressTimer)
+      longPressTimer = 0
+    }
+    window.removeEventListener('pointermove', onMove)
+    window.removeEventListener('pointerup', cancel)
+    window.removeEventListener('pointercancel', cancel)
+  }
+  const onMove = (ev: PointerEvent) => {
+    if (Math.hypot(ev.clientX - sx, ev.clientY - sy) > 8) cancel()
+  }
+  window.addEventListener('pointermove', onMove)
+  window.addEventListener('pointerup', cancel)
+  window.addEventListener('pointercancel', cancel)
+}
+
+/** 径向菜单开着时，点击菜单以外任何地方都关掉（stage 自己的点击已在 onStageClick 处理） */
+function onGlobalClickForRadial(e: MouseEvent) {
+  if (!radial.value) return
+  if (Date.now() - radialOpenedAt < 350) return // 长按松手带的 click，别把刚开的菜单关了
+  const t = e.target as HTMLElement | null
+  if (!t?.closest('.radial-menu')) closeRadial()
+}
+
 function onKey(e: KeyboardEvent) {
   if (lbIndex.value < 0) return
   if (lbEditing.value) return // 重命名输入中：键盘留给输入框（Esc 由输入框自己处理）
   const k = e.key
+  if (k === 'Escape' && radial.value) {
+    closeRadial()
+    return
+  }
   if (k === 'Escape') closeLb()
   else if (k === 'ArrowLeft' || k === 'a' || k === 'A') stepLb(-1)
   else if (k === 'ArrowRight' || k === 'd' || k === 'D') stepLb(1)
@@ -346,11 +432,14 @@ onMounted(() => {
   window.addEventListener('keydown', onKey)
   window.addEventListener('click', closeCtx)
   window.addEventListener('contextmenu', onGlobalCtx)
+  window.addEventListener('click', onGlobalClickForRadial)
 })
 onUnmounted(() => {
   window.removeEventListener('keydown', onKey)
   window.removeEventListener('click', closeCtx)
   window.removeEventListener('contextmenu', onGlobalCtx)
+  window.removeEventListener('click', onGlobalClickForRadial)
+  if (longPressTimer) window.clearTimeout(longPressTimer)
 })
 </script>
 
@@ -427,7 +516,7 @@ onUnmounted(() => {
           清空资产
         </button>
       </header>
-      <!-- 筛选条：工作流下拉 + 未读/收藏 chip；灯箱翻页跟随筛选结果 -->
+      <!-- 筛选条：工作流下拉 + 节点下拉 + 未读/收藏 chip；灯箱翻页跟随筛选结果 -->
       <div class="r-filter">
         <select v-model="filterWf" class="select f-wf" title="只看某个工作流的产出">
           <option value="">全部工作流</option>
@@ -515,7 +604,13 @@ onUnmounted(() => {
     <!-- 放大预览：左右翻页 / 方向键 / Esc -->
     <div v-if="lbAsset" class="lightbox" @click.self="closeLb">
       <button class="nav prev" title="上一张（← / A）" @click="stepLb(-1)">‹</button>
-      <div class="stage" @click.self="closeLb">
+      <div
+        class="stage"
+        title="右键或长按弹出快捷操作（收藏/下载/重跑/删除）"
+        @click.self="onStageClick"
+        @contextmenu.prevent="onStageCtx"
+        @pointerdown="onStagePointerDown"
+      >
         <video
           v-if="lbAsset.kind === 'video'"
           :key="lbAsset.key"
@@ -588,6 +683,20 @@ onUnmounted(() => {
         <button class="btn sm danger" @click="removeCurrent">移除</button>
         <button class="btn sm ghost" @click="closeLb">关闭</button>
       </footer>
+      <!-- 径向菜单：以触发点为圆心的 4 个快捷操作（右键 / 长按舞台弹出） -->
+      <div
+        v-if="radial"
+        class="radial-menu"
+        :style="{ left: radial.x + 'px', top: radial.y + 'px' }"
+        @click.stop
+        @contextmenu.prevent
+      >
+        <span class="radial-core" />
+        <button class="radial-btn r-ren" title="重命名（保存后自动固定）" @click="radialRun(() => startLbRename())">✎</button>
+        <button class="radial-btn r-dl" title="下载到系统下载目录" @click="radialRun(downloadOne)">⬇</button>
+        <button class="radial-btn r-re" title="回填这张图的参数，换新种子重跑一张" @click="radialRun(rerunAsset)">↻</button>
+        <button class="radial-btn r-del" title="移除这张图" @click="radialRun(() => removeCurrent())">✕</button>
+      </div>
     </div>
 
     <!-- 应用内拖拽的跟随幽灵统一由 App.vue 渲染 -->
@@ -1154,6 +1263,90 @@ onUnmounted(() => {
 .btn.on {
   border-color: var(--accent);
   color: var(--accent);
+}
+
+/* ---- 灯箱径向菜单：以触发点为圆心的环形快捷操作 ---- */
+.radial-menu {
+  position: absolute;
+  z-index: 110;
+  width: 0;
+  height: 0;
+  transform-origin: center;
+  animation: radial-in 0.15s ease-out;
+}
+@keyframes radial-in {
+  from {
+    opacity: 0;
+    scale: 0.6;
+  }
+  to {
+    opacity: 1;
+    scale: 1;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .radial-menu {
+    animation: none;
+  }
+}
+.radial-core {
+  position: absolute;
+  left: -4px;
+  top: -4px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.55);
+  box-shadow: 0 0 0 6px rgba(255, 255, 255, 0.07);
+}
+.radial-btn {
+  position: absolute;
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(18, 18, 22, 0.92);
+  color: #fff;
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transform: translate(-50%, -50%);
+  box-shadow: 0 6px 22px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(6px);
+  transition: border-color 0.12s, background 0.12s;
+}
+.radial-btn:hover {
+  border-color: var(--accent);
+  background: rgba(34, 34, 40, 0.98);
+}
+/* 四向圆心：上=重命名 右=下载 左=重跑 下=删除（删除放最远，防误触） */
+.radial-btn.r-ren {
+  left: 0;
+  top: -72px;
+}
+.radial-btn.r-dl {
+  left: 72px;
+  top: 0;
+}
+.radial-btn.r-re {
+  left: -72px;
+  top: 0;
+}
+.radial-btn.r-del {
+  left: 0;
+  top: 72px;
+}
+.radial-btn.r-del:hover {
+  border-color: var(--err);
+  background: rgba(80, 24, 24, 0.95);
+  color: #fecaca;
+}
+.radial-btn.on {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft), 0 6px 22px rgba(0, 0, 0, 0.45);
 }
 
 /* ---- 右键菜单 ---- */

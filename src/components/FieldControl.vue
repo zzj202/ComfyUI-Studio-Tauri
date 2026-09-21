@@ -15,11 +15,11 @@ import {
   imageDropTargets,
   imageOriginBase,
   notify,
+  pasteSubmitField,
   primaryBase,
   promptHistory,
   recordImageOrigin,
   state,
-  submit,
 } from '../store'
 import { randomSeed } from '../core/parseWorkflow'
 
@@ -349,21 +349,7 @@ function clearText() {
   props.field.value = ''
 }
 
-/** 一键粘贴提交：读剪贴板文本填入本框（覆盖），按面板上的批次设置立即提交 */
-async function pasteAndSubmit() {
-  try {
-    const t = await navigator.clipboard.readText()
-    if (!t || !t.trim()) {
-      notify('剪贴板里没有文本', 'warn', 3000)
-      return
-    }
-    props.field.value = t.trim()
-    submit()
-    notify('已粘贴并提交', 'ok', 2000)
-  } catch {
-    notify('读取剪贴板失败，可手动 Ctrl+V 后再提交', 'warn', 4000)
-  }
-}
+// 「⚡ 粘贴提交」的实现已提到 store（pasteSubmitField）：按钮和全局快捷键 Ctrl+E 共用
 
 // ---- 常用提示词快捷按钮：所有文本字段共用一份库，localStorage 持久化 ----
 
@@ -513,8 +499,8 @@ if (props.field.kind === 'image') loadImageOptions()
         </button>
         <button
           class="tbtn go"
-          title="读取剪贴板文本填入本框（覆盖现有内容），并按当前批次设置立即提交"
-          @click="pasteAndSubmit"
+          title="读取剪贴板文本填入本框（覆盖现有内容），并按当前批次设置立即提交（Ctrl+E）"
+          @click="pasteSubmitField(field)"
         >
           ⚡ 粘贴提交
         </button>
@@ -524,6 +510,7 @@ if (props.field.kind === 'image') loadImageOptions()
           ref="ta"
           v-model="field.value"
           class="textarea"
+          :data-field-key="field.key"
           :placeholder="field.placeholder || field.label"
           rows="7"
           @keydown="onTextKeydown"

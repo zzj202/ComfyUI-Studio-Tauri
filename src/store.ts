@@ -433,8 +433,74 @@ export async function loadWorkflows() {
   try {
     const r = await api.listWorkflows()
     state.workflows = r.workflows ?? []
+    sortWorkflowsByOrder()
   } catch (e) {
     notify(`读取工作流列表失败：${e}`, 'error')
+  }
+}
+
+/** 按用户拖拽定制的顺序排工作流（settings.workflowOrder；没记录的排最后，保持扫描序） */
+function sortWorkflowsByOrder() {
+  const order = state.settings.workflowOrder
+  if (!Array.isArray(order) || !order.length) return
+  const idx = new Map(order.map((n, i) => [n, i]))
+  state.workflows.sort(
+    (a, b) => (idx.get(a.name) ?? Number.MAX_SAFE_INTEGER) - (idx.get(b.name) ?? Number.MAX_SAFE_INTEGER)
+  )
+}
+
+/** 工作流拖拽排序后落盘（settings.workflowOrder，随设置一起持久化） */
+export async function persistWorkflowOrder(names: string[]) {
+  state.settings.workflowOrder = names
+  try {
+    state.settings = await api.saveSettings({ workflowOrder: names })
+  } catch (e) {
+    notify(`保存排序失败：${e}`, 'error', 6000)
+  }
+}
+
+/**
+ * 把一份结果资产设为某个工作流的参考图（拖资产到工作流卡片）：
+ * 切到该模板（已在当前则不重载）→ 应用到第一个图片字段（单图）或多图字段追加。
+ * 复用 FieldControl 的取值规则：input 里已有文件直接引用并记上传源；output 先 copyToInput 到主节点。
+ */
+export async function applyAssetToWorkflow(a: Asset, wfName: string) {
+  if (a.kind !== 'image') {
+    notify('只有图片能设为参考图', 'warn')
+    return
+  }
+  try {
+    if (state.currentWorkflow !== wfName) await selectWorkflow(wfName)
+    let field = state.fields.find((f) => f.kind === 'image')
+    let multi = false
+    if (!field) {
+      field = state.fields.find((f) => f.kind === 'multiimage')
+      multi = true
+    }
+    if (!field) {
+      notify(`「${wfName}」没有图片字段，无法设参考图`, 'warn', 5000)
+      return
+    }
+    let path: string
+    if (a.type === 'input') {
+      path = a.subfolder ? `${a.subfolder}/${a.filename}` : a.filename
+      recordImageOrigin(path, a.base ?? primaryBase())
+    } else {
+      const base = primaryBase()
+      const res = await api.copyToInput(base, a.filename, a.subfolder, a.type, 'studio')
+      const sub = String(res?.subfolder ?? 'studio')
+      path = sub ? `${sub}/${res.name}` : String(res.name)
+      recordImageOrigin(path, base)
+    }
+    if (multi) {
+      if (!Array.isArray(field.value)) field.value = []
+      ;(field.value as string[]).push(path)
+    } else {
+      field.value = path
+    }
+    notify(`已设为「${wfName}」的参考图`, 'ok', 3000)
+  } catch (e) {
+    notify(`引用资产失败：${e}`, 'error', 8000)
   }
 }
 
@@ -992,6 +1058,25 @@ export function submit(batch = submitBatch.value) {
   void runChain(total, count, multi?.key, imgs, reroll, paramsSnapshot)
 }
 
+/**
+ * 一键粘贴提交：读剪贴板文本覆盖填入指定文本字段，按当前批次设置立即提交。
+ * 「⚡ 粘贴提交」按钮和全局快捷键 Ctrl+E 共用这一份实现。
+ */
+export async function pasteSubmitField(f: FieldSchema) {
+  try {
+    const t = await navigator.clipboard.readText()
+    if (!t || !t.trim()) {
+      notify('剪贴板里没有文本', 'warn', 3000)
+      return
+    }
+    f.value = t.trim()
+    submit()
+    notify(`已粘贴并提交到「${f.label}」`, 'ok', 2000)
+  } catch {
+    notify('读取剪贴板失败，可手动 Ctrl+V 后再提交', 'warn', 4000)
+  }
+}
+
 /** 当前表单全部字段值收成普通对象（JSON 可序列化，可塞进资产持久化） */
 function collectParamsSnapshot(): Record<string, any> | undefined {
   if (!state.fields.length) return undefined
@@ -1459,10 +1544,11 @@ export function renameAsset(a: Asset, alias: string) {
  * 命中后立即收进持久化缓存——缓存只在 buildFields 同步，直接改 f.value 不落盘的话
  * 400ms 防抖前刷新就会丢（阶段 18 的教训）。
  */
-export function applyAssetParams(a: Asset) {
+/** 返回命中的字段数（0 = 当前表单没有同名字段） */
+export function applyAssetParams(a: Asset): number {
   if (!a.params) {
     notify('该资产没有参数快照（旧版本产出的）', 'warn')
-    return
+    return 0
   }
   let n = 0
   for (const f of state.fields) {
@@ -1477,6 +1563,29 @@ export function applyAssetParams(a: Asset) {
   } else {
     notify('当前表单没有匹配的字段（工作流可能不同）', 'warn', 5000)
   }
+  return n
+}
+
+/**
+ * 重跑这张图（灯箱径向菜单 / 右键菜单）：切到它的来源工作流 → 回填参数快照 →
+ * 换新种子 → 提交 1 张。种子重掷保证不出和原图一样的结果。
+ */
+export async function rerunAsset(a: Asset) {
+  if (!a.params) {
+    notify('该资产没有参数快照（旧版本产出的），无法重跑', 'warn')
+    return
+  }
+  // 跨工作流先切过去（selectWorkflow 会重建表单字段），同工作流直接回填
+  if (a.workflow && a.workflow !== state.currentWorkflow) {
+    await selectWorkflow(a.workflow)
+  }
+  if (state.currentWorkflow !== a.workflow) {
+    notify(`切回工作流「${a.workflow}」失败，已取消重跑`, 'error', 6000)
+    return
+  }
+  if (!applyAssetParams(a)) return // 一个字段都没命中 = 参数对不上，别拿当前表单误跑
+  randomizeSeeds()
+  submit(1)
 }
 
 /** 在放大预览里看过 → 已读 */

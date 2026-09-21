@@ -10,7 +10,7 @@ import LogPanel from './components/LogPanel.vue'
 import Toasts from './components/Toasts.vue'
 import AssetDrop from './components/AssetDrop.vue'
 import LocalAssets from './components/LocalAssets.vue'
-import { disposeAll, dragGhost, imageDropTargets, init, notify, refreshQueue, state } from './store'
+import { disposeAll, dragGhost, imageDropTargets, init, notify, pasteSubmitField, refreshQueue, state } from './store'
 import { api, saveTempBlob } from './api/tauri'
 import type { FieldSchema } from './core/types'
 import { IMG_EXT_RE, extFromFile, filesFromClipboardData } from './core/clipboard'
@@ -123,9 +123,27 @@ function onBtnPointerDown(e: PointerEvent) {
   window.setTimeout(() => s.remove(), 700) // reduced-motion 下 animationend 不来，兜底清理
 }
 
+/** 全局 Ctrl+E：一键粘贴提交。
+ *  焦点在某个文本字段的 textarea 里 → 作用于它（textarea 带 data-field-key 标识）；
+ *  焦点在别处 → 作用于第一个文本字段；其他输入框（重命名/设置等）里直接放行不拦。 */
+function onGlobalKeydown(e: KeyboardEvent) {
+  if (e.repeat) return
+  if (!(e.ctrlKey && !e.altKey && !e.metaKey && (e.key === 'e' || e.key === 'E'))) return
+  const el = document.activeElement as HTMLElement | null
+  const taKey = el?.tagName === 'TEXTAREA' ? el.dataset['fieldKey'] : undefined
+  if (!taKey && isEditableTarget(el)) return // 重命名框 / 设置输入框等：键盘留给它自己
+  const f = taKey
+    ? state.fields.find((x) => x.key === taKey && x.kind === 'textarea')
+    : state.fields.find((x) => x.kind === 'textarea')
+  if (!f) return // 当前工作流没有文本字段：静默放行
+  e.preventDefault()
+  void pasteSubmitField(f)
+}
+
 onMounted(async () => {
   document.addEventListener('paste', onDocPaste)
   document.addEventListener('pointerdown', onBtnPointerDown)
+  window.addEventListener('keydown', onGlobalKeydown)
   await init()
   queueTimer = window.setInterval(() => {
     if (state.settings.autoRefreshQueue !== false && state.connection === 'ok') refreshQueue()
@@ -135,6 +153,7 @@ onMounted(async () => {
 onUnmounted(() => {
   document.removeEventListener('paste', onDocPaste)
   document.removeEventListener('pointerdown', onBtnPointerDown)
+  window.removeEventListener('keydown', onGlobalKeydown)
   if (queueTimer != null) clearInterval(queueTimer)
   disposeAll()
 })
