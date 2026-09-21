@@ -106,9 +106,10 @@ async function onDocPaste(e: ClipboardEvent) {
   }
 }
 
-/** 按钮触感：全局点击涟漪（事件委托到 .btn/.tbtn/.nav，动画结束自动移除） */
+/** 按钮触感：全局点击涟漪（事件委托到 .btn/.tbtn，动画结束自动移除）
+ *  灯箱翻页（.nav）刻意排除——全屏看图时不要涟漪 */
 function onBtnPointerDown(e: PointerEvent) {
-  const host = (e.target as HTMLElement | null)?.closest?.<HTMLElement>('.btn, .tbtn, .nav')
+  const host = (e.target as HTMLElement | null)?.closest?.<HTMLElement>('.btn, .tbtn')
   if (!host || (host as HTMLButtonElement).disabled) return
   const rect = host.getBoundingClientRect()
   const d = Math.max(rect.width, rect.height) * 2

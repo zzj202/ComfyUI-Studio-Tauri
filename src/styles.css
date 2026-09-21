@@ -185,10 +185,10 @@ textarea {
 }
 
 /* ---- 按钮触感反馈：悬停微抬 + 按压缩放（弹簧曲线）+ 点击涟漪 + 键盘焦点环 ----
-   涟漪 span 由 App.vue 的全局 pointerdown 委托注入，动画结束自动移除 */
+   涟漪 span 由 App.vue 的全局 pointerdown 委托注入，动画结束自动移除
+   注意：灯箱翻页（.nav）刻意不参与——全屏看图时翻页按钮只要朴素 hover，不要蹦跳/涟漪 */
 .btn,
-.tbtn,
-.nav {
+.tbtn {
   position: relative;
   overflow: hidden;
   transition:
@@ -199,14 +199,12 @@ textarea {
     box-shadow 0.18s;
 }
 .btn:hover:not(:disabled),
-.tbtn:hover,
-.nav:hover {
+.tbtn:hover {
   transform: translateY(-1px);
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.18);
 }
 .btn:active:not(:disabled),
-.tbtn:active,
-.nav:active {
+.tbtn:active {
   transform: translateY(0) scale(0.96);
   box-shadow: none;
   transition-duration: 0.05s;
@@ -240,16 +238,13 @@ textarea {
 }
 @media (prefers-reduced-motion: reduce) {
   .btn,
-  .tbtn,
-  .nav {
+  .tbtn {
     transition: background 0.14s, border-color 0.14s, opacity 0.14s;
   }
   .btn:hover:not(:disabled),
   .tbtn:hover,
-  .nav:hover,
   .btn:active:not(:disabled),
-  .tbtn:active,
-  .nav:active {
+  .tbtn:active {
     transform: none;
     box-shadow: none;
   }
