@@ -200,9 +200,16 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <option v-for="n in 10" :key="n" :value="n">批次 ×{{ n }}</option>
         </select>
         <button class="btn" :disabled="!state.fields.length" @click="randomizeSeeds">随机种子</button>
-        <button class="btn" :disabled="!state.fields.length" @click="interrupt">中断</button>
         <button
-          class="btn primary"
+          class="btn ghost"
+          :disabled="!state.fields.length"
+          title="中断当前节点上运行中的任务"
+          @click="interrupt"
+        >
+          中断
+        </button>
+        <button
+          class="btn hero"
           :disabled="!state.fields.length"
           title="Ctrl+Enter 也可提交"
           @click="submit()"
@@ -355,6 +362,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
   display: flex;
   gap: 8px;
   align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap; /* 窄窗口时换行，hero 主按钮不被挤压 */
 }
 .batch-select {
   width: 104px;

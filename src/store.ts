@@ -34,6 +34,8 @@ export const state = reactive({
   objectInfo: null as Record<string, any> | null,
 
   workflows: [] as WorkflowMeta[],
+  /** 工作流列表正在读取（面板显示骨架占位） */
+  workflowsLoading: false,
   templates: [] as ParamTemplate[],
   currentWorkflow: null as string | null,
   graph: null as any,
@@ -430,12 +432,15 @@ async function restoreQueueFromServer() {
 }
 
 export async function loadWorkflows() {
+  state.workflowsLoading = true
   try {
     const r = await api.listWorkflows()
     state.workflows = r.workflows ?? []
     sortWorkflowsByOrder()
   } catch (e) {
     notify(`读取工作流列表失败：${e}`, 'error')
+  } finally {
+    state.workflowsLoading = false
   }
 }
 
@@ -1434,6 +1439,54 @@ export async function requeueJob(job: Job) {
     notify(`已改派到「${workerName(target.base)}」`, 'ok', 4000)
   } catch (e) {
     notify(`改派提交失败：${e}（原任务已从队列摘除，请重新提交）`, 'error', 8000)
+  }
+  void refreshQueue()
+}
+
+/**
+ * 失败任务一键重试：用任务留存的 graph + 参数原样重新提交（换节点不换种子，跑的就是当时那份）。
+ * 与 requeueJob（改派排队任务）共用提交/替换记录的骨架，区别：
+ * 面向已结束（error/cancelled）任务、无需从队列摘除旧项、派发范围是全部可用节点。
+ */
+export async function retryJob(job: Job) {
+  if (job.status !== 'error' && job.status !== 'cancelled') return
+  if (!job.graph) {
+    notify('这个任务没有留存提交数据，无法重试（请重新提交）', 'warn', 6000)
+    return
+  }
+  const target = selectWorker(schedulableWorkers(), state.jobs, 'auto')
+  if (!target) {
+    notify('没有可用节点（可能都在冷却中），稍后再试', 'warn', 5000)
+    return
+  }
+  try {
+    const res = await api.submit(
+      target.base,
+      job.graph,
+      job.workflow || undefined,
+      job.params ? JSON.stringify(job.params) : undefined
+    )
+    const err = extractSubmitError(res, job.graph)
+    if (err) throw new Error(err)
+    const i = state.jobs.indexOf(job)
+    if (i >= 0) state.jobs.splice(i, 1)
+    state.jobs.unshift({
+      ...job,
+      promptId: String(res.prompt_id),
+      base: target.base,
+      workerId: target.id,
+      status: 'queued',
+      value: 0,
+      max: 0,
+      startedAt: Date.now(),
+      finishedAt: undefined,
+      error: undefined,
+      outputs: [],
+      staleSince: undefined,
+    })
+    notify('已重新提交', 'ok', 3000)
+  } catch (e) {
+    notify(`重试提交失败：${e}`, 'error', 8000)
   }
   void refreshQueue()
 }

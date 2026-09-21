@@ -162,7 +162,12 @@ async function openDir() {
     </header>
 
     <div class="body" :class="{ reordering: reorder.active }">
-      <div v-if="!state.workflows.length" class="empty">
+      <!-- 加载骨架：首次读取列表时占位（列表已有内容时不闪） -->
+      <div v-if="state.workflowsLoading && !state.workflows.length" class="skel-list">
+        <div v-for="i in 4" :key="i" class="skel-item" />
+      </div>
+
+      <div v-if="!state.workflows.length && !state.workflowsLoading" class="empty">
         还没有工作流。<br />
         点「+ 导入」，选择 ComfyUI 里<br /><b>导出 (API)</b> 得到的 JSON 文件。<br /><br />
         或者把 ComfyUI 生成的<b>图片/视频直接拖进窗口</b>，<br />自动反查它内嵌的工作流。
@@ -254,6 +259,23 @@ async function openDir() {
   flex: 1;
   overflow: auto;
   padding: 8px;
+}
+/* 首次加载骨架 */
+.skel-item {
+  height: 44px;
+  border-radius: var(--radius-sm);
+  margin-bottom: 4px;
+  background: linear-gradient(90deg, var(--bg-2) 25%, var(--bg-3) 45%, var(--bg-2) 65%);
+  background-size: 200% 100%;
+  animation: wf-skel 1.2s infinite linear;
+}
+@keyframes wf-skel {
+  from {
+    background-position: 200% 0;
+  }
+  to {
+    background-position: -200% 0;
+  }
 }
 .wf-item {
   position: relative;

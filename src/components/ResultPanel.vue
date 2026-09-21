@@ -24,6 +24,7 @@ import {
   renameAsset,
   rerunAsset,
   requeueJob,
+  retryJob,
   state,
   toggleAssetRead,
   togglePinAsset,
@@ -59,11 +60,28 @@ function removeHint(job: Job) {
   return '移除记录'
 }
 
+// ---- 失败任务：点击行展开完整错误 + 一键复制 + ↻ 原样重试 ----
+const expandedErrId = ref<string | null>(null)
+
+function toggleErr(job: Job) {
+  expandedErrId.value = expandedErrId.value === job.promptId ? null : job.promptId
+}
+
+async function copyErr(job: Job) {
+  try {
+    await navigator.clipboard.writeText(job.error ?? '')
+    notify('已复制错误信息', 'ok', 2000)
+  } catch {
+    notify('复制失败（剪贴板被其他程序占用？）', 'warn')
+  }
+}
+
 // ---------------------------------------------------------------- 结果资产
 
-// ---- 筛选：按工作流 / 按节点 / 只看未读 / 只看收藏（资产多了找图快） ----
+// ---- 筛选：按工作流 / 按节点 / 文件名搜索 / 只看未读 / 只看收藏（资产多了找图快） ----
 const filterWf = ref('')
 const filterNode = ref('')
+const filterText = ref('')
 const onlyUnread = ref(false)
 const onlyPinned = ref(false)
 
@@ -81,28 +99,31 @@ const nodeOptions = computed(() => {
 })
 
 const filterActive = computed(
-  () => !!filterWf.value || !!filterNode.value || onlyUnread.value || onlyPinned.value
+  () => !!filterWf.value || !!filterNode.value || !!filterText.value || onlyUnread.value || onlyPinned.value
 )
 
 function resetFilters() {
   filterWf.value = ''
   filterNode.value = ''
+  filterText.value = ''
   onlyUnread.value = false
   onlyPinned.value = false
 }
 
 /** 固定的排最前，其余按产出时间倒序；筛选条件叠加（灯箱翻页也走这份列表） */
-const assets = computed(() =>
-  [...state.assets]
+const assets = computed(() => {
+  const kw = filterText.value.trim().toLowerCase()
+  return [...state.assets]
     .filter(
       (a) =>
         (!filterWf.value || a.workflow === filterWf.value) &&
         (!filterNode.value || a.base === filterNode.value) &&
+        (!kw || displayName(a).toLowerCase().includes(kw)) &&
         (!onlyUnread.value || !a.read) &&
         (!onlyPinned.value || a.pinned)
     )
     .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.createdAt - a.createdAt)
-)
+})
 
 /** 队列头部悬停提示：各节点待处理明细 */
 const queueDetailTitle = computed(() => {
@@ -304,6 +325,30 @@ function removeCurrent() {
   closeLb()
 }
 
+// ---- 灯箱舞台底色：透明 PNG/GIF 需要换底色对比查看（棋盘格/深/浅，持久化） ----
+const LB_BG_KEY = 'comfyui-studio.lbBg:v1'
+type LbBg = 'checker' | 'dark' | 'light'
+const lbBg = ref<LbBg>('checker')
+try {
+  const v = localStorage.getItem(LB_BG_KEY)
+  if (v === 'dark' || v === 'light' || v === 'checker') lbBg.value = v
+} catch {
+  /* 忽略损坏的历史数据 */
+}
+const LB_BGS: { v: LbBg; label: string }[] = [
+  { v: 'checker', label: '棋盘' },
+  { v: 'dark', label: '深色' },
+  { v: 'light', label: '浅色' },
+]
+function setLbBg(v: LbBg) {
+  lbBg.value = v
+  try {
+    localStorage.setItem(LB_BG_KEY, v)
+  } catch {
+    /* 存储失败不影响主流程 */
+  }
+}
+
 // ---- 灯箱径向菜单：右键 / 长按舞台弹出环形快捷操作（收藏/下载/重跑/删除） ----
 const radial = ref<{ x: number; y: number; asset: Asset } | null>(null)
 let radialOpenedAt = 0 // 长按松手后浏览器还会补发一个 click，用时间戳把它和正常点击区分开
@@ -382,17 +427,64 @@ function onGlobalClickForRadial(e: MouseEvent) {
   if (!t?.closest('.radial-menu')) closeRadial()
 }
 
+// ---- 网格键盘流（灯箱关闭时）：J/K 移动焦点，Enter 开灯箱，X 收藏，Delete 移除 ----
+const gridFocus = ref<string | null>(null)
+
+function moveGridFocus(d: number) {
+  const list = assets.value
+  if (!list.length) return
+  const cur = gridFocus.value ? list.findIndex((a) => a.key === gridFocus.value) : -1
+  const i = cur < 0 ? (d > 0 ? 0 : list.length - 1) : Math.min(list.length - 1, Math.max(0, cur + d))
+  gridFocus.value = list[i].key
+  // 焦点卡滚进可视区（grid 滚动容器在 .r-body）
+  void nextTick(() => {
+    document
+      .querySelector(`[data-asset-card][data-key="${CSS.escape(gridFocus.value ?? '')}"]`)
+      ?.scrollIntoView({ block: 'nearest' })
+  })
+}
+
 function onKey(e: KeyboardEvent) {
-  if (lbIndex.value < 0) return
-  if (lbEditing.value) return // 重命名输入中：键盘留给输入框（Esc 由输入框自己处理）
-  const k = e.key
-  if (k === 'Escape' && radial.value) {
-    closeRadial()
+  // 输入框聚焦时键盘留给输入（重命名、搜索框等）
+  const t = e.target as HTMLElement | null
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+
+  if (lbIndex.value >= 0) {
+    if (lbEditing.value) return // 重命名输入中：键盘留给输入框（Esc 由输入框自己处理）
+    const k = e.key
+    if (k === 'Escape' && radial.value) {
+      closeRadial()
+      return
+    }
+    if (k === 'Escape') closeLb()
+    else if (k === 'ArrowLeft' || k === 'a' || k === 'A') stepLb(-1)
+    else if (k === 'ArrowRight' || k === 'd' || k === 'D') stepLb(1)
     return
   }
-  if (k === 'Escape') closeLb()
-  else if (k === 'ArrowLeft' || k === 'a' || k === 'A') stepLb(-1)
-  else if (k === 'ArrowRight' || k === 'd' || k === 'D') stepLb(1)
+
+  // 网格流：无修饰键才响应，避免和 Ctrl+E 等全局快捷键抢键
+  if (e.ctrlKey || e.metaKey || e.altKey) return
+  const k = e.key
+  const isJK = k === 'j' || k === 'J' || k === 'k' || k === 'K'
+  const isAct = k === 'Enter' || k === 'x' || k === 'X' || k === 'Delete'
+  if (!isJK && !isAct) return
+  const list = assets.value
+  if (!list.length) return
+  if (isJK) {
+    moveGridFocus(k === 'j' || k === 'J' ? 1 : -1)
+    return
+  }
+  const cur = gridFocus.value ? list.findIndex((a) => a.key === gridFocus.value) : -1
+  if (cur < 0) return // 还没有焦点卡：Enter/X/Delete 不乱动
+  const a = list[cur]
+  if (k === 'Enter') openLb(a)
+  else if (k === 'x' || k === 'X') togglePinAsset(a)
+  else if (k === 'Delete') {
+    removeAsset(a)
+    // 移除后焦点顺延到原位置（列表已实时重算；删空则清焦点）
+    const after = assets.value
+    gridFocus.value = after.length ? after[Math.min(cur, after.length - 1)].key : null
+  }
 }
 
 // ---------------------------------------------------------------- 应用内拖拽 / 右键菜单
@@ -484,7 +576,13 @@ onUnmounted(() => {
           <div v-if="job.status === 'running' || job.status === 'queued'" class="q-bar">
             <div class="q-fill" :style="{ width: pct(job) + '%' }" />
           </div>
-          <span v-else class="q-state" :class="{ err: job.status === 'error' }">
+          <span
+            v-else
+            class="q-state"
+            :class="{ err: job.status === 'error', clickable: !!job.error }"
+            :title="job.error && expandedErrId !== job.promptId ? '点击展开完整错误' : ''"
+            @click="job.error && toggleErr(job)"
+          >
             {{ job.error ? '失败' : STATUS_TEXT[job.status] }} · {{ dur(job) }}
           </span>
           <span v-if="job.outputs.length" class="faint q-files">{{ job.outputs.length }} 文件</span>
@@ -496,7 +594,20 @@ onUnmounted(() => {
           >
             ⇄
           </button>
+          <button
+            v-if="(job.status === 'error' || job.status === 'cancelled') && job.graph"
+            class="btn ghost sm q-x"
+            title="重试：用当时的参数原样重新提交"
+            @click="retryJob(job)"
+          >
+            ↻
+          </button>
           <button class="btn ghost sm q-x" :title="removeHint(job)" @click="discardJob(job)">✕</button>
+          <!-- 展开的完整错误（占满一整行，可复制） -->
+          <div v-if="job.error && expandedErrId === job.promptId" class="q-err" @click.stop>
+            <span>{{ job.error }}</span>
+            <button class="btn ghost sm" title="复制错误信息" @click="copyErr(job)">⧉ 复制</button>
+          </div>
         </div>
       </div>
     </div>
@@ -526,6 +637,14 @@ onUnmounted(() => {
           <option value="">全部节点</option>
           <option v-for="b in nodeOptions" :key="b" :value="b">{{ workerName(b) }}</option>
         </select>
+        <input
+          v-model="filterText"
+          class="select f-text"
+          type="text"
+          placeholder="🔍 搜文件名"
+          title="按文件名 / 别名模糊搜索（与上面筛选叠加）"
+          spellcheck="false"
+        />
         <button class="chip-f" :class="{ on: onlyUnread }" title="只看未读（新产出）" @click="onlyUnread = !onlyUnread">
           未读
         </button>
@@ -537,15 +656,23 @@ onUnmounted(() => {
       </div>
       <div class="r-body">
         <div v-if="!assets.length" class="empty">
-          还没有产出。<br />提交生成后，出图会出现在这里，点击可放大预览。
+          <template v-if="filterActive">
+            当前筛选没有匹配的产出。<br /><br />
+            <button class="btn sm" @click="resetFilters">清除筛选</button>
+          </template>
+          <template v-else>
+            还没有产出。<br />提交生成后，出图会出现在这里，点击可放大预览。<br /><br />
+            <span class="faint">提示：J / K 键移动选择，Enter 放大，X 收藏</span>
+          </template>
         </div>
         <div v-else class="grid">
           <figure
             v-for="a in assets"
             :key="a.key"
             class="card"
-            :class="{ 'unread-card': !a.read }"
+            :class="{ 'unread-card': !a.read, 'kb-focus': a.key === gridFocus }"
             data-asset-card
+            :data-key="a.key"
             @click="openLb(a)"
             @pointerdown="onCardPointerDown($event, a)"
             @contextmenu="openCtx($event, a)"
@@ -606,6 +733,7 @@ onUnmounted(() => {
       <button class="nav prev" title="上一张（← / A）" @click="stepLb(-1)">‹</button>
       <div
         class="stage"
+        :class="'lb-bg-' + lbBg"
         title="右键或长按弹出快捷操作（收藏/下载/重跑/删除）"
         @click.self="onStageClick"
         @contextmenu.prevent="onStageCtx"
@@ -660,6 +788,16 @@ onUnmounted(() => {
           <span class="a-node-dot" />{{ workerName(lbAsset.base) }}
         </span>
         <span class="spacer" />
+        <!-- 透明图底色切换：棋盘格 / 深 / 浅（持久化） -->
+        <span class="lb-bg-seg" title="透明图底色">
+          <button
+            v-for="b in LB_BGS"
+            :key="b.v"
+            class="lb-bg-btn"
+            :class="{ on: lbBg === b.v }"
+            @click="setLbBg(b.v)"
+          >{{ b.label }}</button>
+        </span>
         <button
           v-if="lbPromptEntries.length"
           class="btn sm"
@@ -782,6 +920,7 @@ onUnmounted(() => {
 .q-row {
   display: flex;
   align-items: center;
+  flex-wrap: wrap; /* 失败详情占满一整行时换行 */
   gap: 6px;
   font-size: 11.5px;
   padding: 3px 0;
@@ -870,9 +1009,35 @@ onUnmounted(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-faint);
+  font-variant-numeric: tabular-nums; /* 耗时数字对齐不跳 */
 }
 .q-state.err {
   color: var(--err);
+}
+.q-state.clickable {
+  cursor: pointer;
+}
+.q-state.clickable:hover {
+  text-decoration: underline dotted;
+}
+/* 失败任务展开的完整错误（flex-basis 100% 独占一行） */
+.q-err {
+  flex-basis: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--err);
+  background: rgba(248, 113, 113, 0.08);
+  border-radius: 4px;
+  padding: 4px 8px;
+  word-break: break-all;
+  white-space: normal;
+}
+.q-err span {
+  flex: 1;
+  min-width: 0;
 }
 .q-files {
   flex: 0 1 auto;
@@ -928,6 +1093,17 @@ onUnmounted(() => {
   max-width: 150px;
   padding: 3px 24px 3px 8px;
   font-size: 12px;
+}
+/* 文件名搜索框：与下拉同高同款 */
+.f-text {
+  flex: 1 1 96px;
+  min-width: 0;
+  max-width: 150px;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+.f-text::placeholder {
+  color: var(--text-faint);
 }
 /* 全部中断：警示色文字，hover 加重 */
 .q-stop {
@@ -1006,6 +1182,11 @@ onUnmounted(() => {
     0 0 0 1px var(--accent-soft),
     0 2px 12px rgba(99, 102, 241, 0.28);
 }
+/* 键盘流的焦点卡（J/K 移动）：细描边提示当前位置 */
+.card.kb-focus {
+  border-color: var(--accent);
+  outline: 1px solid var(--accent-soft);
+}
 .unread-pill {
   position: absolute;
   top: 6px;
@@ -1078,6 +1259,7 @@ onUnmounted(() => {
   flex: none;
   font-size: 10px;
   opacity: 0.7;
+  font-variant-numeric: tabular-nums;
 }
 .rename-input {
   flex: 1;
@@ -1151,6 +1333,43 @@ onUnmounted(() => {
   object-fit: contain;
   border-radius: 6px;
   box-shadow: 0 8px 40px rgba(0, 0, 0, 0.6);
+}
+/* 透明图底色三态：底色打在图片/视频元素上（只罩透明区，不改变舞台整体暗色调） */
+.stage.lb-bg-checker img,
+.stage.lb-bg-checker video {
+  background: conic-gradient(#323850 25%, #22263a 0 50%, #323850 0 75%, #22263a 0) 0 0 / 20px 20px;
+}
+.stage.lb-bg-dark img,
+.stage.lb-bg-dark video {
+  background: #10131c;
+}
+.stage.lb-bg-light img,
+.stage.lb-bg-light video {
+  background: #e8eaf2;
+}
+/* 底色切换段控件 */
+.lb-bg-seg {
+  display: inline-flex;
+  border: 1px solid var(--border-soft);
+  border-radius: 7px;
+  overflow: hidden;
+}
+.lb-bg-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 11px;
+  line-height: 1;
+  padding: 5px 8px;
+  cursor: pointer;
+  transition: background 0.14s, color 0.14s;
+}
+.lb-bg-btn:hover {
+  color: var(--text-dim);
+}
+.lb-bg-btn.on {
+  background: var(--accent-soft);
+  color: inherit;
 }
 .nav {
   position: absolute;
