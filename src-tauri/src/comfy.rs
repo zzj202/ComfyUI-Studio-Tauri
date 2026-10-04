@@ -17,11 +17,20 @@ use tauri::command;
 
 // ---------------------------------------------------------------- 基础工具
 
+/// 共享 HTTP 客户端（内部 Arc，clone 廉价）：复用连接池，避免每个请求都重新
+/// TCP/TLS 握手——批量提交几十个任务时能明显减轻服务端连接压力。
+/// 全局 300s 只是兜底（个别请求如 object_info/history 没写按请求超时）；
+/// 大多数调用点都有更短的 `.timeout(...)` 覆盖，per-request 优先于全局。
 fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(60))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(300))
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(8)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    });
+    HTTP.clone()
 }
 
 pub fn join_url(base: &str, path: &str) -> String {

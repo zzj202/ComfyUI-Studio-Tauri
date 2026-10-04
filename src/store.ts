@@ -464,6 +464,93 @@ export async function persistWorkflowOrder(names: string[]) {
   }
 }
 
+// ---- 固定工作流：固定的不可删除（settings.pinnedWorkflows，随设置持久化） ----
+
+export function isWorkflowPinned(name: string): boolean {
+  const list = state.settings.pinnedWorkflows
+  return Array.isArray(list) && list.includes(name)
+}
+
+export async function toggleWorkflowPin(name: string) {
+  const list: string[] = Array.isArray(state.settings.pinnedWorkflows)
+    ? [...state.settings.pinnedWorkflows]
+    : []
+  const wasPinned = list.includes(name)
+  if (wasPinned) list.splice(list.indexOf(name), 1)
+  else list.push(name)
+  state.settings.pinnedWorkflows = list
+  try {
+    state.settings = await api.saveSettings({ pinnedWorkflows: list })
+    notify(wasPinned ? `已取消固定「${name}」` : `已固定「${name}」，删除会被拦下`, 'info', 3000)
+  } catch (e) {
+    notify(`保存固定状态失败：${e}`, 'error', 6000)
+  }
+}
+
+/**
+ * 工作流改名（重命名文件）+ 全链路引用迁移：
+ * 列表元数据 / 拖拽排序 / 已填参数值缓存 / 上次打开记录 / 模板绑定。
+ * 历史任务与资产的 workflow 字段保持提交时的名字（历史语义，不追改）。
+ */
+export async function renameWorkflow(oldName: string, newName: string) {
+  const name = newName.trim()
+  if (!name || name === oldName) return
+  if (state.workflows.some((w) => w.name === name)) {
+    notify(`已存在同名工作流「${name}」`, 'warn', 5000)
+    return
+  }
+  try {
+    await api.renameWorkflow(oldName, name)
+  } catch (e) {
+    notify(`改名失败：${e}`, 'error', 8000)
+    return
+  }
+
+  // 1) 列表元数据
+  const meta = state.workflows.find((w) => w.name === oldName)
+  if (meta) meta.name = name
+
+  // 2) 拖拽排序里的旧名 → 新名
+  if (Array.isArray(state.settings.workflowOrder)) {
+    const order = state.settings.workflowOrder.map((n: string) => (n === oldName ? name : n))
+    await persistWorkflowOrder(order)
+  }
+
+  // 3) 已填参数值缓存（fieldValueCache + localStorage 落盘）
+  if (fieldValueCache.has(oldName)) {
+    fieldValueCache.set(name, fieldValueCache.get(oldName)!)
+    fieldValueCache.delete(oldName)
+    persistFieldValues()
+  }
+
+  // 4) 上次打开的工作流
+  try {
+    if (localStorage.getItem('comfyui-studio.lastWorkflow:v1') === oldName) {
+      localStorage.setItem('comfyui-studio.lastWorkflow:v1', name)
+    }
+  } catch {
+    /* 忽略存储失败 */
+  }
+
+  // 5) 模板绑定迁移（落盘，否则模板失联）
+  for (const t of state.templates) {
+    if (t.workflow === oldName) {
+      t.workflow = name
+      try {
+        await api.saveTemplate(t)
+      } catch (e) {
+        notify(`模板「${t.name}」的绑定迁移失败：${e}`, 'warn', 8000)
+      }
+    }
+  }
+  if (state.activeTemplate?.workflow === oldName) state.activeTemplate.workflow = name
+
+  // 6) 当前打开的正是它：内存里 graph/fields 不用重建，改名字即可
+  if (state.currentWorkflow === oldName) state.currentWorkflow = name
+
+  notify(`已改名：「${oldName}」→「${name}」`, 'ok', 4000)
+}
+
 /**
  * 把一份结果资产设为某个工作流的参考图（拖资产到工作流卡片）：
  * 切到该模板（已在当前则不重载）→ 应用到第一个图片字段（单图）或多图字段追加。
@@ -573,6 +660,20 @@ async function loadObjectInfo() {
   }
 }
 
+// ---- 队列 UI 投影（150ms 合并）：入队几十个任务时服务端会连发几十条 status，
+// 每条都重建 queueByBase + 重算 total 会让三个组件跟着狂渲染——合并一次足够跟手 ----
+let projTimer: number | null = null
+
+function flushQueueProjection() {
+  projTimer = null
+  queueByBase.value = Object.fromEntries(perBaseQueue)
+  let total = 0
+  for (const [b, n] of perBaseQueue) {
+    if (wss.has(b)) total += n // 已从节点池删除的不计入
+  }
+  state.queueRemaining = total
+}
+
 function connectWs() {
   for (const w of wss.values()) w.dispose()
   wss.clear()
@@ -593,13 +694,10 @@ function connectWs() {
       },
       onStatus: ({ queueRemaining }) => {
         perBaseQueue.set(base, queueRemaining)
-        // 实时维护每节点明细（队列头悬停 tooltip 用）
-        queueByBase.value = { ...queueByBase.value, [base]: queueRemaining }
-        let total = 0
-        for (const [b, n] of perBaseQueue) {
-          if (wss.has(b)) total += n // 已从节点池删除的不计入
+        // UI 投影走 150ms 合并（数据层 perBaseQueue 立即保真）
+        if (projTimer == null) {
+          projTimer = window.setTimeout(flushQueueProjection, 150)
         }
-        state.queueRemaining = total
         // 该机队列已空 → 应用内还挂在它名下的 queued/running 就是幽灵任务，安排清理
         if (queueRemaining === 0) {
           window.clearTimeout(reapTimer)
@@ -635,6 +733,13 @@ function connectWs() {
         }
         notify(`任务出错：${message}`, 'error', 8000)
       },
+      needsLive: () =>
+        // 该机还有排队/运行中的任务 → WS 需要保活（假死 watchdog 用）
+        state.jobs.some(
+          (j) =>
+            (j.base ?? primaryBase()) === base &&
+            (j.status === 'queued' || j.status === 'running')
+        ),
     })
     wss.set(base, conn)
     conn.connect()
@@ -927,14 +1032,25 @@ function randomizeHiddenSeeds(graph: any) {
 function waitForJob(promptId: string, base: string, timeoutMs = 2 * 60 * 60 * 1000): Promise<boolean> {
   return new Promise((resolve) => {
     const started = Date.now()
+    let missingSince = 0 // 记录消失的起始时刻（改派换绑/清理竞态时短暂找不到）
     const timer = window.setInterval(() => {
       const job = state.jobs.find((j) => j.base === base && j.promptId === promptId)
-      if (!job || job.status === 'done' || job.status === 'error' || job.status === 'cancelled') {
+      if (job && (job.status === 'done' || job.status === 'error' || job.status === 'cancelled')) {
         clearInterval(timer)
-        resolve(job?.status === 'done')
-      } else if (Date.now() - started > timeoutMs) {
-        clearInterval(timer)
-        resolve(false)
+        resolve(job.status === 'done')
+      } else if (!job) {
+        // 记录不在了：宽限 30s（改派瞬间旧记录被替换属正常），仍不出现才按取消收尾
+        if (!missingSince) missingSince = Date.now()
+        else if (Date.now() - missingSince > 30_000) {
+          clearInterval(timer)
+          resolve(false)
+        }
+      } else {
+        missingSince = 0 // 找到了（且未结束）：继续等
+        if (Date.now() - started > timeoutMs) {
+          clearInterval(timer)
+          resolve(false)
+        }
       }
     }, 400)
   })
@@ -1223,7 +1339,17 @@ async function runChain(
         base: r.base,
         graph: r.graph,
       })
-      if (state.jobs.length > 50) state.jobs.length = 50
+      // 防内存膨胀：只清已结束的旧记录（保底 150 条）；排队/运行中的绝不截——
+      // 截了 waitForJob 找不到记录会立刻按「已取消」收尾，onExecuting/onProgress
+      // 也找不到宿主，产出不落资产 → 用户看到的就是「任务凭空消失像掉线」
+      if (state.jobs.length > 300) {
+        const finished = state.jobs.filter((j) => j.status !== 'queued' && j.status !== 'running')
+        const excess = finished.length - 150
+        if (excess > 0) {
+          const victims = new Set(finished.slice(0, excess).map((j) => `${j.base}|${j.promptId}`))
+          state.jobs = state.jobs.filter((j) => !victims.has(`${j.base}|${j.promptId}`))
+        }
+      }
       done_.push({ base: r.base, promptId: r.promptId })
       // 每提交一个批次任务就把表单种子换新：下一个批次 collectValues 拿到的就是新种子，
       // 表单上也随时显示新鲜种子（与「每批次提交后随机」一致）

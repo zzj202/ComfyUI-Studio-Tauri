@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, reactive, ref, watchEffect } from 'vue'
+import { nextTick, onMounted, onUnmounted, reactive, ref, watchEffect } from 'vue'
 import { api } from '../api/tauri'
 import { open } from '@tauri-apps/plugin-dialog'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -8,12 +8,15 @@ import {
   dragGhost,
   dropZones,
   isDragClick,
+  isWorkflowPinned,
   loadWorkflows,
   notify,
   openAssetWorkflow,
   persistWorkflowOrder,
+  renameWorkflow,
   selectWorkflow,
   state,
+  toggleWorkflowPin,
 } from '../store'
 import type { DragItem } from '../store'
 import type { WorkflowMeta } from '../core/types'
@@ -60,7 +63,9 @@ function idxAt(x: number, y: number): number {
 
 function onItemPointerDown(e: PointerEvent, idx: number) {
   if (e.button !== 0) return
+  if (editingWf.value) return // 改名输入中：不动排序
   if ((e.target as HTMLElement).closest('.del')) return // 删除按钮不触发拖拽
+  if ((e.target as HTMLElement).closest('.wf-ops')) return // 固定/改名按钮也不触发
   const startY = e.clientY
   let started = false
   const move = (ev: PointerEvent) => {
@@ -93,9 +98,36 @@ function onItemPointerDown(e: PointerEvent, idx: number) {
 }
 
 function onWfClick(w: WorkflowMeta) {
-  // 刚结束的排序拖拽 / 资产拖拽派发的 click 不当选择处理
+  // 刚结束的排序拖拽 / 资产拖拽派发的 click 不当选择处理；改名输入中不响应
   if (Date.now() - reorderEndedAt < 120 || isDragClick()) return
+  if (editingWf.value) return
   void selectWorkflow(w.name)
+}
+
+// ---- 工作流行内改名：✎ → 输入框，Enter/失焦确认，Esc 取消 ----
+const editingWf = ref<string | null>(null)
+const editWfName = ref('')
+
+function startRename(w: WorkflowMeta) {
+  editingWf.value = w.name
+  editWfName.value = w.name
+  nextTick(() => {
+    const el = document.getElementById('wf-rename') as HTMLInputElement | null
+    el?.focus()
+    el?.select()
+  })
+}
+
+function confirmRename(w: WorkflowMeta) {
+  if (editingWf.value !== w.name) return
+  const newName = editWfName.value.trim()
+  editingWf.value = null
+  if (!newName || newName === w.name) return
+  void renameWorkflow(w.name, newName)
+}
+
+function cancelRename() {
+  editingWf.value = null
 }
 
 const dataDir = ref('')
@@ -123,6 +155,11 @@ async function importWorkflow() {
 }
 
 async function remove(name: string) {
+  // 双保险：固定的不删（UI 上删除按钮已隐藏）
+  if (isWorkflowPinned(name)) {
+    notify(`「${name}」已固定，先取消固定再删除`, 'warn', 5000)
+    return
+  }
   if (!window.confirm(`确定删除工作流「${name}」？此操作不可撤销。`)) return
   try {
     await api.deleteWorkflow(name)
@@ -188,14 +225,42 @@ async function openDir() {
         @click="onWfClick(w)"
         @pointerdown="onItemPointerDown($event, i)"
       >
-        <span class="wf-name" :title="w.name">
-          {{ w.name }}
-          <span v-if="w.broken" class="broken" title="JSON 解析失败">!</span>
+        <template v-if="editingWf === w.name">
+          <input
+            id="wf-rename"
+            v-model="editWfName"
+            class="wf-rename"
+            @click.stop
+            @pointerdown.stop
+            @keydown.enter.prevent="confirmRename(w)"
+            @keydown.esc.prevent="cancelRename"
+            @blur="confirmRename(w)"
+          />
+        </template>
+        <template v-else>
+          <span class="wf-name" :title="w.name">
+            {{ w.name }}
+            <span v-if="w.broken" class="broken" title="JSON 解析失败">!</span>
+          </span>
+          <span class="wf-meta">
+            {{ w.nodeCount }} 节点<template v-if="!w.hasMeta"> · 无标题</template>
+          </span>
+        </template>
+        <span class="wf-ops">
+          <span
+            class="op pin"
+            :class="{ on: isWorkflowPinned(w.name) }"
+            :title="isWorkflowPinned(w.name) ? '取消固定' : '固定（固定后不可删除）'"
+            @click.stop="toggleWorkflowPin(w.name)"
+          >📌</span>
+          <span class="op ren" title="改名" @click.stop="startRename(w)">✎</span>
+          <span
+            v-if="!isWorkflowPinned(w.name)"
+            class="op del"
+            title="删除"
+            @click.stop="remove(w.name)"
+          >✕</span>
         </span>
-        <span class="wf-meta">
-          {{ w.nodeCount }} 节点<template v-if="!w.hasMeta"> · 无标题</template>
-        </span>
-        <span class="del" title="删除" @click.stop="remove(w.name)">✕</span>
       </button>
     </div>
 
@@ -284,7 +349,7 @@ async function openDir() {
   flex-direction: column;
   gap: 2px;
   align-items: flex-start;
-  padding: 9px 26px 9px 10px;
+  padding: 9px 64px 9px 10px; /* 右侧给操作组留位 */
   margin-bottom: 4px;
   background: transparent;
   border: 1px solid transparent;
@@ -315,23 +380,50 @@ async function openDir() {
   font-size: 11px;
   color: var(--text-faint);
 }
-.del {
+/* 右侧操作组：固定 / 改名 / 删除（hover 出现；固定的 📌 常亮） */
+.wf-ops {
   position: absolute;
   right: 6px;
   top: 50%;
   transform: translateY(-50%);
+  display: flex;
+  gap: 2px;
+}
+.op {
   color: var(--text-faint);
   font-size: 12px;
-  padding: 2px 5px;
+  line-height: 1;
+  padding: 3px 5px;
   border-radius: 4px;
   opacity: 0;
+  cursor: pointer;
+  transition: opacity 0.12s, background 0.14s, color 0.14s;
 }
-.wf-item:hover .del {
+.wf-item:hover .op {
   opacity: 1;
 }
-.del:hover {
+.op.pin.on {
+  opacity: 1;
+  color: var(--accent);
+}
+.op.ren:hover {
+  background: var(--bg-3);
+  color: inherit;
+}
+.op.del:hover {
   background: #f8717122;
   color: var(--err);
+}
+/* 行内改名输入框 */
+.wf-rename {
+  width: 100%;
+  font-size: 12.5px;
+  padding: 2px 6px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  background: var(--bg-1);
+  color: inherit;
+  outline: none;
 }
 .foot {
   padding: 9px 12px;

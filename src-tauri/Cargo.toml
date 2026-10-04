@@ -32,6 +32,7 @@ urlencoding = "2"
 # 解析资产内嵌元数据：zTXt 解压用 flate2，预览图转 data URL 用 base64
 flate2 = "1"
 base64 = "0.22"
+tauri-plugin-single-instance = "2.4.5"
 
 # 读取剪贴板里的文件列表（资源管理器复制的图片文件直接粘贴上传）
 [target.'cfg(windows)'.dependencies]

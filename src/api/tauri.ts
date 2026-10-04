@@ -42,6 +42,8 @@ export const api = {
   saveWorkflow: (name: string, graph: any) =>
     invoke<any>('save_workflow', { name, graph }),
   deleteWorkflow: (name: string) => invoke<any>('delete_workflow', { name }),
+  renameWorkflow: (oldName: string, newName: string) =>
+    invoke<{ ok: boolean; name: string }>('rename_workflow', { old: oldName, new: newName }),
   importWorkflow: (src: string, name?: string) =>
     invoke<{ ok: boolean; name: string }>('import_workflow', { src, name: name ?? null }),
 

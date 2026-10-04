@@ -322,6 +322,24 @@ pub fn delete_workflow(name: String) -> Result<Value, String> {
     Ok(json!({ "ok": true }))
 }
 
+/// 工作流改名（重命名文件；目标已存在则拒绝，防覆盖）
+#[command]
+pub fn rename_workflow(old: String, new: String) -> Result<Value, String> {
+    let from = safe_name(&old)?;
+    let to = safe_name(&new)?;
+    let dir = ensure_dirs()?.join("workflows");
+    let src = dir.join(with_ext(&from));
+    if !src.exists() {
+        return Err(format!("工作流不存在：{}", from));
+    }
+    let dst = dir.join(with_ext(&to));
+    if dst.exists() {
+        return Err(format!("已存在同名工作流：{}", to));
+    }
+    fs::rename(&src, &dst).map_err(|e| format!("重命名失败：{}", e))?;
+    Ok(json!({ "ok": true, "name": to }))
+}
+
 /// 从任意磁盘位置导入一份工作流（复制进应用数据目录）
 #[command]
 pub fn import_workflow(src: String, name: Option<String>) -> Result<Value, String> {

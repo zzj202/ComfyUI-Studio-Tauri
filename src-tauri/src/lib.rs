@@ -35,6 +35,11 @@ fn toggle_main(app: &tauri::AppHandle) {
 /// - `store`    : 应用数据目录下的设置、工作流、模板持久化
 pub fn run() {
     tauri::Builder::default()
+        // 单实例保护（官方要求必须第一个注册）：旧实例还在托盘常驻时再次启动，
+        // 不再双开抢 Alt+2 全局热键，而是唤起旧实例、新进程自动退出
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            show_main(app);
+        }))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         // 全局快捷键插件：setup 里的 app.global_shortcut() 依赖它先被 manage（否则启动即 panic）
@@ -88,7 +93,9 @@ pub fn run() {
                     }
                     toggle_main(app);
                 }) {
-                    eprintln!("注册 Alt+2 全局快捷键失败（可能被其他程序占用）：{e}");
+                    eprintln!(
+                        "注册 Alt+2 全局快捷键失败（系统级已被其他进程占用；常见原因：上次的实例还在托盘运行，或网易云音乐/OBS/AHK 等软件的全局快捷键冲突）：{e}"
+                    );
                 }
             }
 
@@ -139,6 +146,7 @@ pub fn run() {
             store::read_workflow,
             store::save_workflow,
             store::delete_workflow,
+            store::rename_workflow,
             store::import_workflow,
             store::list_templates,
             store::save_template,

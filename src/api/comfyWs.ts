@@ -18,7 +18,18 @@ export interface WsHandlers {
     message: string
     traceback?: string
   }) => void
+  /**
+   * 假死检测回调：该节点当前是否需要实时消息（有排队/运行中的任务才保活）。
+   * 连接假死（TCP 半开：看着 OPEN 但收不到任何数据，远程机器/反代 NAT 超时常见）
+   * 不会触发 onclose——必须在应用层主动检测并重建。
+   */
+  needsLive?: () => boolean
 }
+
+/** 假死判定：需要实时消息却连续这么久没收到任何 WS 消息（含 status/progress） */
+const STALE_MS = 60_000
+/** watchdog 巡检间隔 */
+const WATCHDOG_MS = 15_000
 
 function toWs(base: string, clientId: string): string {
   const u = new URL(base)
@@ -33,12 +44,16 @@ export class ComfyWs {
   private disposed = false
   private retry = 0
   private retryTimer: number | null = null
+  /** 最近一次收到任何消息（含二进制预览帧）的时间戳；0 = 还没收到过 */
+  private lastMsgAt = 0
+  private watchdogTimer: number | null = null
 
   constructor(private base: string, private clientId: string, private handlers: WsHandlers) {}
 
   connect() {
     this.disposed = false
     this.open()
+    this.startWatchdog()
   }
 
   private open() {
@@ -70,6 +85,7 @@ export class ComfyWs {
       /* onclose 会接着触发，重连交给它 */
     }
     ws.onmessage = (ev) => {
+      this.lastMsgAt = Date.now()
       // 预览帧是二进制数据，直接忽略
       if (typeof ev.data !== 'string') return
       let msg: any
@@ -80,6 +96,28 @@ export class ComfyWs {
       }
       this.dispatch(msg)
     }
+  }
+
+  /**
+   * 假死 watchdog：有活动任务（needsLive）却连续 STALE_MS 没有任何消息，
+   * 主动 close() 让 onclose 走既有重连。空闲节点安静是正常的，不干预。
+   */
+  private startWatchdog() {
+    if (this.watchdogTimer != null) return
+    this.watchdogTimer = window.setInterval(() => {
+      if (this.disposed) return
+      const ws = this.ws
+      if (!ws || ws.readyState !== WebSocket.OPEN) return
+      if (this.lastMsgAt === 0) return // 刚连上还没收到过消息（connecting/握手慢），再等等
+      if (!this.handlers.needsLive?.()) return
+      if (Date.now() - this.lastMsgAt < STALE_MS) return
+      console.warn(`[ws] ${this.base} 疑似假死（${STALE_MS / 1000}s 无消息但有活动任务），重建连接`)
+      try {
+        ws.close()
+      } catch {
+        /* onclose 会触发重连 */
+      }
+    }, WATCHDOG_MS)
   }
 
   private dispatch(msg: any) {
@@ -144,6 +182,10 @@ export class ComfyWs {
     if (this.retryTimer != null) {
       clearTimeout(this.retryTimer)
       this.retryTimer = null
+    }
+    if (this.watchdogTimer != null) {
+      clearInterval(this.watchdogTimer)
+      this.watchdogTimer = null
     }
     try {
       this.ws?.close()
