@@ -9,7 +9,7 @@ export const ui = reactive({
   workerBoardOpen: false,
   /** 右侧「📁 素材」本地文件夹浏览列（TopBar 按钮开关，状态持久化） */
   localFilesOpen: false,
-  /** 左下角「本地资产」收藏条（TopBar 按钮开关，状态持久化） */
+  /** 左下角「收藏」条（TopBar 按钮开关，状态持久化）：上传到系统的精选素材 */
   localAssetsOpen: true,
   /** 置 true 即请求打开「选择资产文件」对话框（由 AssetDrop 消费后复位） */
   assetPick: false,

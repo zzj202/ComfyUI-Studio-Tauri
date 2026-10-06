@@ -46,6 +46,18 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         // 系统通知（出图完成提醒，窗口在后台时用）
         .plugin(tauri_plugin_notification::init())
+        // 记忆主窗口大小/位置：关闭时自动保存，下次启动自动恢复（覆盖 builder 的默认尺寸）。
+        // 只记 SIZE/POSITION/MAXIMIZED——不记可见性：✕ 是隐藏到托盘，直接退出时
+        // 若把「隐藏」状态记住，下次启动窗口会隐身。
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::SIZE
+                        | tauri_plugin_window_state::StateFlags::POSITION
+                        | tauri_plugin_window_state::StateFlags::MAXIMIZED,
+                )
+                .build(),
+        )
         .setup(|app| {
             // 便携模式：先把旧版 C 盘 AppData 里的用户数据搬到程序旁 data\（一次性）
             store::migrate_from_legacy();
@@ -142,6 +154,8 @@ pub fn run() {
             store::clipboard_file_paths,
             store::list_local_media,
             store::read_local_file,
+            store::copy_to_favorites,
+            store::rename_local_file,
             store::get_settings,
             store::save_settings,
             store::list_workflows,

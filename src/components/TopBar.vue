@@ -36,7 +36,7 @@ function toggleUi(key: 'localFilesOpen' | 'localAssetsOpen', storeKey: string) {
   }
 }
 
-/** 「📁 素材」列开关（状态持久化，重启恢复） */
+/** 「📁 本地素材」列开关（状态持久化，重启恢复） */
 function toggleLocalFiles() {
   toggleUi('localFilesOpen', LF_OPEN_KEY)
 }
@@ -146,15 +146,15 @@ function healthInfo(base: string): { cls: string; text: string } {
       title="本地素材浏览器：浏览自定义文件夹里的图片/视频，可拖到参数卡当参考图"
       @click="toggleLocalFiles"
     >
-      📁 素材
+      📁 本地素材
     </button>
     <button
       class="btn sm"
       :class="{ active: ui.localAssetsOpen }"
-      title="本地资产收藏条（左下角）：常用图片随手拖"
+      title="收藏条（左下角）：图片/视频复制进系统素材库集中存放，随手拖去当参考图"
       @click="toggleUi('localAssetsOpen', LA_OPEN_KEY)"
     >
-      🖼 收藏
+      ⭐ 收藏
     </button>
     <button class="btn sm" @click="ui.logsOpen = !ui.logsOpen">日志</button>
     <button class="btn sm" @click="ui.settingsOpen = true">⚙ 设置</button>

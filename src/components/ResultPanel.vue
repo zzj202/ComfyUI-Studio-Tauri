@@ -122,7 +122,7 @@ async function copyAssetToClipboard(a: Asset) {
 
 // ---------------------------------------------------------------- 结果资产
 
-// ---- 筛选：按工作流 / 按节点 / 文件名搜索 / 只看未读 / 只看收藏（资产多了找图快） ----
+// ---- 筛选：按工作流 / 按节点 / 文件名搜索 / 只看未读 / 只看固定（资产多了找图快） ----
 const filterWf = ref('')
 const filterNode = ref('')
 const filterText = ref('')
@@ -181,7 +181,7 @@ const unreadCount = computed(() => state.assets.filter((a) => !a.read).length)
 /**
  * 预览地址缓存（key → { base, url }）。
  * viewUrl 每次调用都带新时间戳参数，若模板直接绑定，组件每次重渲染
- * （进度轮询 / 标已读 / 收藏切换…）src 都会变 → 视频图片全部重新加载 → 闪烁卡顿。
+ * （进度轮询 / 标已读 / 固定切换…）src 都会变 → 视频图片全部重新加载 → 闪烁卡顿。
  * 同一资产的 URL 只算一次；换 baseUrl 才重算（资产 key 含文件名，内容不会变）。
  */
 const urlCache = new Map<string, { base: string; url: string }>()
@@ -247,12 +247,12 @@ function safeAssetFilename(a: Asset) {
 
 async function downloadOne(a: Asset) {
   try {
-    // 不弹窗：优先设置里配置的下载目录，留空用系统「下载」目录（同名覆盖无妨，ComfyUI 文件名本身唯一）
+    // 不弹窗：优先设置里配置的下载目录，留空用系统「下载」目录；同名自动加序号 (2)(3)…
     const configured = String(state.settings.downloadDir ?? '').trim()
     const dir = (configured || String(await downloadDir())).replace(/[\\/]+$/, '')
     const dest = `${dir}/${safeAssetFilename(a)}`
-    await api.saveOutput(a.base ?? primaryBase(), a.filename, a.subfolder, a.type, dest)
-    notify(`已保存：${dest}`, 'ok', 4000)
+    const r = await api.saveOutput(a.base ?? primaryBase(), a.filename, a.subfolder, a.type, dest)
+    notify(`已保存：${r.path}`, 'ok', 4000)
   } catch (e) {
     notify(`保存失败：${e}`, 'error', 8000)
   }
@@ -353,7 +353,7 @@ async function copyLbPrompt(text: string) {
   }
 }
 
-// ---- 灯箱内重命名（确认后自动固定：起名保存 = 要收藏） ----
+// ---- 灯箱内重命名（确认后自动固定：起名保存 = 要固定） ----
 const lbEditing = ref(false)
 const lbEditName = ref('')
 
@@ -502,7 +502,7 @@ function setLbBg(v: LbBg) {
   }
 }
 
-// ---- 灯箱径向菜单：右键 / 长按舞台弹出环形快捷操作（收藏/下载/重跑/删除） ----
+// ---- 灯箱径向菜单：右键 / 长按舞台弹出环形快捷操作（固定/下载/重跑/删除） ----
 const radial = ref<{ x: number; y: number; asset: Asset } | null>(null)
 let radialOpenedAt = 0 // 长按松手后浏览器还会补发一个 click，用时间戳把它和正常点击区分开
 let longPressTimer = 0
@@ -580,7 +580,7 @@ function onGlobalClickForRadial(e: MouseEvent) {
   if (!t?.closest('.radial-menu')) closeRadial()
 }
 
-// ---- 网格键盘流（灯箱关闭时）：J/K 移动焦点，Enter 开灯箱，X 收藏，Delete 移除 ----
+// ---- 网格键盘流（灯箱关闭时）：J/K 移动焦点，Enter 开灯箱，X 固定，Delete 移除 ----
 const gridFocus = ref<string | null>(null)
 
 function moveGridFocus(d: number) {
@@ -849,7 +849,7 @@ onUnmounted(() => {
           清空资产
         </button>
       </header>
-      <!-- 筛选条：工作流下拉 + 节点下拉 + 未读/收藏 chip；灯箱翻页跟随筛选结果 -->
+      <!-- 筛选条：工作流下拉 + 节点下拉 + 未读/固定 chip；灯箱翻页跟随筛选结果 -->
       <div class="r-filter">
         <select v-model="filterWf" class="select f-wf" title="只看某个工作流的产出">
           <option value="">全部工作流</option>
@@ -870,8 +870,8 @@ onUnmounted(() => {
         <button class="chip-f" :class="{ on: onlyUnread }" title="只看未读（新产出）" @click="onlyUnread = !onlyUnread">
           未读
         </button>
-        <button class="chip-f" :class="{ on: onlyPinned }" title="只看固定的收藏" @click="onlyPinned = !onlyPinned">
-          📌 收藏
+        <button class="chip-f" :class="{ on: onlyPinned }" title="只看固定的产出" @click="onlyPinned = !onlyPinned">
+          📌 固定
         </button>
         <span class="spacer" />
         <button v-if="filterActive" class="btn ghost sm" @click="resetFilters">重置筛选</button>
@@ -884,7 +884,7 @@ onUnmounted(() => {
           </template>
           <template v-else>
             还没有产出。<br />提交生成后，出图会出现在这里，点击可放大预览。<br /><br />
-            <span class="faint">提示：J / K 键移动选择，Enter 放大，X 收藏</span>
+            <span class="faint">提示：J / K 键移动选择，Enter 放大，X 固定</span>
           </template>
         </div>
         <div v-else class="grid">
@@ -963,7 +963,7 @@ onUnmounted(() => {
       <div
         class="stage"
         :class="'lb-bg-' + lbBg"
-        title="右键或长按弹出快捷操作（收藏/下载/重跑/删除）"
+        title="右键或长按弹出快捷操作（固定/下载/重跑/删除）"
         @click.self="onStageClick"
         @contextmenu.prevent="onStageCtx"
         @pointerdown="onStagePointerDown"

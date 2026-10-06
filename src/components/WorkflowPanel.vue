@@ -29,8 +29,6 @@ function onDropZone(item: { asset?: any; path?: string }) {
 }
 onMounted(() => {
   dropZones.set('workflow-panel', onDropZone)
-  // 便携模式：数据根目录跟随程序所在位置，动态显示真实路径
-  api.appDataDir().then((d) => (dataDir.value = d)).catch(() => {})
 })
 onUnmounted(() => dropZones.delete('workflow-panel'))
 
@@ -306,8 +304,6 @@ async function confirmCreateGroup() {
   }
 }
 
-const dataDir = ref('')
-
 async function importWorkflow() {
   const picked = await open({
     multiple: true,
@@ -490,14 +486,6 @@ async function openDir() {
         ＋ 新建分组
       </button>
     </div>
-
-    <footer class="foot">
-      <span class="faint">
-        工作流与模板保存在程序旁
-        <code :title="dataDir">{{ dataDir || 'data\\' }}</code>
-        （便携模式：整个程序文件夹拷走数据跟着走）
-      </span>
-    </footer>
   </section>
 </template>
 
@@ -747,18 +735,5 @@ async function openDir() {
   background: var(--bg-1);
   color: inherit;
   outline: none;
-}
-.foot {
-  padding: 9px 12px;
-  border-top: 1px solid var(--border-soft);
-  font-size: 11px;
-  line-height: 1.6;
-  flex: none;
-}
-.foot code {
-  background: var(--bg-3);
-  padding: 1px 4px;
-  border-radius: 3px;
-  font-size: 10.5px;
 }
 </style>

@@ -107,10 +107,48 @@ pub fn migrate_from_legacy() {
 
 fn ensure_dirs() -> Result<PathBuf, String> {
     let root = app_root()?;
-    for sub in ["workflows", "templates", "outputs"] {
+    for sub in ["workflows", "templates", "outputs", "favorites"] {
         fs::create_dir_all(root.join(sub)).map_err(|e| format!("创建目录失败：{}", e))?;
     }
     Ok(root)
+}
+
+/// 重命名素材库/本地目录里的一个媒体文件（同目录内改名，不移动）。
+/// 新名经 safe_name 校验（禁路径分隔符/..），同名已存在则拒绝（不覆盖）。
+#[command]
+pub fn rename_local_file(path: String, new_name: String) -> Result<String, String> {
+    let p = PathBuf::from(&path);
+    if !p.is_file() {
+        return Err("文件不存在".into());
+    }
+    let n = safe_name(&new_name)?;
+    let dir = p.parent().ok_or_else(|| "路径没有父目录".to_string())?;
+    let dest = dir.join(&n);
+    if dest.exists() {
+        return Err(format!("「{}」已存在，换个名字", n));
+    }
+    fs::rename(&p, &dest).map_err(|e| format!("重命名失败：{}", e))?;
+    Ok(dest.to_string_lossy().to_string())
+}
+
+/// 把一个本地文件复制进应用收藏库（favorites/），返回收藏后的完整路径。
+/// 「收藏」条用：素材集中存放在应用数据目录里，而不是引用散落各处的原始路径。
+/// 同名文件覆盖（重复添加同一文件只留一份，前端按路径去重）。
+#[command]
+pub fn copy_to_favorites(src: String) -> Result<String, String> {
+    let from = PathBuf::from(&src);
+    if !from.is_file() {
+        return Err("文件不存在".into());
+    }
+    let dir = ensure_dirs()?.join("favorites");
+    let name = from
+        .file_name()
+        .ok_or_else(|| "路径没有文件名".to_string())?
+        .to_string_lossy()
+        .to_string();
+    let dest = dir.join(&name);
+    fs::copy(&from, &dest).map_err(|e| format!("复制失败：{}", e))?;
+    Ok(dest.to_string_lossy().to_string())
 }
 
 /// 名称安全校验：禁止空名、路径分隔符和 .. （防路径穿越）

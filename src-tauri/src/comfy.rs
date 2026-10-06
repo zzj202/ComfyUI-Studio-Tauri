@@ -416,10 +416,41 @@ pub async fn comfy_save_output(
             .await
             .map_err(|e| format!("创建目录失败：{}", e))?;
     }
-    tokio::fs::write(&dest, &bytes)
+    // 同名不覆盖：目标已存在时自动追加序号 「xxx (2).png」「xxx (3).png」…
+    let mut final_dest = dest.clone();
+    if Path::new(&final_dest).exists() {
+        let p = Path::new(&dest);
+        let stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "file".into());
+        let ext = p
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
+        let mut n = 2u32;
+        loop {
+            let cand = match p.parent() {
+                Some(d) => d
+                    .join(format!("{} ({}){}", stem, n, ext))
+                    .to_string_lossy()
+                    .to_string(),
+                None => format!("{} ({}){}", stem, n, ext),
+            };
+            if !Path::new(&cand).exists() {
+                final_dest = cand;
+                break;
+            }
+            n += 1;
+            if n > 999 {
+                break; // 极端兜底：编号用尽按原名覆盖
+            }
+        }
+    }
+    tokio::fs::write(&final_dest, &bytes)
         .await
         .map_err(|e| format!("写入文件失败：{}", e))?;
-    Ok(json!({ "ok": true, "path": dest, "size": bytes.len() }))
+    Ok(json!({ "ok": true, "path": final_dest, "size": bytes.len() }))
 }
 
 /// GET /view 取文件字节（base64 返回）：前端像素级处理（视频截帧/复制图片）时用。

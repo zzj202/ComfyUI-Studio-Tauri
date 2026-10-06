@@ -6,12 +6,13 @@
  * - 右键：发送到图片字段 / 打开所在位置
  * - 只读不写：不提供删除等破坏性操作，本地文件在资源管理器里管
  */
-import { computed, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
-import { api, saveTempBlob } from '../api/tauri'
-import { addManualAsset, beginDrag, imageDropTargets, notify, primaryBase, state } from '../store'
+import { api } from '../api/tauri'
+import { captureLocalFrame, copyLocalImageToClipboard, writePngToClipboard } from '../core/localMedia'
+import { beginDrag, notify } from '../store'
 import { ui } from '../ui'
 
 interface MediaItem {
@@ -180,71 +181,34 @@ const groups = computed(() => {
   return order.map((label) => ({ label, items: map.get(label)! }))
 })
 
-// ---- 预览浮层的复制/截帧：字节经 Rust 拿回（asset 源跨域会污染 canvas）再走 blob URL ----
+// ---- 预览浮层：视频控制（按钮 + Q/E/空格/R 快捷键）与图片复制（Ctrl+C） ----
+// 截帧字节经 Rust read_local_file 拿回（asset 源跨域会污染 canvas），只进剪贴板不上传
 
 const pvVideo = ref<HTMLVideoElement | null>(null)
+const pvPlaying = ref(false)
 
-function b64ToBlobUrl(b64: string, mime: string): string {
-  const bin = atob(b64)
-  const bytes = new Uint8Array(bin.length)
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i)
-  return URL.createObjectURL(new Blob([bytes], { type: mime }))
+function stepPv(d: number) {
+  const v = pvVideo.value
+  if (!v) return
+  v.pause()
+  v.currentTime = Math.min(v.duration || 0, Math.max(0, v.currentTime + d / 30))
 }
 
-function extOf(p: string): string {
-  const n = p.split(/[\\/]/).pop() ?? ''
-  const i = n.lastIndexOf('.')
-  return i >= 0 ? n.slice(i + 1).toLowerCase() : ''
+function togglePv() {
+  const v = pvVideo.value
+  if (!v) return
+  if (v.paused) void v.play().catch(() => {})
+  else v.pause()
 }
 
-/** 截取预览视频当前帧：进剪贴板 + 结果区留底（自动固定），与结果区截帧行为一致 */
+/** 截取预览视频当前帧：只写剪贴板（Ctrl+V 即用），不上传不留底 */
 async function captureFrame(it: MediaItem) {
   const t = pvVideo.value?.currentTime ?? 0
   notify('正在截取当前帧…', 'info', 2000)
   try {
-    const url = b64ToBlobUrl(await api.readLocalFile(it.path), `video/${extOf(it.path) || 'mp4'}`)
-    const off = document.createElement('video')
-    off.muted = true
-    off.preload = 'auto'
-    off.src = url
-    await new Promise<void>((resolve, reject) => {
-      off.onloadedmetadata = () => resolve()
-      off.onerror = () => reject(new Error('视频加载失败'))
-    })
-    off.currentTime = Math.min(t, off.duration || t)
-    await new Promise<void>((resolve) => {
-      off.onseeked = () => resolve()
-      window.setTimeout(resolve, 3000) // seek 事件偶发不触发的兜底
-    })
-    const c = document.createElement('canvas')
-    c.width = off.videoWidth || 720
-    c.height = off.videoHeight || 1280
-    c.getContext('2d')?.drawImage(off, 0, 0, c.width, c.height)
-    URL.revokeObjectURL(url)
-    const png = await new Promise<Blob>((resolve, reject) =>
-      c.toBlob((b) => (b ? resolve(b) : reject(new Error('截帧失败'))), 'image/png')
-    )
-    let copied = false
-    try {
-      await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })])
-      copied = true
-    } catch {
-      /* 剪贴板被占用/权限失败：结果区留底兜底 */
-    }
-    const path = await saveTempBlob(png, 'png')
-    const base = primaryBase()
-    const res = await api.uploadImage(base, path, undefined, 'studio', true)
-    const name = String(res?.name ?? '')
-    if (name) {
-      addManualAsset({ base, filename: name, subfolder: String(res?.subfolder ?? 'studio'), pinned: true })
-    }
-    notify(
-      copied
-        ? '已截取当前帧：剪贴板可直接 Ctrl+V（结果区也留了一份）'
-        : '已截取当前帧（剪贴板写入失败，结果区可查看）',
-      copied ? 'ok' : 'warn',
-      5000
-    )
+    const png = await captureLocalFrame(it.path, t)
+    await writePngToClipboard(png)
+    notify('已截取当前帧：剪贴板可直接 Ctrl+V', 'ok', 4000)
   } catch (e) {
     notify(`截帧失败：${e}`, 'error', 8000)
   }
@@ -253,39 +217,83 @@ async function captureFrame(it: MediaItem) {
 /** 复制本地图片到剪贴板（统一转 PNG，gif/webp 都能贴） */
 async function copyImage(it: MediaItem) {
   try {
-    const url = b64ToBlobUrl(await api.readLocalFile(it.path), `image/${extOf(it.path) || 'png'}`)
-    const img = document.createElement('img')
-    img.src = url
-    await new Promise<void>((resolve, reject) => {
-      img.onload = () => resolve()
-      img.onerror = () => reject(new Error('图片加载失败'))
-    })
-    const c = document.createElement('canvas')
-    c.width = img.naturalWidth
-    c.height = img.naturalHeight
-    c.getContext('2d')?.drawImage(img, 0, 0)
-    URL.revokeObjectURL(url)
-    const png = await new Promise<Blob>((resolve, reject) =>
-      c.toBlob((b) => (b ? resolve(b) : reject(new Error('转码失败'))), 'image/png')
-    )
-    await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })])
+    await copyLocalImageToClipboard(it.path)
     notify(`已复制「${it.name}」到剪贴板`, 'ok', 3000)
   } catch (e) {
     notify(`复制失败：${e}`, 'error', 8000)
   }
 }
 
-/** 发送到图片字段：走字段注册的上传回调（与粘贴/拖拽同一通道） */
-function sendToField(p: string) {
-  const f =
-    state.fields.find((x) => x.kind === 'image') ??
-    state.fields.find((x) => x.kind === 'multiimage')
-  if (!f) {
-    notify('当前工作流没有图片字段', 'warn', 4000)
+/** 预览浮层的键盘：Q/E 逐帧、空格播放/暂停、R 截帧、Ctrl+C 复制图片 */
+function onPvKey(e: KeyboardEvent) {
+  if (!preview.value) return
+  const t = e.target as HTMLElement | null
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+  const k = e.key
+  if ((e.ctrlKey || e.metaKey) && (k === 'c' || k === 'C')) {
+    e.preventDefault()
+    if (preview.value.kind === 'image') void copyImage(preview.value)
     return
   }
-  void imageDropTargets.get(f.key)?.(p)
-  notify(`已发送「${fileName(p)}」到「${f.label}」`, 'ok', 2500)
+  if (e.ctrlKey || e.metaKey || e.altKey) return
+  if (preview.value.kind !== 'video') return
+  if (k === 'q' || k === 'Q') stepPv(-1)
+  else if (k === 'e' || k === 'E') stepPv(1)
+  else if (k === ' ') {
+    e.preventDefault()
+    togglePv()
+  } else if (k === 'r' || k === 'R') void captureFrame(preview.value)
+}
+window.addEventListener('keydown', onPvKey)
+
+// ---- 行内重命名（只改主名，扩展名固定不可改） ----
+const editingPath = ref<string | null>(null)
+const editName = ref('')
+
+/** 取主名（不含扩展名） */
+function stemOf(p: string): string {
+  const n = fileName(p)
+  const i = n.lastIndexOf('.')
+  return i > 0 ? n.slice(0, i) : n
+}
+
+function startRename(it: MediaItem) {
+  editingPath.value = it.path
+  editName.value = stemOf(it.path) // 只给主名，扩展名锁定
+  nextTick(() => {
+    const el = document.querySelector<HTMLInputElement>('.lf-rename')
+    if (el) {
+      el.focus()
+      el.select()
+    }
+  })
+}
+
+function cancelRename() {
+  editingPath.value = null
+}
+
+async function confirmRename() {
+  const old = editingPath.value
+  editingPath.value = null
+  if (!old) return
+  const stem = editName.value.trim()
+  const ext = old.slice(old.lastIndexOf('.')) // 沿用原扩展名（含「.」；无扩展名则空）
+  const name = ext ? `${stem}${ext}` : stem
+  if (!stem || name === fileName(old)) return
+  try {
+    const newPath = await api.renameLocalFile(old, name)
+    const i = items.value.findIndex((x) => x.path === old)
+    if (i >= 0) {
+      items.value[i] = { ...items.value[i], path: newPath, name: fileName(newPath) }
+    }
+    if (preview.value?.path === old) {
+      preview.value = { ...preview.value, path: newPath, name: fileName(newPath) }
+    }
+    notify(`已重命名：${fileName(newPath)}`, 'ok', 2500)
+  } catch (e) {
+    notify(`重命名失败：${e}`, 'error', 8000)
+  }
 }
 
 // ---- 右键菜单 ----
@@ -374,10 +382,21 @@ window.addEventListener('click', onDocClick)
               :class="{ dir: it.isDir }"
               :title="it.isDir ? it.name : `${it.name}${fmtSize(it.size) ? ' · ' + fmtSize(it.size) : ''}（按住拖到参数卡）`"
               @click="activate(it)"
-              @pointerdown="!it.isDir && beginDrag($event, { path: it.path, label: it.name, thumb: thumbUrl(it) })"
+              @pointerdown="!it.isDir && editingPath !== it.path && beginDrag($event, { path: it.path, label: it.name, thumb: thumbUrl(it) })"
               @contextmenu="openCtx($event, it)"
             >
-              <template v-if="it.isDir">
+              <!-- 行内重命名：整卡变输入框（Enter 确认 / Esc 取消） -->
+              <input
+                v-if="editingPath === it.path"
+                v-model="editName"
+                class="lf-rename mono"
+                @click.stop
+                @pointerdown.stop
+                @keydown.enter.prevent="confirmRename"
+                @keydown.esc.prevent="cancelRename"
+                @blur="confirmRename"
+              />
+              <template v-else-if="it.isDir">
                 <span class="lf-dir-icon">📁</span>
                 <span class="lf-dir-name">{{ it.name }}</span>
               </template>
@@ -417,30 +436,43 @@ window.addEventListener('click', onDocClick)
       @click.stop
       @contextmenu.prevent
     >
-      <button class="lf-ctx-item" @click="ctxRun((it) => sendToField(it.path))">
-        ⤴ 发送到图片字段
-      </button>
+      <button class="lf-ctx-item" @click="ctxRun((it) => startRename(it))">✎ 重命名</button>
       <button class="lf-ctx-item" @click="ctxRun((it) => revealItemInDir(it.path).catch(() => {}))">
         📂 打开所在位置
       </button>
     </div>
 
-    <!-- 点击放大预览（Esc / 点外部关闭）：视频可截帧、图片可复制 -->
+    <!-- 点击放大预览（Esc / 点外部关闭）：视频控制+截帧（Q/E/空格/R），图片 Ctrl+C 复制 -->
     <div v-if="preview" class="lf-preview" @click.self="preview = null" @contextmenu.prevent>
       <div class="lf-pv-body">
-        <video v-if="preview.kind === 'video'" ref="pvVideo" :src="thumbUrl(preview)" controls autoplay loop />
+        <video
+          v-if="preview.kind === 'video'"
+          ref="pvVideo"
+          :src="thumbUrl(preview)"
+          controls
+          autoplay
+          loop
+          @play="pvPlaying = true"
+          @pause="pvPlaying = false"
+        />
         <img v-else :src="thumbUrl(preview)" :alt="preview.name" />
       </div>
       <div class="lf-pv-cap">
-        <span class="mono" :title="preview.path">{{ preview.name }}</span>
-        <span class="spacer" />
-        <button v-if="preview.kind === 'video'" class="btn sm" title="截取当前画面：进剪贴板，结果区留底并自动固定" @click="captureFrame(preview)">
-          📷 截帧
-        </button>
-        <button v-if="preview.kind === 'image'" class="btn sm" title="复制图片（可直接粘贴发送）" @click="copyImage(preview)">
+        <template v-if="preview.kind === 'video'">
+          <button class="btn sm ghost" title="上一帧（Q）" @click="stepPv(-1)">⏮</button>
+          <button class="btn sm ghost" :title="pvPlaying ? '暂停（空格）' : '播放（空格）'" @click="togglePv">
+            {{ pvPlaying ? '⏸' : '▶' }}
+          </button>
+          <button class="btn sm ghost" title="下一帧（E）" @click="stepPv(1)">⏭</button>
+          <button class="btn sm" title="截取当前画面（R）：只进剪贴板，Ctrl+V 即用" @click="captureFrame(preview)">
+            📷 截帧
+          </button>
+        </template>
+        <button v-if="preview.kind === 'image'" class="btn sm" title="复制图片（Ctrl+C，可直接粘贴发送）" @click="copyImage(preview)">
           ⧉ 复制
         </button>
-        <button class="btn sm" @click="sendToField(preview.path)">⤴ 发送到图片字段</button>
+        <span class="mono" :title="preview.path">{{ preview.name }}</span>
+        <span class="spacer" />
         <button class="btn sm ghost" @click="preview = null">✕</button>
       </div>
     </div>
@@ -633,6 +665,18 @@ window.addEventListener('click', onDocClick)
   font-size: 9px;
   line-height: 1.3;
   pointer-events: none;
+}
+/* 行内重命名输入框：铺满整卡 */
+.lf-rename {
+  width: 100%;
+  height: 100%;
+  border: none;
+  background: var(--bg-1);
+  color: var(--text);
+  font-size: 11px;
+  text-align: center;
+  outline: 1px solid var(--accent);
+  padding: 4px;
 }
 /* 右键菜单：fixed 定位，样式与结果区 ctx-menu 一致 */
 .lf-ctx {
