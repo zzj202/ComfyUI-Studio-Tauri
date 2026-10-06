@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { nextTick, onMounted, onUnmounted, reactive, ref, watchEffect } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watchEffect } from 'vue'
 import { api } from '../api/tauri'
 import { open } from '@tauri-apps/plugin-dialog'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -51,21 +51,90 @@ watchEffect((onCleanup) => {
   })
 })
 
-// ---- 工作流列表拖拽排序（pointer 模拟：HTML5 DnD 被 WebView2 的 dragDropEnabled 吞掉）----
-// 按下 → 纵向移动超阈值进入排序 → 实时高亮目标位 → 松手换位并持久化到 settings.workflowOrder
-const reorder = reactive({ active: false, from: -1, to: -1 })
+// ---- 树形分组渲染：组头（含空组）→ 组内工作流 → 未分组区 ----
+// 组 = workflows/ 下的一级子目录（Rust 扫描）；归组/移组/改名 = 文件移动（renameWorkflow 全链路迁移引用）
+const COLLAPSE_KEY = 'comfyui-studio.groupCollapsed:v1'
+
+const collapsed = ref<Record<string, boolean>>(
+  (() => {
+    try {
+      const raw = localStorage.getItem(COLLAPSE_KEY)
+      if (raw) {
+        const obj = JSON.parse(raw)
+        if (obj && typeof obj === 'object') return obj
+      }
+    } catch {
+      /* 忽略损坏数据 */
+    }
+    return {}
+  })()
+)
+
+function saveCollapsed() {
+  try {
+    localStorage.setItem(COLLAPSE_KEY, JSON.stringify(collapsed.value))
+  } catch {
+    /* 忽略存储失败 */
+  }
+}
+
+function toggleGroup(name: string) {
+  collapsed.value = { ...collapsed.value, [name]: !collapsed.value[name] }
+  saveCollapsed()
+}
+
+type Row =
+  | { kind: 'group'; name: string; count: number; collapsed: boolean }
+  | { kind: 'wf'; w: WorkflowMeta }
+
+/** 扁平渲染列表：组头行 + 组内工作流行（折叠则隐藏组内）；末尾固定「未分组」区 */
+const rows = computed<Row[]>(() => {
+  const out: Row[] = []
+  const seen = new Set<string>()
+  for (const g of state.workflowGroups) {
+    const mine = state.workflows.filter((w) => w.group === g)
+    seen.add(g)
+    out.push({ kind: 'group', name: g, count: mine.length, collapsed: !!collapsed.value[g] })
+    if (!collapsed.value[g]) for (const w of mine) out.push({ kind: 'wf', w })
+  }
+  // 顶层（无组）+ 组目录被手动删掉的兜底回落
+  const loose = state.workflows.filter((w) => !w.group || !seen.has(w.group))
+  out.push({ kind: 'group', name: '', count: loose.length, collapsed: !!collapsed.value[''] })
+  if (!collapsed.value['']) for (const w of loose) out.push({ kind: 'wf', w })
+  return out
+})
+
+/** 工作流显示名：只显示文件名段（组名在组头） */
+function wfLabel(w: WorkflowMeta) {
+  return w.name.split('/').pop() ?? w.name
+}
+
+/** 归组 / 移出分组：本质是文件移动（组/名 ↔ 名），引用迁移复用 renameWorkflow */
+async function moveToGroup(w: WorkflowMeta, group: string) {
+  if (w.group === group) return
+  const stem = w.name.split('/').pop() ?? w.name
+  const target = group ? `${group}/${stem}` : stem
+  await renameWorkflow(w.name, target)
+  await loadWorkflows() // 组列表/归属变了，重新扫描
+}
+
+// ---- 工作流列表拖拽（pointer 模拟）：同组内排序；拖到组头 = 归组，拖到「未分组」头 = 移出 ----
+const reorder = reactive({ active: false, from: -1, to: -1, groupHot: '' })
 let reorderEndedAt = 0
 
-function idxAt(x: number, y: number): number {
-  const el = document.elementFromPoint(x, y)?.closest('[data-wf-idx]')
-  return el ? Number(el.getAttribute('data-wf-idx')) : -1
+function dropTargetAt(x: number, y: number): { idx: number; group: string | null } {
+  const el = document.elementFromPoint(x, y)
+  const gh = el?.closest('[data-group-name]') as HTMLElement | null
+  if (gh) return { idx: -1, group: gh.getAttribute('data-group-name') ?? '' }
+  const wi = el?.closest('[data-wf-idx]') as HTMLElement | null
+  return { idx: wi ? Number(wi.getAttribute('data-wf-idx')) : -1, group: null }
 }
 
 function onItemPointerDown(e: PointerEvent, idx: number) {
   if (e.button !== 0) return
-  if (editingWf.value) return // 改名输入中：不动排序
-  if ((e.target as HTMLElement).closest('.del')) return // 删除按钮不触发拖拽
-  if ((e.target as HTMLElement).closest('.wf-ops')) return // 固定/改名按钮也不触发
+  if (editingWf.value || editingGroup.value) return // 改名输入中：不动
+  if ((e.target as HTMLElement).closest('.wf-ops') || (e.target as HTMLElement).closest('.g-ops'))
+    return // 操作按钮不触发拖拽
   const startY = e.clientY
   let started = false
   const move = (ev: PointerEvent) => {
@@ -74,24 +143,42 @@ function onItemPointerDown(e: PointerEvent, idx: number) {
       started = true
       reorder.active = true
       reorder.from = idx
-      reorder.to = idx
+      reorder.to = -1
+      reorder.groupHot = ''
     }
-    const t = idxAt(ev.clientX, ev.clientY)
-    if (t >= 0) reorder.to = t
+    const t = dropTargetAt(ev.clientX, ev.clientY)
+    reorder.to = t.idx
+    reorder.groupHot = t.group ?? ''
   }
   const up = (ev: PointerEvent) => {
     window.removeEventListener('pointermove', move)
     window.removeEventListener('pointerup', up)
     if (started) {
       reorderEndedAt = Date.now()
-      const to = idxAt(ev.clientX, ev.clientY)
-      if (to >= 0 && to !== idx) {
-        const [item] = state.workflows.splice(idx, 1)
-        state.workflows.splice(to, 0, item)
-        void persistWorkflowOrder(state.workflows.map((w) => w.name))
+      const fromRow = rows.value[idx]
+      const t = dropTargetAt(ev.clientX, ev.clientY)
+      if (fromRow && fromRow.kind === 'wf') {
+        if (t.group !== null) {
+          // 拖到组头 / 未分组头：归组（组头都带 data-group-name，包括未分组 ''）
+          const g = t.group
+          if (g !== fromRow.w.group) void moveToGroup(fromRow.w, g)
+        } else if (t.idx >= 0 && t.idx !== idx) {
+          const toRow = rows.value[t.idx]
+          // 同组内排序：换到目标工作流前面（在全局数组里操作，保持 workflowOrder 全序）
+          if (toRow && toRow.kind === 'wf' && toRow.w.group === fromRow.w.group) {
+            const gi = state.workflows.indexOf(fromRow.w)
+            const gj = state.workflows.indexOf(toRow.w)
+            if (gi >= 0 && gj >= 0 && gi !== gj) {
+              state.workflows.splice(gi, 1)
+              state.workflows.splice(gj, 0, fromRow.w)
+              void persistWorkflowOrder(state.workflows.map((w) => w.name))
+            }
+          }
+        }
       }
     }
     reorder.active = false
+    reorder.groupHot = ''
   }
   window.addEventListener('pointermove', move)
   window.addEventListener('pointerup', up)
@@ -100,17 +187,17 @@ function onItemPointerDown(e: PointerEvent, idx: number) {
 function onWfClick(w: WorkflowMeta) {
   // 刚结束的排序拖拽 / 资产拖拽派发的 click 不当选择处理；改名输入中不响应
   if (Date.now() - reorderEndedAt < 120 || isDragClick()) return
-  if (editingWf.value) return
+  if (editingWf.value || editingGroup.value) return
   void selectWorkflow(w.name)
 }
 
-// ---- 工作流行内改名：✎ → 输入框，Enter/失焦确认，Esc 取消 ----
+// ---- 工作流行内改名：✎ → 输入框（只改文件名段，分组不变），Enter/失焦确认，Esc 取消 ----
 const editingWf = ref<string | null>(null)
 const editWfName = ref('')
 
 function startRename(w: WorkflowMeta) {
   editingWf.value = w.name
-  editWfName.value = w.name
+  editWfName.value = wfLabel(w)
   nextTick(() => {
     const el = document.getElementById('wf-rename') as HTMLInputElement | null
     el?.focus()
@@ -122,12 +209,101 @@ function confirmRename(w: WorkflowMeta) {
   if (editingWf.value !== w.name) return
   const newName = editWfName.value.trim()
   editingWf.value = null
-  if (!newName || newName === w.name) return
-  void renameWorkflow(w.name, newName)
+  if (!newName || newName === wfLabel(w)) return
+  // 名字可能带点（0.6+5步），只改文件名段、保留分组前缀
+  const target = w.group ? `${w.group}/${newName}` : newName
+  void renameWorkflow(w.name, target)
 }
 
 function cancelRename() {
   editingWf.value = null
+}
+
+// ---- 分组管理：新建 / 改名 / 删组（组 = 真实子目录；删组不删工作流，全部回落未分组） ----
+const editingGroup = ref<string | null>(null)
+const editGroupName = ref('')
+const creatingGroup = ref(false)
+const newGroupName = ref('')
+
+function startGroupRename(name: string) {
+  editingGroup.value = name
+  editGroupName.value = name
+  nextTick(() => {
+    const el = document.getElementById('group-rename') as HTMLInputElement | null
+    el?.focus()
+    el?.select()
+  })
+}
+
+async function confirmGroupRename(oldName: string) {
+  if (editingGroup.value !== oldName) return
+  const newName = editGroupName.value.trim()
+  editingGroup.value = null
+  if (!newName || newName === oldName) return
+  if (state.workflowGroups.includes(newName)) {
+    notify(`已存在同名分组「${newName}」`, 'warn', 5000)
+    return
+  }
+  const mine = state.workflows.filter((w) => w.group === oldName)
+  try {
+    // 组内逐个文件移动到新组（renameWorkflow 同步迁移排序/固定/已填值/模板绑定）
+    for (const w of mine) {
+      const stem = w.name.split('/').pop() ?? w.name
+      await renameWorkflow(w.name, `${newName}/${stem}`)
+    }
+    if (!mine.length) {
+      // 空组：直接建新删旧
+      await api.createWorkflowGroup(newName)
+      await api.deleteWorkflowGroup(oldName)
+    }
+    // 折叠状态跟着迁
+    if (collapsed.value[oldName]) {
+      const next = { ...collapsed.value }
+      delete next[oldName]
+      next[newName] = true
+      collapsed.value = next
+      saveCollapsed()
+    }
+    await loadWorkflows()
+    notify(`分组已改名：「${oldName}」→「${newName}」`, 'ok', 3000)
+  } catch (e) {
+    notify(`分组改名失败：${e}`, 'error', 8000)
+    await loadWorkflows()
+  }
+}
+
+async function removeGroup(name: string) {
+  const mine = state.workflows.filter((w) => w.group === name)
+  const msg = mine.length
+    ? `分组「${name}」里有 ${mine.length} 个工作流，删除分组会把它们移回未分组（不删文件）。继续？`
+    : `确定删除空分组「${name}」？`
+  if (!window.confirm(msg)) return
+  try {
+    for (const w of mine) {
+      const stem = w.name.split('/').pop() ?? w.name
+      await renameWorkflow(w.name, stem) // 移回顶层
+    }
+    await api.deleteWorkflowGroup(name) // 此时必空；若移出失败会报「还有工作流」
+    await loadWorkflows()
+    notify(`已删除分组「${name}」`, 'info', 3000)
+  } catch (e) {
+    notify(`删除分组失败：${e}`, 'error', 8000)
+    await loadWorkflows()
+  }
+}
+
+async function confirmCreateGroup() {
+  const name = newGroupName.value.trim()
+  creatingGroup.value = false
+  newGroupName.value = ''
+  if (!name) return
+  try {
+    await api.createWorkflowGroup(name)
+    await loadWorkflows()
+    notify(`已创建分组「${name}」，把工作流拖到组头即可归组`, 'ok', 4000)
+  } catch (e) {
+    notify(`创建分组失败：${e}`, 'error', 8000)
+  }
 }
 
 const dataDir = ref('')
@@ -204,63 +380,114 @@ async function openDir() {
         <div v-for="i in 4" :key="i" class="skel-item" />
       </div>
 
-      <div v-if="!state.workflows.length && !state.workflowsLoading" class="empty">
+      <div v-if="!state.workflows.length && !state.workflowGroups.length && !state.workflowsLoading" class="empty">
         还没有工作流。<br />
         点「+ 导入」，选择 ComfyUI 里<br /><b>导出 (API)</b> 得到的 JSON 文件。<br /><br />
         或者把 ComfyUI 生成的<b>图片/视频直接拖进窗口</b>，<br />自动反查它内嵌的工作流。
       </div>
 
-      <button
-        v-for="(w, i) in state.workflows"
-        :key="w.name"
-        class="wf-item"
-        :class="{
-          active: w.name === state.currentWorkflow,
-          dragging: reorder.active && reorder.from === i,
-          'drop-target': reorder.active && reorder.to === i && reorder.to !== reorder.from,
-        }"
-        :data-wf-idx="i"
-        :data-drop-zone="'wf:' + w.name"
-        :title="'点击载入 · 拖动排序 · 拖入结果图可设为参考图'"
-        @click="onWfClick(w)"
-        @pointerdown="onItemPointerDown($event, i)"
-      >
-        <template v-if="editingWf === w.name">
-          <input
-            id="wf-rename"
-            v-model="editWfName"
-            class="wf-rename"
-            @click.stop
-            @pointerdown.stop
-            @keydown.enter.prevent="confirmRename(w)"
-            @keydown.esc.prevent="cancelRename"
-            @blur="confirmRename(w)"
-          />
-        </template>
-        <template v-else>
-          <span class="wf-name" :title="w.name">
-            {{ w.name }}
-            <span v-if="w.broken" class="broken" title="JSON 解析失败">!</span>
+      <template v-for="(row, ri) in rows" :key="row.kind === 'group' ? 'g:' + row.name : 'w:' + row.w.name">
+        <!-- 组头：点击展开/收起；拖工作流到这里 = 归组（未分组头 = 移出） -->
+        <div
+          v-if="row.kind === 'group'"
+          class="group-head"
+          :class="{ 'group-hot': reorder.active && reorder.groupHot === row.name }"
+          :data-group-name="row.name"
+          :title="row.name ? '点击展开/收起 · 把工作流拖到这里归组' : '未分组：拖到这里移出分组'"
+          @click="toggleGroup(row.name)"
+        >
+          <span class="tri" :class="{ open: !row.collapsed }" />
+          <template v-if="editingGroup === row.name">
+            <input
+              id="group-rename"
+              v-model="editGroupName"
+              class="wf-rename"
+              @click.stop
+              @pointerdown.stop
+              @keydown.enter.prevent="confirmGroupRename(row.name)"
+              @keydown.esc.prevent="editingGroup = null"
+              @blur="confirmGroupRename(row.name)"
+            />
+          </template>
+          <template v-else>
+            <span class="g-name">{{ row.name || '未分组' }}</span>
+          </template>
+          <span class="g-count">{{ row.count }}</span>
+          <span v-if="row.name" class="g-ops">
+            <span class="op ren" title="分组改名" @click.stop="startGroupRename(row.name)">✎</span>
+            <span class="op del" title="删除分组（工作流移回未分组）" @click.stop="removeGroup(row.name)">✕</span>
           </span>
-          <span class="wf-meta">
-            {{ w.nodeCount }} 节点<template v-if="!w.hasMeta"> · 无标题</template>
+          <span v-else class="g-hint">拖到这里移出分组</span>
+        </div>
+
+        <!-- 工作流行（组内缩进显示文件名段） -->
+        <button
+          v-else
+          class="wf-item"
+          :class="{
+            active: row.w.name === state.currentWorkflow,
+            dragging: reorder.active && reorder.from === ri,
+            'drop-target': reorder.active && reorder.to === ri && reorder.to !== reorder.from,
+            'in-group': !!row.w.group,
+          }"
+          :data-wf-idx="ri"
+          :data-drop-zone="'wf:' + row.w.name"
+          :title="row.w.name + ' · 点击载入 · 拖动排序 · 拖到组头归组'"
+          @click="onWfClick(row.w)"
+          @pointerdown="onItemPointerDown($event, ri)"
+        >
+          <template v-if="editingWf === row.w.name">
+            <input
+              id="wf-rename"
+              v-model="editWfName"
+              class="wf-rename"
+              @click.stop
+              @pointerdown.stop
+              @keydown.enter.prevent="confirmRename(row.w)"
+              @keydown.esc.prevent="cancelRename"
+              @blur="confirmRename(row.w)"
+            />
+          </template>
+          <template v-else>
+            <span class="wf-name" :title="row.w.name">
+              {{ wfLabel(row.w) }}
+              <span v-if="row.w.broken" class="broken" title="JSON 解析失败">!</span>
+            </span>
+            <span class="wf-meta">
+              {{ row.w.nodeCount }} 节点<template v-if="!row.w.hasMeta"> · 无标题</template>
+            </span>
+          </template>
+          <span class="wf-ops">
+            <span
+              class="op pin"
+              :class="{ on: isWorkflowPinned(row.w.name) }"
+              :title="isWorkflowPinned(row.w.name) ? '取消固定' : '固定（固定后不可删除）'"
+              @click.stop="toggleWorkflowPin(row.w.name)"
+            >📌</span>
+            <span class="op ren" title="改名" @click.stop="startRename(row.w)">✎</span>
+            <span
+              v-if="!isWorkflowPinned(row.w.name)"
+              class="op del"
+              title="删除"
+              @click.stop="remove(row.w.name)"
+            >✕</span>
           </span>
-        </template>
-        <span class="wf-ops">
-          <span
-            class="op pin"
-            :class="{ on: isWorkflowPinned(w.name) }"
-            :title="isWorkflowPinned(w.name) ? '取消固定' : '固定（固定后不可删除）'"
-            @click.stop="toggleWorkflowPin(w.name)"
-          >📌</span>
-          <span class="op ren" title="改名" @click.stop="startRename(w)">✎</span>
-          <span
-            v-if="!isWorkflowPinned(w.name)"
-            class="op del"
-            title="删除"
-            @click.stop="remove(w.name)"
-          >✕</span>
-        </span>
+        </button>
+      </template>
+
+      <!-- 新建分组：虚线行，点击变输入 -->
+      <div v-if="creatingGroup" class="group-create">
+        <input
+          v-model="newGroupName"
+          class="wf-rename"
+          placeholder="分组名，回车确认（Esc 取消）"
+          @keydown.enter.prevent="confirmCreateGroup"
+          @keydown.esc.prevent="creatingGroup = false"
+          @blur="confirmCreateGroup"
+        />
+      </div>
+      <button v-else class="group-add" title="新建分组（workflows/ 下建一个子目录）" @click="creatingGroup = true">
+        ＋ 新建分组
       </button>
     </div>
 
@@ -357,6 +584,102 @@ async function openDir() {
   cursor: pointer;
   text-align: left;
   transition: background 0.14s, border-color 0.14s;
+}
+/* 组内工作流：缩进 + 左侧树连接线 */
+.wf-item.in-group {
+  margin-left: 18px;
+  width: calc(100% - 18px);
+}
+/* 组头行 */
+.group-head {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  padding: 6px 8px;
+  margin-bottom: 4px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-2);
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.14s, box-shadow 0.14s;
+}
+.group-head:hover {
+  background: var(--bg-3);
+}
+/* 拖工作流悬停在组头上 = 归组落点高亮 */
+.group-head.group-hot {
+  background: var(--accent-soft);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+/* 展开/收起三角 */
+.tri {
+  flex: none;
+  width: 0;
+  height: 0;
+  border-left: 5px solid var(--text-faint);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  transition: transform 0.14s;
+}
+.tri.open {
+  transform: rotate(90deg);
+}
+.g-name {
+  font-size: 12px;
+  font-weight: 500;
+  max-width: 130px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.g-count {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  background: var(--bg-1);
+  border-radius: 999px;
+  padding: 1px 7px;
+  line-height: 1.4;
+}
+.g-hint {
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  opacity: 0.7;
+}
+/* 组头操作组（与 wf-ops 同款 hover 显隐） */
+.g-ops {
+  position: absolute;
+  right: 6px;
+  display: flex;
+  gap: 2px;
+}
+.g-ops .op {
+  opacity: 0;
+}
+.group-head:hover .g-ops .op {
+  opacity: 1;
+}
+/* 新建分组虚线行 */
+.group-add {
+  width: 100%;
+  padding: 7px 0;
+  margin-top: 2px;
+  border: 1px dashed var(--border-soft);
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 11.5px;
+  cursor: pointer;
+  transition: border-color 0.14s, color 0.14s;
+}
+.group-add:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.group-create {
+  margin-top: 2px;
 }
 .wf-item:hover {
   background: var(--bg-2);

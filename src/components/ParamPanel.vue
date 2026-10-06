@@ -2,6 +2,8 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import FieldControl from './FieldControl.vue'
 import type { FieldSchema } from '../core/types'
+import { api } from '../api/tauri'
+import { applyValues, collectValues } from '../core/parseWorkflow'
 import {
   enabledWorkers,
   interrupt,
@@ -14,6 +16,28 @@ import {
   submitWorkerId,
 } from '../store'
 import { ui } from '../ui'
+
+/**
+ * 把当前表单参数固化回工作流 JSON 文件（覆盖保存）。
+ * applyValues 深拷贝原图 + 只覆盖有值字段 + 被连线占用的输入不碰——
+ * 保存的就是「提交时发给 ComfyUI 的那份图」，工作流其余结构原样保留。
+ */
+async function saveToWorkflow() {
+  if (!state.currentWorkflow || !state.graph) return
+  if (
+    !window.confirm(
+      `把当前参数写入工作流文件「${state.currentWorkflow}」？\n将覆盖原 JSON，此操作不可撤销。`
+    )
+  )
+    return
+  try {
+    const graph = applyValues(state.graph, collectValues(state.fields))
+    await api.saveWorkflow(state.currentWorkflow, graph)
+    notify(`已把当前参数写入工作流文件「${state.currentWorkflow}」`, 'ok', 4000)
+  } catch (e) {
+    notify(`写入工作流失败：${e}`, 'error', 8000)
+  }
+}
 
 const collapsed = ref<Record<string, boolean>>({})
 
@@ -200,6 +224,14 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <option v-for="n in 10" :key="n" :value="n">批次 ×{{ n }}</option>
         </select>
         <button class="btn" :disabled="!state.fields.length" @click="randomizeSeeds">随机种子</button>
+        <button
+          class="btn ghost"
+          :disabled="!state.fields.length || !state.currentWorkflow"
+          title="把当前参数写入工作流 JSON 文件（覆盖保存；连线输入不受影响）"
+          @click="saveToWorkflow"
+        >
+          💾 写入工作流
+        </button>
         <button
           class="btn ghost"
           :disabled="!state.fields.length"

@@ -82,6 +82,8 @@ export interface ParamTemplate {
 
 export interface WorkflowMeta {
   name: string
+  /** 所在分组（workflows/ 下的一级子目录名；顶层为空字符串） */
+  group: string
   nodeCount: number
   hasMeta: boolean
   broken?: boolean

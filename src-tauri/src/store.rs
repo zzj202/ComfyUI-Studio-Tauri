@@ -137,6 +137,48 @@ fn with_ext(name: &str) -> String {
     }
 }
 
+/// 相对路径版名称校验：允许「分组/工作流」形式的子路径（分组 = workflows/ 下的一级子目录）。
+/// 每段都过 safe_name（拒空、拒 ..、拒 Windows 保留字符），统一以 / 分隔返回。
+fn safe_rel_path(name: &str) -> Result<String, String> {
+    let norm = name.trim().replace('\\', "/");
+    let parts: Vec<&str> = norm.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return Err("名称不能为空".to_string());
+    }
+    for p in &parts {
+        safe_name(p)?;
+    }
+    Ok(parts.join("/"))
+}
+
+/// 相对路径 → dir 下真实路径（逐段 push，杜绝路径穿越）
+fn path_for(dir: &Path, rel: &str) -> PathBuf {
+    let mut p = dir.to_path_buf();
+    for seg in rel.split('/') {
+        p.push(seg);
+    }
+    p
+}
+
+/// 工作流相对路径 → .json 文件路径。只给文件名段补扩展名：
+/// 名字可能带点（如「0.6+5步」），用 with_extension 会把点后当扩展名替换掉。
+fn wf_file_path(dir: &Path, rel: &str) -> PathBuf {
+    let mut p = path_for(dir, rel);
+    if let Some(name) = p.file_name().map(|s| s.to_string_lossy().to_string()) {
+        p.set_file_name(with_ext(&name));
+    }
+    p
+}
+
+/// 工作流文件被删/移走后，所在分组目录若空了就顺手移除（remove_dir 只删得动空目录）
+fn cleanup_group_dir(dir: &Path, file: &Path) {
+    if let Some(p) = file.parent() {
+        if p != dir {
+            let _ = fs::remove_dir(p);
+        }
+    }
+}
+
 // ---------------------------------------------------------------- 设置
 
 fn default_settings(root: &Path) -> Value {
@@ -234,25 +276,26 @@ pub fn save_settings(value: Value) -> Result<Value, String> {
 
 // ---------------------------------------------------------------- 工作流
 
-#[command]
-pub fn list_workflows() -> Result<Value, String> {
-    let dir = ensure_dirs()?.join("workflows");
-    let mut items = Vec::new();
-    for entry in fs::read_dir(&dir)
-        .map_err(|e| format!("读取工作流目录失败：{}", e))?
-        .flatten()
-    {
+/// 扫描一个目录下的 .json 工作流文件（name 前缀区分分组；不递归——分组只有一层）
+fn scan_wf_dir(dir: &Path, prefix: &str, items: &mut Vec<Value>) {
+    let Ok(rd) = fs::read_dir(dir) else { return };
+    for entry in rd.flatten() {
         let path = entry.path();
         if !path.is_file() || path.extension().and_then(|s| s.to_str()) != Some("json") {
             continue;
         }
-        let name: String = path
+        let stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-
+        let name = if prefix.is_empty() {
+            stem
+        } else {
+            format!("{prefix}/{stem}")
+        };
         let mut item = json!({
             "name": name,
+            "group": prefix,
             "size": entry.metadata().map(|m| m.len()).unwrap_or(0),
             "updatedAt": entry.metadata().ok()
                 .and_then(|m| m.modified().ok())
@@ -279,6 +322,29 @@ pub fn list_workflows() -> Result<Value, String> {
         }
         items.push(item);
     }
+}
+
+#[command]
+pub fn list_workflows() -> Result<Value, String> {
+    let dir = ensure_dirs()?.join("workflows");
+    let mut items = Vec::new();
+    let mut groups: Vec<String> = Vec::new();
+    // 一级子目录 = 分组（空目录也算，供用户先建组再拖入工作流）
+    if let Ok(rd) = fs::read_dir(&dir) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if let Some(g) = p.file_name().and_then(|s| s.to_str()) {
+                    groups.push(g.to_string());
+                }
+            }
+        }
+    }
+    groups.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+    scan_wf_dir(&dir, "", &mut items);
+    for g in &groups {
+        scan_wf_dir(&dir.join(g), g, &mut items);
+    }
     items.sort_by(|a, b| {
         a["name"]
             .as_str()
@@ -286,13 +352,13 @@ pub fn list_workflows() -> Result<Value, String> {
             .to_lowercase()
             .cmp(&b["name"].as_str().unwrap_or("").to_lowercase())
     });
-    Ok(json!({ "workflows": items, "dir": dir.to_string_lossy() }))
+    Ok(json!({ "workflows": items, "groups": groups, "dir": dir.to_string_lossy() }))
 }
 
 #[command]
 pub fn read_workflow(name: String) -> Result<Value, String> {
-    let n = safe_name(&name)?;
-    let path = ensure_dirs()?.join("workflows").join(with_ext(&n));
+    let n = safe_rel_path(&name)?;
+    let path = wf_file_path(&ensure_dirs()?.join("workflows"), &n);
     if !path.exists() {
         return Err(format!("工作流不存在：{}", n));
     }
@@ -302,8 +368,11 @@ pub fn read_workflow(name: String) -> Result<Value, String> {
 
 #[command]
 pub fn save_workflow(name: String, graph: Value) -> Result<Value, String> {
-    let n = safe_name(&name)?;
-    let path = ensure_dirs()?.join("workflows").join(with_ext(&n));
+    let n = safe_rel_path(&name)?;
+    let path = wf_file_path(&ensure_dirs()?.join("workflows"), &n);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{}", e))?;
+    }
     fs::write(
         &path,
         serde_json::to_string_pretty(&graph).unwrap_or_else(|_| graph.to_string()),
@@ -314,33 +383,64 @@ pub fn save_workflow(name: String, graph: Value) -> Result<Value, String> {
 
 #[command]
 pub fn delete_workflow(name: String) -> Result<Value, String> {
-    let n = safe_name(&name)?;
-    let path = ensure_dirs()?.join("workflows").join(with_ext(&n));
+    let n = safe_rel_path(&name)?;
+    let dir = ensure_dirs()?.join("workflows");
+    let path = wf_file_path(&dir, &n);
     if path.exists() {
         fs::remove_file(&path).map_err(|e| format!("删除失败：{}", e))?;
+        cleanup_group_dir(&dir, &path);
     }
     Ok(json!({ "ok": true }))
 }
 
-/// 工作流改名（重命名文件；目标已存在则拒绝，防覆盖）
+/// 工作流改名/移动分组（相对路径重命名；目标已存在则拒绝，防覆盖）。
+/// 「归组」「移出分组」也走这里：new 带「组/名」即进组，只带「名」即回顶层。
 #[command]
 pub fn rename_workflow(old: String, new: String) -> Result<Value, String> {
-    let from = safe_name(&old)?;
-    let to = safe_name(&new)?;
+    let from = safe_rel_path(&old)?;
+    let to = safe_rel_path(&new)?;
     let dir = ensure_dirs()?.join("workflows");
-    let src = dir.join(with_ext(&from));
+    let src = wf_file_path(&dir, &from);
     if !src.exists() {
         return Err(format!("工作流不存在：{}", from));
     }
-    let dst = dir.join(with_ext(&to));
+    let dst = wf_file_path(&dir, &to);
     if dst.exists() {
         return Err(format!("已存在同名工作流：{}", to));
     }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{}", e))?;
+    }
     fs::rename(&src, &dst).map_err(|e| format!("重命名失败：{}", e))?;
+    cleanup_group_dir(&dir, &src);
     Ok(json!({ "ok": true, "name": to }))
 }
 
-/// 从任意磁盘位置导入一份工作流（复制进应用数据目录）
+/// 新建空分组（workflows/ 下的一级子目录；同名已存在则拒绝）
+#[command]
+pub fn create_workflow_group(name: String) -> Result<Value, String> {
+    let g = safe_name(&name)?;
+    let dir = ensure_dirs()?.join("workflows").join(&g);
+    if dir.exists() {
+        return Err(format!("已存在同名分组：{}", g));
+    }
+    fs::create_dir_all(&dir).map_err(|e| format!("创建分组失败：{}", e))?;
+    Ok(json!({ "ok": true, "group": g }))
+}
+
+/// 删除分组目录（只删得动空目录——里面还有工作流时报错，防误删）
+#[command]
+pub fn delete_workflow_group(name: String) -> Result<Value, String> {
+    let g = safe_name(&name)?;
+    let dir = ensure_dirs()?.join("workflows").join(&g);
+    if !dir.is_dir() {
+        return Err(format!("分组不存在：{}", g));
+    }
+    fs::remove_dir(&dir).map_err(|_| format!("分组「{}」里还有工作流，先移出去再删", g))?;
+    Ok(json!({ "ok": true }))
+}
+
+/// 从任意磁盘位置导入一份工作流（复制进应用数据目录；name 可带「分组/」前缀）
 #[command]
 pub fn import_workflow(src: String, name: Option<String>) -> Result<Value, String> {
     let source = PathBuf::from(&src);
@@ -355,7 +455,7 @@ pub fn import_workflow(src: String, name: Option<String>) -> Result<Value, Strin
                 .map(|s| s.to_string_lossy().to_string())
                 .unwrap_or_else(|| format!("workflow-{}", chrono_like_id()))
         });
-    let n = safe_name(&base)?;
+    let n = safe_rel_path(&base)?;
     let text = fs::read_to_string(&source).map_err(|e| format!("读取文件失败：{}", e))?;
     // 先验证是合法 JSON，且尽量确认是 API 格式
     let graph: Value = serde_json::from_str(&text).map_err(|e| format!("不是合法的 JSON：{}", e))?;
@@ -365,7 +465,11 @@ pub fn import_workflow(src: String, name: Option<String>) -> Result<Value, Strin
                 .to_string(),
         );
     }
-    let dest = ensure_dirs()?.join("workflows").join(with_ext(&n));
+    let dir = ensure_dirs()?.join("workflows");
+    let dest = wf_file_path(&dir, &n);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{}", e))?;
+    }
     fs::write(&dest, &text).map_err(|e| format!("写入失败：{}", e))?;
     Ok(json!({ "ok": true, "name": n }))
 }

@@ -34,6 +34,8 @@ export const state = reactive({
   objectInfo: null as Record<string, any> | null,
 
   workflows: [] as WorkflowMeta[],
+  /** 分组列表（workflows/ 下的一级子目录，含空组；组内工作流 name 带「组/」前缀） */
+  workflowGroups: [] as string[],
   /** 工作流列表正在读取（面板显示骨架占位） */
   workflowsLoading: false,
   templates: [] as ParamTemplate[],
@@ -436,6 +438,7 @@ export async function loadWorkflows() {
   try {
     const r = await api.listWorkflows()
     state.workflows = r.workflows ?? []
+    state.workflowGroups = r.groups ?? []
     sortWorkflowsByOrder()
   } catch (e) {
     notify(`读取工作流列表失败：${e}`, 'error')

@@ -37,7 +37,11 @@ export const api = {
 
   // ---- 工作流 ----
   listWorkflows: () =>
-    invoke<{ workflows: any[]; dir: string }>('list_workflows'),
+    invoke<{ workflows: any[]; groups: string[]; dir: string }>('list_workflows'),
+  createWorkflowGroup: (name: string) =>
+    invoke<{ ok: boolean; group: string }>('create_workflow_group', { name }),
+  deleteWorkflowGroup: (name: string) =>
+    invoke<{ ok: boolean }>('delete_workflow_group', { name }),
   readWorkflow: (name: string) => invoke<any>('read_workflow', { name }),
   saveWorkflow: (name: string, graph: any) =>
     invoke<any>('save_workflow', { name, graph }),

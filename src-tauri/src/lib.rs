@@ -147,6 +147,8 @@ pub fn run() {
             store::save_workflow,
             store::delete_workflow,
             store::rename_workflow,
+            store::create_workflow_group,
+            store::delete_workflow_group,
             store::import_workflow,
             store::list_templates,
             store::save_template,
