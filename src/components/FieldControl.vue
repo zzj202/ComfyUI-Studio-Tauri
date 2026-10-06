@@ -15,6 +15,7 @@ import {
   imageDropTargets,
   imageOriginBase,
   notify,
+  openBatchTextDialog,
   pasteSubmitField,
   primaryBase,
   promptHistory,
@@ -499,10 +500,17 @@ if (props.field.kind === 'image') loadImageOptions()
         </button>
         <button
           class="tbtn go"
-          title="读取剪贴板文本填入本框（覆盖现有内容），并按当前批次设置立即提交（Ctrl+E）"
+          title="读取剪贴板文本填入本框（覆盖现有内容），并按当前批次设置立即提交（Ctrl+E）；多行内容会询问是否逐条拆分"
           @click="pasteSubmitField(field)"
         >
           ⚡ 粘贴提交
+        </button>
+        <button
+          class="tbtn"
+          title="把框内内容按行拆分：每行一条提示词，各提交一个任务"
+          @click="openBatchTextDialog(field)"
+        >
+          ✂ 拆行提交
         </button>
       </div>
       <div class="ta-wrap">

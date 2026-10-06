@@ -2,7 +2,7 @@
 import { ref } from 'vue'
 import { api } from '../api/tauri'
 import { open } from '@tauri-apps/plugin-dialog'
-import { notify, saveSettings, state } from '../store'
+import { batchTextMode, notify, saveSettings, state } from '../store'
 import type { WorkerProfile } from '../core/types'
 import { ui } from '../ui'
 
@@ -167,6 +167,19 @@ async function save() {
           <div class="hint">
             任务按「空闲优先」自动分摊，单节点提交失败自动改派；权重仅在空闲度并列时生效。
             远程机需以 <code>--listen 0.0.0.0</code> 启动，公网建议反代加鉴权。
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label>粘贴多行提示词（长文本字段的 ⚡ 粘贴提交 / Ctrl+E）</label>
+          <select v-model="batchTextMode" class="input" style="width: 240px">
+            <option value="ask">每次询问（拆成多条或整段提交）</option>
+            <option value="split">自动逐条拆分：每行一个任务</option>
+            <option value="whole">整段作为一条提交</option>
+          </select>
+          <div class="hint">
+            逐条拆分 = 每行一条提示词、各提交一个任务（上限 50）。长文本工具条的
+            <code>✂ 拆行提交</code> 按钮不受此项影响，总是先弹预览确认。
           </div>
         </div>
 

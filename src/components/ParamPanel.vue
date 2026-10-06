@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import FieldControl from './FieldControl.vue'
+import BatchTextDialog from './BatchTextDialog.vue'
 import type { FieldSchema } from '../core/types'
 import { api } from '../api/tauri'
 import { applyValues, collectValues } from '../core/parseWorkflow'
@@ -250,6 +251,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </button>
       </div>
     </footer>
+
+    <!-- 批量拆行确认弹窗：粘贴/拆行按钮识别到多行提示词时弹出 -->
+    <BatchTextDialog />
   </section>
 </template>
 

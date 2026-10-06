@@ -211,6 +211,23 @@ function hoverStop(e: Event) {
   }
 }
 
+// ---- 资产卡类型角标：视频 ▶ + 时长 / 音频 ♪（图片不标，绝对多数不加噪） ----
+
+/** key → 时长（秒），loadedmetadata 时填充；拿不到就只显示 ▶ */
+const videoDurations = ref<Record<string, number>>({})
+
+function onVideoMeta(e: Event, key: string) {
+  const d = (e.target as HTMLVideoElement | null)?.duration
+  if (d && Number.isFinite(d)) videoDurations.value = { ...videoDurations.value, [key]: d }
+}
+
+function fmtDur(s?: number): string {
+  if (!s || !Number.isFinite(s)) return ''
+  const m = Math.floor(s / 60)
+  const sec = Math.round(s % 60)
+  return `${m}:${String(sec).padStart(2, '0')}`
+}
+
 function displayName(a: Asset) {
   return a.alias || a.filename
 }
@@ -446,7 +463,7 @@ async function captureVideoFrame() {
     const res = await api.uploadImage(base, path, undefined, 'studio', true)
     const name = String(res?.name ?? '')
     if (name) {
-      addManualAsset({ base, filename: name, subfolder: String(res?.subfolder ?? 'studio') })
+      addManualAsset({ base, filename: name, subfolder: String(res?.subfolder ?? 'studio'), pinned: true })
     }
     notify(
       copied
@@ -595,9 +612,10 @@ function onKey(e: KeyboardEvent) {
     else if (k === 'ArrowLeft' || k === 'a' || k === 'A') stepLb(-1)
     else if (k === 'ArrowRight' || k === 'd' || k === 'D') stepLb(1)
     else if (lbAsset.value?.kind === 'video') {
-      // 视频专属：,/. 逐帧（视频软件惯例），空格播放/暂停
-      if (k === ',') stepFrame(-1)
-      else if (k === '.') stepFrame(1)
+      // 视频专属：Q/E 逐帧（,/. 保留兼容），R 截帧，空格播放/暂停
+      if (k === 'q' || k === 'Q' || k === ',') stepFrame(-1)
+      else if (k === 'e' || k === 'E' || k === '.') stepFrame(1)
+      else if (k === 'r' || k === 'R') void captureVideoFrame()
       else if (k === ' ') {
         e.preventDefault() // 空格防页面滚动
         togglePlay()
@@ -883,10 +901,16 @@ onUnmounted(() => {
                 playsinline
                 preload="metadata"
                 title="悬停播放"
+                @loadedmetadata="onVideoMeta($event, a.key)"
                 @mouseenter="hoverPlay($event)"
                 @mouseleave="hoverStop($event)"
               />
               <img v-else :src="assetUrl(a)" :alt="displayName(a)" loading="lazy" />
+              <!-- 类型角标：视频 ▶+时长 / 音频 ♪（右下角，与左下节点徽标错开） -->
+              <span v-if="a.kind === 'video'" class="kind-pill" title="视频（悬停播放）">
+                ▶<template v-if="videoDurations[a.key]"> {{ fmtDur(videoDurations[a.key]) }}</template>
+              </span>
+              <span v-else-if="a.kind === 'audio'" class="kind-pill" title="音频">♪</span>
               <span v-if="!a.read" class="unread-pill">未读</span>
               <span v-if="a.pinned" class="pin-flag" title="已固定">📌</span>
               <span v-if="a.base" class="a-node" :title="'生成节点：' + a.base">
@@ -952,14 +976,14 @@ onUnmounted(() => {
           @loadedmetadata="lbDur = lbVideo?.duration ?? 0"
         />
         <img v-else :key="lbAsset.key" :src="assetUrl(lbAsset)" :alt="displayName(lbAsset)" />
-        <!-- 视频逐帧控制条（原生进度条上方悬浮；快捷键 , / . / 空格） -->
+        <!-- 视频逐帧控制条（原生进度条上方悬浮；快捷键 Q / E / R / 空格） -->
         <div v-if="lbAsset.kind === 'video'" class="v-ctrl" @click.stop @contextmenu.prevent>
-          <button class="v-btn" title="上一帧（,）" @click="stepFrame(-1)">⏮</button>
+          <button class="v-btn" title="上一帧（Q）" @click="stepFrame(-1)">⏮</button>
           <button class="v-btn" :title="lbPlaying ? '暂停（空格）' : '播放（空格）'" @click="togglePlay">
             {{ lbPlaying ? '⏸' : '▶' }}
           </button>
-          <button class="v-btn" title="下一帧（.）" @click="stepFrame(1)">⏭</button>
-          <button class="v-btn" title="截取当前帧为图片（存进结果区）" @click="captureVideoFrame">📷</button>
+          <button class="v-btn" title="下一帧（E）" @click="stepFrame(1)">⏭</button>
+          <button class="v-btn" title="截取当前帧（R）：进剪贴板，结果区留底并自动固定" @click="captureVideoFrame">📷</button>
           <span v-if="frameLabel" class="v-time">{{ frameLabel }}</span>
         </div>
       </div>
@@ -1484,6 +1508,23 @@ onUnmounted(() => {
   height: 5px;
   border-radius: 50%;
   background: var(--cyan);
+}
+/* 资产卡右下角类型角标：视频 ▶+时长 / 音频 ♪，与左下节点徽标、左上未读错开 */
+.kind-pill {
+  position: absolute;
+  right: 6px;
+  bottom: 6px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(13, 16, 23, 0.62);
+  color: #e7ecf5;
+  font-size: 10px;
+  line-height: 1.3;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
 }
 /* 灯箱底栏里的同款徽标：底栏本身是深色毛玻璃，换浅描边弱化 */
 .lb-node {

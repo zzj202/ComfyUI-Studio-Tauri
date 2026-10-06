@@ -8,6 +8,7 @@ import {
   randomSeed,
 } from './core/parseWorkflow'
 import { extractSubmitError, normalizeOutputs } from './core/errors'
+import { BATCH_TEXT_MAX, splitBatchLines } from './core/batchText'
 import { cooldownWorker, selectWorker } from './core/scheduler'
 import { ensureAudio, playChime } from './core/chime'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
@@ -1243,9 +1244,121 @@ export function submit(batch = submitBatch.value) {
   void runChain(total, count, multi?.key, imgs, reroll, paramsSnapshot)
 }
 
+// ---- 批量拆行提交（方案 A）：粘贴多行提示词自动识别，逐条 = 每行一个任务 ----
+
+export type BatchTextMode = 'ask' | 'split' | 'whole'
+
+const BATCH_TEXT_KEY = 'comfyui-studio.batchTextMode:v1'
+
+/** 粘贴多行长文本时的行为：ask=弹窗询问（默认）/ split=自动逐条拆 / whole=整段一条 */
+export const batchTextMode = ref<BatchTextMode>('ask')
+try {
+  const saved = localStorage.getItem(BATCH_TEXT_KEY)
+  if (saved === 'ask' || saved === 'split' || saved === 'whole') batchTextMode.value = saved
+} catch {
+  /* 忽略读取失败 */
+}
+watch(batchTextMode, (v) => {
+  try {
+    localStorage.setItem(BATCH_TEXT_KEY, v)
+  } catch {
+    /* 忽略写入失败 */
+  }
+})
+
+/** 拆行确认弹窗的挂起状态（pasteSubmitField / 拆行按钮设置，BatchTextDialog 消费） */
+export const batchTextPending = ref<{
+  fieldKey: string
+  fieldLabel: string
+  lines: string[]
+  raw: string
+} | null>(null)
+
+/** 拆行弹窗确认：'split'=逐条提交 / 'whole'=整段提交 / 'cancel'=关闭；remember=记住选择；
+ *  count=每条的批次数（弹窗里可调，默认顶栏批次）。 */
+export function confirmBatchText(
+  action: 'split' | 'whole' | 'cancel',
+  remember: boolean,
+  count = submitBatch.value
+) {
+  const p = batchTextPending.value
+  if (!p) return
+  batchTextPending.value = null
+  if (action === 'cancel') return
+  if (remember) batchTextMode.value = action // split→以后静默拆条；whole→以后整段
+  const f = state.fields.find((x) => x.key === p.fieldKey)
+  if (f) f.value = p.raw
+  if (action === 'split') {
+    submitBatchText(p.lines, p.fieldKey, p.fieldLabel, count)
+  } else {
+    submit()
+    notify(`已粘贴并提交到「${p.fieldLabel}」`, 'ok', 2000)
+  }
+}
+
+/** 批量拆行提交：每行一条提示词 × 批次数，走 runChain 同一链路（改派/ETA/音效/看板全兼容）。
+ *  种子策略与批次一致：第 1 个任务用表单种子，其余全量换新；每条的参数快照各记各的行。 */
+function submitBatchText(
+  lines: string[],
+  fieldKey: string,
+  fieldLabel: string,
+  count = submitBatch.value
+) {
+  ensureAudio()
+  if (!state.graph) {
+    notify('请先选择一个工作流', 'warn')
+    return
+  }
+  if (!selectWorker(schedulableWorkers(), state.jobs, submitWorkerId.value)) {
+    notify('没有可用的计算节点（全部禁用或冷却中），请到设置里检查节点列表', 'warn', 6000)
+    return
+  }
+  const items = lines.slice(0, BATCH_TEXT_MAX)
+  const perLine = Math.max(1, Math.min(10, Math.floor(count) || 1))
+  recordPromptHistory()
+  // 已有链在跑时又提交（排队链）→ 整链重掷种子防撞车，与普通提交一致
+  const reroll = activeChains > 0
+  activeChains++
+  state.busy = true
+  const baseSnapshot = collectParamsSnapshot()
+  // 外层行 × 内层批次：与多图展开同构（Math.floor(i / count) 取行）
+  void runChain(
+    items.length * perLine,
+    perLine,
+    undefined,
+    [],
+    reroll,
+    undefined,
+    (i, values) => {
+      const line = items[Math.floor(i / perLine)]
+      values[fieldKey] = line
+      return { ...(baseSnapshot ?? {}), [fieldKey]: line }
+    }
+  )
+  notify(
+    perLine > 1
+      ? `「${fieldLabel}」已按行拆分：${items.length} 条 × ${perLine} 张 = ${items.length * perLine} 个任务`
+      : `「${fieldLabel}」已按行拆分：提交 ${items.length} 个任务（每行一条）`,
+    'ok',
+    4000
+  )
+}
+
+/** 「✂ 拆行提交」按钮：把字段当前内容按行拆分，弹预览确认后批量提交（显式操作，总是弹窗） */
+export function openBatchTextDialog(f: FieldSchema) {
+  const raw = String(f.value ?? '')
+  const lines = splitBatchLines(raw)
+  if (lines.length < 2) {
+    notify('框里内容不足两行，无需拆行（每行一条提示词）', 'warn', 4000)
+    return
+  }
+  batchTextPending.value = { fieldKey: f.key, fieldLabel: f.label, lines, raw }
+}
+
 /**
  * 一键粘贴提交：读剪贴板文本覆盖填入指定文本字段，按当前批次设置立即提交。
  * 「⚡ 粘贴提交」按钮和全局快捷键 Ctrl+E 共用这一份实现。
+ * 多行长文本 + 长文字段 → 批量拆行路径：ask 弹窗确认 / split 静默逐条 / whole 整段（现状）。
  */
 export async function pasteSubmitField(f: FieldSchema) {
   try {
@@ -1254,7 +1367,23 @@ export async function pasteSubmitField(f: FieldSchema) {
       notify('剪贴板里没有文本', 'warn', 3000)
       return
     }
-    f.value = t.trim()
+    const raw = t.trim()
+    if (f.kind === 'textarea') {
+      const lines = splitBatchLines(raw)
+      if (lines.length >= 2) {
+        if (batchTextMode.value === 'split') {
+          f.value = raw
+          submitBatchText(lines, f.key, f.label)
+          return
+        }
+        if (batchTextMode.value === 'ask') {
+          batchTextPending.value = { fieldKey: f.key, fieldLabel: f.label, lines, raw }
+          return
+        }
+        // whole → 落到下面的整段提交
+      }
+    }
+    f.value = raw
     submit()
     notify(`已粘贴并提交到「${f.label}」`, 'ok', 2000)
   } catch {
@@ -1365,14 +1494,17 @@ async function dispatchOne(
 
 /** 一条提交链的执行体：busy 由链生命周期管理，计数归零才复位。
  *  批次/多图展开后逐任务经 dispatchOne 派发——单任务粒度分摊到节点池，
- *  某台失败冷却 60s 自动改派；其余（种子策略/收尾通知音效/busy 语义）与旧版一致。 */
+ *  某台失败冷却 60s 自动改派；其余（种子策略/收尾通知音效/busy 语义）与旧版一致。
+ *  perItem（批量拆行提交用）：第 i 条派发前对 values 做最后覆盖（如提示词换成第 i 行），
+ *  返回值作为该条独立的参数快照（不返回则沿用外层 params）——每条产出的「载入参数」各回各的行。 */
 async function runChain(
   total: number,
   count: number,
   multiKey: string | undefined,
   imgs: string[],
   reroll: boolean,
-  params?: Record<string, any>
+  params?: Record<string, any>,
+  perItem?: (i: number, values: Record<string, any>) => Record<string, any> | undefined
 ) {
   let ok = 0
   const done_ = [] as { base: string; promptId: string }[]
@@ -1380,13 +1512,14 @@ async function runChain(
     for (let i = 0; i < total; i++) {
       const values = collectValues(state.fields.filter((f) => f.kind !== 'multiimage'))
       if (multiKey) values[multiKey] = imgs[Math.floor(i / count)] // 外层图片、内层批次
+      const itemParams = perItem ? perItem(i, values) : params
       // 第 1 个任务沿用表单上的种子（可复现）；其余每个都全量换新种子，整批不重样
       const reseed = i > 0 || reroll
       const r = await dispatchOne(
         values,
         submitWorkerId.value,
         state.currentWorkflow,
-        params,
+        itemParams,
         reseed
       )
       ok++
@@ -1398,7 +1531,7 @@ async function runChain(
         max: 0,
         startedAt: Date.now(),
         outputs: [],
-        params,
+        params: itemParams,
         workerId: r.workerId,
         base: r.base,
         graph: r.graph,
@@ -1902,7 +2035,13 @@ function persistAssets() {
  * 手动添加一份资产（视频截帧等本机产生、不经过任务队列的图片）：
  * type=input（文件在 ComfyUI input/studio/ 下），workflow 标记来源便于筛选。
  */
-export function addManualAsset(o: { base: string; filename: string; subfolder: string }) {
+export function addManualAsset(o: {
+  base: string
+  filename: string
+  subfolder: string
+  /** 截帧等「精心挑过的图」直接固定，不会被清空资产误删 */
+  pinned?: boolean
+}) {
   const key = assetKey(o.base, { filename: o.filename, subfolder: o.subfolder, type: 'input' })
   if (state.assets.some((a) => a.key === key)) return
   state.assets.unshift({
@@ -1916,7 +2055,7 @@ export function addManualAsset(o: { base: string; filename: string; subfolder: s
     createdAt: Date.now(),
     base: o.base,
     read: false,
-    pinned: false,
+    pinned: o.pinned ?? false,
   })
   persistAssets()
 }
