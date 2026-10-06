@@ -232,6 +232,122 @@ pub fn clipboard_file_paths() -> Result<Vec<String>, String> {
     }
 }
 
+/// 列出一个本地目录里的媒体内容（「📁 素材」面板用）：只保留图片/视频扩展名与子目录，
+/// 隐藏文件跳过。全部条目（含子目录）按修改时间倒序——最新的在最前。
+/// 返回规范化的绝对路径（dialog 可能给相对路径，canonicalize 统一转绝对并去掉 \\?\ 前缀）。
+#[command]
+pub fn list_local_media(path: String) -> Result<Value, String> {
+    #[derive(serde::Serialize)]
+    struct Item {
+        name: String,
+        path: String,
+        is_dir: bool,
+        kind: &'static str,
+        size: u64,
+        mtime: u64,
+    }
+    let dir = PathBuf::from(&path);
+    if !dir.is_dir() {
+        return Err("目录不存在或不可访问".into());
+    }
+    // 相对路径 → 绝对（strip \\?\ Windows 长路径前缀），前端面包屑/持久化都用规范路径
+    let dir = dir
+        .canonicalize()
+        .map_err(|e| format!("解析目录失败：{}", e))?;
+    let dir_str = dir.to_string_lossy().to_string();
+    let dir_str = dir_str
+        .strip_prefix(r"\\?\")
+        .map(|s| s.to_string())
+        .unwrap_or(dir_str);
+    let rd = fs::read_dir(&dir).map_err(|e| format!("读取目录失败：{}", e))?;
+    let mut items: Vec<Item> = Vec::new();
+    for entry in rd {
+        let Ok(entry) = entry else { continue };
+        let p = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            continue; // 隐藏文件/目录
+        }
+        let is_dir = p.is_dir();
+        let meta = entry.metadata().ok();
+        let mtime = meta
+            .as_ref()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if is_dir {
+            items.push(Item {
+                name,
+                path: p.to_string_lossy().to_string(),
+                is_dir: true,
+                kind: "dir",
+                size: 0,
+                mtime,
+            });
+            continue;
+        }
+        let ext = p
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let kind = match ext.as_str() {
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" => "image",
+            "mp4" | "webm" | "mov" | "mkv" | "avi" => "video",
+            _ => continue, // 非媒体文件不展示
+        };
+        items.push(Item {
+            name,
+            path: p.to_string_lossy().to_string(),
+            is_dir: false,
+            kind,
+            size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            mtime,
+        });
+    }
+    // 统一按修改时间倒序（文件夹和文件混排，最新动的在最前）
+    items.sort_by(|a, b| b.mtime.cmp(&a.mtime).then(a.name.to_lowercase().cmp(&b.name.to_lowercase())));
+    Ok(json!({
+        "dir": dir_str,
+        "items": items.into_iter().map(|it| {
+            json!({
+                "name": it.name,
+                "path": it.path,
+                "isDir": it.is_dir,
+                "kind": it.kind,
+                "size": it.size,
+                "mtime": it.mtime,
+            })
+        }).collect::<Vec<_>>(),
+    }))
+}
+
+/// 读取本地媒体文件的字节（base64）——素材面板的「复制图片 / 视频截帧」用。
+/// asset protocol 的源对 canvas 是跨源的（drawImage 后 toBlob 抛 SecurityError），
+/// 所以字节必须经 Rust 中转拿回，前端转 blob URL（同源）再喂给 img/video/canvas。
+/// 安全限制：只读媒体扩展名，单文件上限 200MB。
+#[command]
+pub fn read_local_file(path: String) -> Result<String, String> {
+    let p = PathBuf::from(&path);
+    let ext = p
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    const MEDIA: &[&str] = &[
+        "png", "jpg", "jpeg", "webp", "gif", "bmp", "mp4", "webm", "mov", "mkv", "avi",
+    ];
+    if !MEDIA.contains(&ext.as_str()) {
+        return Err("只支持读取图片/视频文件".into());
+    }
+    let meta = fs::metadata(&p).map_err(|e| format!("读取文件失败：{}", e))?;
+    if meta.len() > 200 * 1024 * 1024 {
+        return Err("文件超过 200MB，不支持读取".into());
+    }
+    let bytes = fs::read(&p).map_err(|e| format!("读取文件失败：{}", e))?;
+    use base64::Engine as _;
+    Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
 #[command]
 pub fn get_settings() -> Result<Value, String> {
     let root = ensure_dirs()?;

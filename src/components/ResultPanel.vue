@@ -247,8 +247,9 @@ function safeAssetFilename(a: Asset) {
 
 async function downloadOne(a: Asset) {
   try {
-    // 不弹窗：直接存系统「下载」目录（同名覆盖无妨，ComfyUI 文件名本身唯一）
-    const dir = String(await downloadDir()).replace(/[\\/]+$/, '')
+    // 不弹窗：优先设置里配置的下载目录，留空用系统「下载」目录（同名覆盖无妨，ComfyUI 文件名本身唯一）
+    const configured = String(state.settings.downloadDir ?? '').trim()
+    const dir = (configured || String(await downloadDir())).replace(/[\\/]+$/, '')
     const dest = `${dir}/${safeAssetFilename(a)}`
     await api.saveOutput(a.base ?? primaryBase(), a.filename, a.subfolder, a.type, dest)
     notify(`已保存：${dest}`, 'ok', 4000)
@@ -606,6 +607,12 @@ function onKey(e: KeyboardEvent) {
     const k = e.key
     if (k === 'Escape' && radial.value) {
       closeRadial()
+      return
+    }
+    // Ctrl+C / Cmd+C：复制图片到剪贴板（输入框聚焦时已被上方拦下，不会到这）
+    if ((e.ctrlKey || e.metaKey) && (k === 'c' || k === 'C')) {
+      e.preventDefault()
+      if (lbAsset.value?.kind === 'image') void copyAssetToClipboard(lbAsset.value)
       return
     }
     if (k === 'Escape') closeLb()

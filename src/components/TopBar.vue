@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted } from 'vue'
 import {
   checkConnection,
   enabledWorkers,
@@ -13,6 +13,33 @@ import { soundEnabled, toggleSound } from '../core/chime'
 import { cycleTheme, themeMode } from '../core/theme'
 import { ui } from '../ui'
 import WorkerBoard from './WorkerBoard.vue'
+
+const LF_OPEN_KEY = 'comfyui-studio.localFilesOpen:v1'
+const LA_OPEN_KEY = 'comfyui-studio.localAssetsOpen:v1'
+
+onMounted(() => {
+  try {
+    if (localStorage.getItem(LF_OPEN_KEY) === '1') ui.localFilesOpen = true
+    if (localStorage.getItem(LA_OPEN_KEY) === '0') ui.localAssetsOpen = false
+  } catch {
+    /* ignore */
+  }
+})
+
+/** 开关型按钮通用切换 + 持久化 */
+function toggleUi(key: 'localFilesOpen' | 'localAssetsOpen', storeKey: string) {
+  ui[key] = !ui[key]
+  try {
+    localStorage.setItem(storeKey, ui[key] ? '1' : '0')
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 「📁 素材」列开关（状态持久化，重启恢复） */
+function toggleLocalFiles() {
+  toggleUi('localFilesOpen', LF_OPEN_KEY)
+}
 
 /** 三态主题的按钮外观：跟随系统 → 深色 → 亮色 循环 */
 const THEME_UI: Record<string, { icon: string; label: string }> = {
@@ -113,6 +140,22 @@ function healthInfo(base: string): { cls: string; text: string } {
     >
       {{ THEME_UI[themeMode].icon }}
     </button>
+    <button
+      class="btn sm"
+      :class="{ active: ui.localFilesOpen }"
+      title="本地素材浏览器：浏览自定义文件夹里的图片/视频，可拖到参数卡当参考图"
+      @click="toggleLocalFiles"
+    >
+      📁 素材
+    </button>
+    <button
+      class="btn sm"
+      :class="{ active: ui.localAssetsOpen }"
+      title="本地资产收藏条（左下角）：常用图片随手拖"
+      @click="toggleUi('localAssetsOpen', LA_OPEN_KEY)"
+    >
+      🖼 收藏
+    </button>
     <button class="btn sm" @click="ui.logsOpen = !ui.logsOpen">日志</button>
     <button class="btn sm" @click="ui.settingsOpen = true">⚙ 设置</button>
   </header>
@@ -198,5 +241,11 @@ function healthInfo(base: string): { cls: string; text: string } {
 }
 .spacer {
   flex: 1;
+}
+/* 开关型按钮的按下态（📁 素材列展开中） */
+.btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
 }
 </style>

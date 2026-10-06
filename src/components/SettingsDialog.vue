@@ -29,6 +29,11 @@ async function browseOutput() {
   if (picked && !Array.isArray(picked)) state.settings.outputDir = picked
 }
 
+async function browseDownload() {
+  const picked = await open({ directory: true, multiple: false })
+  if (picked && !Array.isArray(picked)) state.settings.downloadDir = picked
+}
+
 function workerList(): WorkerProfile[] {
   if (!Array.isArray(state.settings.workers)) state.settings.workers = []
   return state.settings.workers
@@ -118,6 +123,7 @@ async function save() {
     pythonPath: state.settings.pythonPath,
     launchArgs: state.settings.launchArgs,
     outputDir: state.settings.outputDir,
+    downloadDir: state.settings.downloadDir,
     workers,
   })
   notify('设置已保存', 'ok', 2500)
@@ -180,6 +186,18 @@ async function save() {
           <div class="hint">
             逐条拆分 = 每行一条提示词、各提交一个任务（上限 50）。长文本工具条的
             <code>✂ 拆行提交</code> 按钮不受此项影响，总是先弹预览确认。
+          </div>
+        </div>
+
+        <div class="form-row">
+          <label>资源下载目录（结果区 ⬇ 下载的保存位置；留空用系统下载目录）</label>
+          <div class="inline">
+            <input
+              v-model="state.settings.downloadDir"
+              class="input"
+              placeholder="留空 = 系统「下载」目录"
+            />
+            <button class="btn" @click="browseDownload">浏览</button>
           </div>
         </div>
 

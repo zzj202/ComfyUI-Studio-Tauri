@@ -140,6 +140,8 @@ pub fn run() {
             store::app_data_dir,
             store::save_temp_bytes,
             store::clipboard_file_paths,
+            store::list_local_media,
+            store::read_local_file,
             store::get_settings,
             store::save_settings,
             store::list_workflows,

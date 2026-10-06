@@ -3,10 +3,12 @@ import { onMounted, ref } from 'vue'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { beginDrag, notify } from '../store'
+import { ui } from '../ui'
 
 /**
  * 界面左下角的「本地资产」条：常用的本地图片集合，按住即可拖到
  * 右侧参数区的图片卡上当参考图（也支持拖到工作流面板反查工作流）。
+ * TopBar「🖼 收藏」按钮可收起/展开（状态持久化）。
  */
 
 const KEY = 'comfyui-studio.localAssets.v1'
@@ -75,7 +77,7 @@ function clearAll() {
 </script>
 
 <template>
-  <section class="local">
+  <section v-if="ui.localAssetsOpen" class="local">
     <header class="head">
       <h2>本地资产</h2>
       <span class="faint">{{ paths.length }}</span>

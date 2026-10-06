@@ -31,6 +31,14 @@ export const api = {
     invoke<string>('save_temp_bytes', { name, b64 }),
   /** 读取剪贴板里的文件路径列表（资源管理器复制的文件，可多张；WebView clipboard API 看不到） */
   clipboardFilePaths: () => invoke<string[]>('clipboard_file_paths'),
+  /** 列出本地目录里的媒体内容（「📁 素材」面板）：按修改时间倒序，只含图片/视频/子目录；dir = 规范化绝对路径 */
+  listLocalMedia: (path: string) =>
+    invoke<{
+      dir: string
+      items: { name: string; path: string; isDir: boolean; kind: 'dir' | 'image' | 'video'; size: number; mtime: number }[]
+    }>('list_local_media', { path }),
+  /** 读取本地媒体文件字节（base64）：素材面板复制图片/视频截帧用（asset 源跨域污染 canvas，必须 Rust 中转） */
+  readLocalFile: (path: string) => invoke<string>('read_local_file', { path }),
   getSettings: () => invoke<Record<string, any>>('get_settings'),
   saveSettings: (value: Record<string, any>) =>
     invoke<Record<string, any>>('save_settings', { value }),

@@ -10,6 +10,7 @@ import LogPanel from './components/LogPanel.vue'
 import Toasts from './components/Toasts.vue'
 import AssetDrop from './components/AssetDrop.vue'
 import LocalAssets from './components/LocalAssets.vue'
+import LocalFiles from './components/LocalFiles.vue'
 import { disposeAll, dragGhost, imageDropTargets, init, notify, pasteSubmitField, refreshQueue, state } from './store'
 import { api, saveTempBlob } from './api/tauri'
 import type { FieldSchema } from './core/types'
@@ -170,6 +171,8 @@ onUnmounted(() => {
       </aside>
       <main class="col center"><ParamPanel /></main>
       <aside class="col right"><ResultPanel /></aside>
+      <!-- 「📁 素材」：本地文件夹浏览列（组件自身 v-if 控制显隐；第 4 列 auto，关闭时宽 0） -->
+      <LocalFiles />
     </div>
 
     <!-- 应用内拖拽的跟随幽灵（ResultPanel / LocalAssets 共用） -->
@@ -201,7 +204,8 @@ onUnmounted(() => {
 .body {
   flex: 1;
   display: grid;
-  grid-template-columns: 232px minmax(0, 1fr) 340px;
+  /* 第 4 列 = 素材列（auto）：LocalFiles 关闭时不渲染、该列宽 0；开启时由组件自身宽度撑起 */
+  grid-template-columns: 232px minmax(0, 1fr) 340px auto;
   min-height: 0;
 }
 .col {
