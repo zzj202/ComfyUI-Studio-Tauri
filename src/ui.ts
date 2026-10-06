@@ -5,6 +5,8 @@ export const ui = reactive({
   settingsOpen: false,
   templateOpen: false,
   logsOpen: false,
+  /** 节点健康看板弹层（TopBar 触发点下方） */
+  workerBoardOpen: false,
   /** 置 true 即请求打开「选择资产文件」对话框（由 AssetDrop 消费后复位） */
   assetPick: false,
   /** 置为本地路径即请求打开「资产工作流」查看器（由 AssetDrop 消费后复位） */

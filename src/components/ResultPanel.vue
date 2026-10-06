@@ -18,6 +18,7 @@ import {
   markAssetRead,
   notify,
   openAssetWorkflow,
+  pinJobToWorker,
   primaryBase,
   promoteJob,
   queueByBase,
@@ -641,6 +642,7 @@ const ctxMenu = ref<{ x: number; y: number; asset: Asset } | null>(null)
 
 function openCtx(e: MouseEvent, a: Asset) {
   e.preventDefault()
+  jobCtxMenu.value = null // 与任务菜单互斥
   // 粗略防溢出（菜单约 168×252）
   ctxMenu.value = {
     x: Math.min(e.clientX, window.innerWidth - 176),
@@ -651,17 +653,44 @@ function openCtx(e: MouseEvent, a: Asset) {
 
 function closeCtx() {
   ctxMenu.value = null
+  jobCtxMenu.value = null
 }
 
 function onGlobalCtx(e: MouseEvent) {
   const t = e.target as HTMLElement | null
-  if (!t?.closest('[data-asset-card]') && !t?.closest('.ctx-menu')) closeCtx()
+  if (
+    !t?.closest('[data-asset-card]') &&
+    !t?.closest('.ctx-menu') &&
+    !t?.closest('.q-row') // 任务行有自己的右键菜单（指定节点）
+  )
+    closeCtx()
 }
 
 function ctxRun(fn: (a: Asset) => void) {
   if (ctxMenu.value) fn(ctxMenu.value.asset)
   closeCtx()
 }
+
+// ---- 任务右键菜单：指定节点执行（绕过自动调度） ----
+const jobCtxMenu = ref<{ x: number; y: number; job: Job } | null>(null)
+
+function openJobCtx(e: MouseEvent, job: Job) {
+  e.preventDefault()
+  ctxMenu.value = null // 与资产菜单互斥
+  jobCtxMenu.value = {
+    x: Math.min(e.clientX, window.innerWidth - 200),
+    y: Math.min(e.clientY, window.innerHeight - 280),
+    job,
+  }
+}
+
+function jobCtxRun(fn: (j: Job) => void) {
+  if (jobCtxMenu.value) fn(jobCtxMenu.value.job)
+  jobCtxMenu.value = null
+}
+
+/** 右键菜单里的可选节点：全部启用节点（跑没跑得动由预检/改派机制兜底） */
+const ctxWorkers = computed(() => enabledWorkers())
 
 onMounted(() => {
   window.addEventListener('keydown', onKey)
@@ -715,11 +744,23 @@ onUnmounted(() => {
       </header>
       <div class="q-body">
         <div v-if="!state.jobs.length" class="q-empty">队列空 · 任务进度显示在这里</div>
-        <div v-for="job in state.jobs" :key="job.promptId" class="q-row">
+        <div
+          v-for="job in state.jobs"
+          :key="job.promptId"
+          class="q-row"
+          @contextmenu.prevent="openJobCtx($event, job)"
+        >
           <span class="dot" :class="job.status" />
           <span class="q-wf" :title="job.workflow">{{ job.workflow || '—' }}</span>
-          <span v-if="job.base" class="q-node" :title="'节点：' + job.base">
-            <span class="q-node-dot" />{{ workerName(job.base) }}
+          <span
+            v-if="job.base"
+            class="q-node"
+            :class="{ pinned: !!job.pinnedWorkerId }"
+            :title="
+              (job.pinnedWorkerId ? '已指定节点（右键可改）· ' : '节点（右键可指定）· ') + job.base
+            "
+          >
+            <span class="q-node-dot" />{{ job.pinnedWorkerId ? '📌 ' : '' }}{{ workerName(job.base) }}
           </span>
           <div v-if="job.status === 'running' || job.status === 'queued'" class="q-bar">
             <div class="q-fill" :style="{ width: pct(job) + '%' }" />
@@ -1034,6 +1075,43 @@ onUnmounted(() => {
       </button>
       <div class="ctx-sep" />
       <button class="ctx-item danger" @click="ctxRun(removeAsset)">✕ 移除</button>
+    </div>
+
+    <!-- 任务右键菜单：指定节点执行（绕过自动调度） -->
+    <div
+      v-if="jobCtxMenu"
+      class="ctx-menu"
+      :style="{ left: jobCtxMenu.x + 'px', top: jobCtxMenu.y + 'px' }"
+      @click.stop
+      @contextmenu.prevent
+    >
+      <div class="ctx-note">
+        {{ jobCtxMenu.job.status === 'queued'
+          ? '指定这个任务必须在哪台节点执行'
+          : '仅排队中的任务可指定节点' }}
+      </div>
+      <button
+        v-for="w in ctxWorkers"
+        :key="w.id"
+        class="ctx-item"
+        :disabled="jobCtxMenu.job.status !== 'queued'"
+        :title="jobCtxMenu.job.base === w.base ? '任务当前就在这台，选中即固定' : `从原节点摘除并提交到 ${w.base}`"
+        @click="jobCtxRun((j) => pinJobToWorker(j, w.id))"
+      >
+        <span class="ctx-mark">
+          {{ jobCtxMenu.job.pinnedWorkerId === w.id ? '📌' : jobCtxMenu.job.base === w.base ? '•' : '' }}
+        </span>
+        {{ w.name || w.base }}
+      </button>
+      <div class="ctx-sep" />
+      <button
+        class="ctx-item"
+        :disabled="jobCtxMenu.job.status !== 'queued' || !jobCtxMenu.job.pinnedWorkerId"
+        title="清除指定：任务留在当前位置，之后改派/重试不再受限"
+        @click="jobCtxRun((j) => pinJobToWorker(j, 'auto'))"
+      >
+        ↺ 恢复自动调度
+      </button>
     </div>
   </section>
 </template>
@@ -1821,5 +1899,31 @@ onUnmounted(() => {
   height: 1px;
   background: var(--border-soft);
   margin: 4px 6px;
+}
+/* 任务右键菜单：说明行 / 标记列 / 禁用态 */
+.ctx-note {
+  font-size: 11px;
+  color: var(--text-faint);
+  padding: 4px 10px 6px;
+  white-space: nowrap;
+}
+.ctx-mark {
+  display: inline-block;
+  width: 18px;
+  flex: none;
+  text-align: center;
+}
+.ctx-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.ctx-item:disabled:hover {
+  background: transparent;
+  color: var(--text);
+}
+/* 已指定节点的任务：节点胶囊高亮 + 📌 前缀（模板里加） */
+.q-node.pinned {
+  border-color: var(--accent);
+  color: var(--accent);
 }
 </style>

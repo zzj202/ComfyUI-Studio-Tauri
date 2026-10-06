@@ -123,6 +123,8 @@ export interface Job {
   params?: Record<string, any>
   /** 派发到的计算节点 id（刷新恢复的旧任务可能没有） */
   workerId?: string
+  /** 任务级指定节点（右键「必须在这台跑」）：仅约束展示与手动改派；任何自动重排（改派/重试）都会清除回自动调度 */
+  pinnedWorkerId?: string
   /** 冗余存产出机器的 base：节点被删/改名后仍能收尾、下载、查历史（WS/对账按它路由） */
   base?: string
   /** 首次发现不在服务器队列的时间（幽灵任务两轮确认用，内部字段） */

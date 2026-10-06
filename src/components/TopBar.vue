@@ -12,6 +12,7 @@ import {
 import { soundEnabled, toggleSound } from '../core/chime'
 import { cycleTheme, themeMode } from '../core/theme'
 import { ui } from '../ui'
+import WorkerBoard from './WorkerBoard.vue'
 
 /** 三态主题的按钮外观：跟随系统 → 深色 → 亮色 循环 */
 const THEME_UI: Record<string, { icon: string; label: string }> = {
@@ -57,24 +58,33 @@ function healthInfo(base: string): { cls: string; text: string } {
       <span>{{ state.connection === 'ok' ? '已连接' : state.connection === 'error' ? '未连接' : '检测中' }}</span>
     </button>
 
-    <!-- 每节点健康状态点：绿=在线 红=离线 灰=检测中；点击打开设置 -->
-    <span v-if="workers.length > 1" class="node-dots">
-      <button
-        v-for="w in workers"
-        :key="w.id"
-        class="node-dot"
-        :class="healthInfo(w.base).cls"
-        :title="`${w.name || w.base} · ${w.base} · ${healthInfo(w.base).text}（点击打开设置）`"
-        @click="ui.settingsOpen = true"
-      />
-    </span>
+    <!-- 每节点健康状态点：绿=在线 红=离线 灰=检测中；点击展开节点看板 -->
+    <div class="node-wrap" data-wb-anchor>
+      <span v-if="workers.length > 1" class="node-dots">
+        <button
+          v-for="w in workers"
+          :key="w.id"
+          class="node-dot"
+          :class="healthInfo(w.base).cls"
+          :title="`${w.name || w.base} · ${healthInfo(w.base).text}（点击打开节点看板）`"
+          @click="ui.workerBoardOpen = !ui.workerBoardOpen"
+        />
+      </span>
+      <WorkerBoard v-if="ui.workerBoardOpen" @close="ui.workerBoardOpen = false" />
+    </div>
 
-    <span v-if="state.stats?.devices?.[0]" class="device faint">
+    <button
+      v-if="state.stats?.devices?.[0]"
+      class="device faint"
+      data-wb-anchor
+      title="点击打开节点看板（显存 / 队列 / 进度）"
+      @click="ui.workerBoardOpen = !ui.workerBoardOpen"
+    >
       {{ state.stats.devices[0].name }}
       <template v-if="state.stats.devices[0].vram_total">
         · {{ (state.stats.devices[0].vram_total / 1073741824).toFixed(0) }}GB
       </template>
-    </span>
+    </button>
 
     <div class="spacer" />
 
@@ -137,6 +147,12 @@ function healthInfo(base: string): { cls: string; text: string } {
   white-space: nowrap;
   font-size: 11.5px;
 }
+/* 节点看板弹层的定位锚点 */
+.node-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
 /* 每节点健康状态点 */
 .node-dots {
   display: flex;
@@ -170,6 +186,15 @@ function healthInfo(base: string): { cls: string; text: string } {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  border: none;
+  background: none;
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: inherit;
+}
+.device:hover {
+  background: var(--hover, #ffffff14);
 }
 .spacer {
   flex: 1;

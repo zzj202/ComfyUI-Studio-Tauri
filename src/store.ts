@@ -256,18 +256,45 @@ export function healthOf(base: string): 'up' | 'down' | 'unknown' {
   return nodeHealth.value[base] ?? 'unknown'
 }
 
+/** 单节点的硬件快照（节点看板用）：/system_stats 的 GPU 名与显存 */
+export interface WorkerStat {
+  device?: string
+  /** 总显存 / 剩余显存（字节）；非 GPU 或旧版 ComfyUI 可能缺 */
+  vramTotal?: number
+  vramFree?: number
+  ts: number
+}
+
+/** key = base。健康轮询顺带填充（零额外请求），30s 一刷 */
+export const workerStats = ref<Record<string, WorkerStat>>({})
+
 async function pingAllNodes() {
   const list = enabledWorkers()
   await Promise.all(
     list.map(async (w) => {
       try {
-        await api.systemStats(w.base)
+        const s = await api.systemStats(w.base)
         setHealth(w.base, 'up')
+        const dev = s?.devices?.[0]
+        workerStats.value = {
+          ...workerStats.value,
+          [w.base]: {
+            device: dev?.name,
+            vramTotal: dev?.vram_total,
+            vramFree: dev?.vram_free,
+            ts: Date.now(),
+          },
+        }
       } catch {
         setHealth(w.base, 'down')
       }
     })
   )
+}
+
+/** 立即 ping 一轮（节点看板打开 / 手动刷新用），不影响 30s 周期轮询 */
+export async function pingNow() {
+  await pingAllNodes()
 }
 
 function startHealthLoop() {
@@ -1598,10 +1625,95 @@ export async function requeueJob(job: Job) {
       error: undefined,
       outputs: [],
       staleSince: undefined,
+      // 自动改派 = 回自动调度：清除任务级 pin（pin 只由 pinJobToWorker 设置）
+      pinnedWorkerId: undefined,
     })
     notify(`已改派到「${workerName(target.base)}」`, 'ok', 4000)
   } catch (e) {
     notify(`改派提交失败：${e}（原任务已从队列摘除，请重新提交）`, 'error', 8000)
+  }
+  void refreshQueue()
+}
+
+/**
+ * 任务级指定节点（队列右键「必须在这台跑」，绕过自动调度）：
+ * - 'auto'      → 清除指定（任务留在当前节点跑完，不再强制）
+ * - 指定当前节点 → 只打 pin 标记，不动队列
+ * - 指定其他节点 → 从原节点摘除（防竞态：摘除后核对 /queue，已开跑的让它跑完不改派）
+ *   → 重新提交到目标机 → 换绑记录并打 pin。
+ * pin 不参与 dispatchOne 自动调度；后续 requeueJob/retryJob 等任何重排都会清 pin 回自动。
+ */
+export async function pinJobToWorker(job: Job, workerId: string) {
+  if (job.status !== 'queued') return
+  if (workerId === 'auto') {
+    if (job.pinnedWorkerId) {
+      job.pinnedWorkerId = undefined
+      notify('已恢复自动调度', 'ok', 3000)
+    }
+    return
+  }
+  const target = enabledWorkers().find((w) => w.id === workerId)
+  if (!target) {
+    notify('该节点不存在或已禁用', 'warn', 5000)
+    return
+  }
+  if (job.base === target.base) {
+    job.pinnedWorkerId = target.id
+    notify(`已固定在「${workerName(target.base)}」`, 'ok', 3000)
+    return
+  }
+  if (!job.graph) {
+    notify('这个任务没有留存提交数据，无法指定到其他节点（可移除后重新提交）', 'warn', 6000)
+    return
+  }
+  const from = job.base ?? primaryBase()
+  try {
+    await api.queueDelete(from, [job.promptId])
+  } catch (e) {
+    notify(`从原节点摘除失败：${e}`, 'error', 8000)
+    return
+  }
+  // 核对摘除后的服务器现状：任务恰好开跑/完成就不动它（避免重复烧卡）
+  try {
+    const q = await api.queue(from)
+    const rows = [...(q?.queue_pending ?? [])]
+    const pendingIds = new Set(rows.map((r: any) => String(r?.[1] ?? '')).filter(Boolean))
+    if (!pendingIds.has(job.promptId)) {
+      notify('任务已开跑或已完成，未改派（等它跑完即可）', 'info', 5000)
+      return
+    }
+  } catch {
+    // 拉不到 /queue 就按「仍在队列」处理，与 promoteJob 的兜底一致
+  }
+  try {
+    const res = await api.submit(
+      target.base,
+      job.graph,
+      job.workflow || undefined,
+      job.params ? JSON.stringify(job.params) : undefined
+    )
+    const err = extractSubmitError(res, job.graph)
+    if (err) throw new Error(err)
+    const i = state.jobs.indexOf(job)
+    if (i >= 0) state.jobs.splice(i, 1)
+    state.jobs.unshift({
+      ...job,
+      promptId: String(res.prompt_id),
+      base: target.base,
+      workerId: target.id,
+      pinnedWorkerId: target.id,
+      status: 'queued',
+      value: 0,
+      max: 0,
+      startedAt: Date.now(),
+      finishedAt: undefined,
+      error: undefined,
+      outputs: [],
+      staleSince: undefined,
+    })
+    notify(`已指定到「${workerName(target.base)}」`, 'ok', 4000)
+  } catch (e) {
+    notify(`提交失败：${e}（原任务已从队列摘除，请重新提交）`, 'error', 8000)
   }
   void refreshQueue()
 }
@@ -1646,6 +1758,8 @@ export async function retryJob(job: Job) {
       error: undefined,
       outputs: [],
       staleSince: undefined,
+      // 重试同样回自动调度：清除任务级 pin
+      pinnedWorkerId: undefined,
     })
     notify('已重新提交', 'ok', 3000)
   } catch (e) {
