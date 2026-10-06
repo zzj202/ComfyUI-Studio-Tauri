@@ -422,6 +422,46 @@ pub async fn comfy_save_output(
     Ok(json!({ "ok": true, "path": dest, "size": bytes.len() }))
 }
 
+/// GET /view 取文件字节（base64 返回）：前端像素级处理（视频截帧/复制图片）时用。
+/// ComfyUI 不发 CORS 头，WebView 里 fetch /view 会被跨域拦掉（Failed to fetch），
+/// 所以必须从 Rust 中转——前端拿到 base64 后自行解码成 Blob。
+#[command]
+pub async fn comfy_view_bytes(
+    base: String,
+    filename: String,
+    subfolder: Option<String>,
+    kind: Option<String>,
+) -> Result<Value, String> {
+    let sub = subfolder.unwrap_or_default();
+    let k = kind.unwrap_or_else(|| "output".to_string());
+    let url = with_query(
+        &join_url(&base, "/view"),
+        &[
+            ("filename", filename.as_str()),
+            ("subfolder", sub.as_str()),
+            ("type", k.as_str()),
+        ],
+    );
+    let resp = client()
+        .get(&url)
+        .timeout(Duration::from_secs(300))
+        .send()
+        .await
+        .map_err(|e| conn_err(&url, &e.to_string()))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        let text = resp.text().await.unwrap_or_default();
+        return Err(http_err(&url, status, &text));
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("读取文件失败：{}", e))?;
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(json!({ "b64": b64, "size": bytes.len() }))
+}
+
 /// 把一份产出（output/temp）转存进 ComfyUI 的 input 目录 —— 应用内把结果图拖到参考图控件时用：
 /// LoadImage 只认 input 目录，先 GET /view 拿字节，再 POST /upload/image 存回去。
 #[command]

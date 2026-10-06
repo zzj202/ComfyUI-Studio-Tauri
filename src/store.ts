@@ -1,4 +1,4 @@
-import { reactive, ref, watch } from 'vue'
+import { computed, reactive, ref, watch } from 'vue'
 import { api } from './api/tauri'
 import { ComfyWs } from './api/comfyWs'
 import {
@@ -838,6 +838,10 @@ async function finishJob(promptId: string, base: string) {
       job.status = 'done'
       job.value = job.max || 1
       job.finishedAt = Date.now()
+      // 记录该机单任务耗时（指数滑动平均）：队列完成 ETA 的估算依据
+      const durMs = Math.max(1000, (job.finishedAt ?? Date.now()) - job.startedAt)
+      const prev = baseAvgMs.get(base)
+      baseAvgMs.set(base, prev == null ? durMs : Math.round(prev * 0.7 + durMs * 0.3))
       addAssets(job)
       notify(`生成完成（${job.outputs.length} 个文件）`, 'ok')
       // 应用内没有排队/进行中的任务了（这一批跑完）且窗口在后台 → 发一条系统通知
@@ -854,6 +858,36 @@ async function finishJob(promptId: string, base: string) {
     job.error = String(e)
   }
 }
+
+// ---- 队列完成 ETA：按各机历史平均单任务耗时估算；总完成时间 = 最慢那台（并行） ----
+// 内存数据，重启后从第一个完成任务开始重新积累；无样本时不显示。
+const baseAvgMs = reactive(new Map<string, number>())
+
+export const queueEtaText = computed(() => {
+  if (!state.jobs.some((j) => j.status === 'queued' || j.status === 'running')) return ''
+  let slowest = 0
+  for (const [base, avg] of baseAvgMs) {
+    const mine = state.jobs.filter(
+      (j) =>
+        (j.base ?? primaryBase()) === base &&
+        (j.status === 'queued' || j.status === 'running')
+    )
+    if (!mine.length) continue
+    let remain = 0
+    for (const j of mine) {
+      // 运行中的按进度折算剩余比例（保底 5%：最后一步的收尾/写盘也要时间），排队的按全耗时
+      if (j.status === 'running' && j.max > 0) {
+        remain += avg * Math.max(0.05, 1 - j.value / j.max)
+      } else {
+        remain += avg
+      }
+    }
+    slowest = Math.max(slowest, remain)
+  }
+  if (!slowest) return ''
+  const m = Math.round(slowest / 60000)
+  return m >= 1 ? `约 ${m} 分钟` : '1 分钟内'
+})
 
 // ---------------------------------------------------------------- 工作流
 
@@ -1617,6 +1651,91 @@ export async function retryJob(job: Job) {
   void refreshQueue()
 }
 
+/**
+ * 排队插队：让这个任务成为它所在节点的「下一个执行」。
+ * ComfyUI 队列是 FIFO 且不支持优先级——做法：摘除该机全部 pending，
+ * 按「目标 → 其余（原执行顺序）」立刻重新提交（提交顺序即队列顺序）。
+ * 防重复烧卡：摘除瞬间某个任务可能刚好开跑/完成——先拉服务器 /queue 核对，
+ * 只重新提交确认还在 pending 里的；已在 running 的让它继续跑，不动。
+ */
+export async function promoteJob(job: Job) {
+  if (job.status !== 'queued') return
+  if (!job.graph) {
+    notify('这个任务没有留存提交数据，无法插队', 'warn', 6000)
+    return
+  }
+  const base = job.base ?? primaryBase()
+  const queued = state.jobs.filter(
+    (j) => (j.base ?? primaryBase()) === base && j.status === 'queued'
+  )
+  if (queued.length < 2) {
+    notify('该节点没有其他排队任务，无需插队', 'info', 4000)
+    return
+  }
+  // 服务器执行顺序 = 提交顺序 = state.jobs 倒序（本地新的在前）；目标提到最前
+  const ordered = [...queued].reverse()
+  const plan = [job, ...ordered.filter((j) => j !== job)]
+  try {
+    await api.queueDelete(
+      base,
+      plan.map((j) => j.promptId)
+    )
+  } catch (e) {
+    notify(`从节点摘除失败：${e}`, 'error', 8000)
+    return
+  }
+  // 核对摘除后的服务器现状
+  let pendingIds = new Set<string>()
+  let runningIds = new Set<string>()
+  try {
+    const q = await api.queue(base)
+    const ids = (rows: any[]) => new Set(rows.map((r) => String(r?.[1] ?? '')).filter(Boolean))
+    pendingIds = ids([...(q?.queue_pending ?? [])])
+    runningIds = ids([...(q?.queue_running ?? [])])
+  } catch {
+    // 拉不到就以「全部重新提交」为准（与旧行为一致）
+    pendingIds = new Set(plan.map((j) => j.promptId))
+  }
+  const failed: string[] = []
+  for (const j of plan) {
+    if (runningIds.has(j.promptId)) continue // 竞态中已开跑：让它跑完，不重复提交
+    if (!pendingIds.has(j.promptId)) continue // 已完成/不存在：跳过
+    try {
+      const res = await api.submit(
+        base,
+        j.graph,
+        j.workflow || undefined,
+        j.params ? JSON.stringify(j.params) : undefined
+      )
+      const err = extractSubmitError(res, j.graph)
+      if (err) throw new Error(err)
+      const i = state.jobs.indexOf(j)
+      if (i >= 0) {
+        state.jobs[i] = {
+          ...j,
+          promptId: String(res.prompt_id),
+          status: 'queued',
+          value: 0,
+          max: 0,
+          startedAt: Date.now(),
+          finishedAt: undefined,
+          error: undefined,
+          outputs: [],
+          staleSince: undefined,
+        }
+      }
+    } catch {
+      failed.push(j.workflow || j.promptId)
+    }
+  }
+  void refreshQueue()
+  if (failed.length) {
+    notify(`插队时 ${failed.length} 个任务重新提交失败（可在队列里用 ↻ 重试）`, 'error', 8000)
+  } else {
+    notify(`已插队：「${job.workflow || '任务'}」将成为该节点下一个执行`, 'ok', 4000)
+  }
+}
+
 // ---------------------------------------------------------------- 结果资产
 
 const ASSETS_KEY = 'comfyui-studio.assets.v1'
@@ -1660,6 +1779,29 @@ function persistAssets() {
   } catch {
     /* 超限就放弃持久化，不影响使用 */
   }
+}
+
+/**
+ * 手动添加一份资产（视频截帧等本机产生、不经过任务队列的图片）：
+ * type=input（文件在 ComfyUI input/studio/ 下），workflow 标记来源便于筛选。
+ */
+export function addManualAsset(o: { base: string; filename: string; subfolder: string }) {
+  const key = assetKey(o.base, { filename: o.filename, subfolder: o.subfolder, type: 'input' })
+  if (state.assets.some((a) => a.key === key)) return
+  state.assets.unshift({
+    key,
+    filename: o.filename,
+    subfolder: o.subfolder,
+    type: 'input',
+    kind: 'image',
+    promptId: '',
+    workflow: '视频截帧',
+    createdAt: Date.now(),
+    base: o.base,
+    read: false,
+    pinned: false,
+  })
+  persistAssets()
 }
 
 function restoreAssets() {

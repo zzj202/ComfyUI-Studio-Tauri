@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
-import { api, viewUrl } from '../api/tauri'
+import { api, saveTempBlob, viewUrl } from '../api/tauri'
 import { downloadDir } from '@tauri-apps/api/path'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import type { Asset, Job } from '../core/types'
 import { IMG_EXT_RE } from '../core/clipboard'
 import {
+  addManualAsset,
   applyAssetParams,
   beginDrag,
   clearAssets,
@@ -18,7 +19,9 @@ import {
   notify,
   openAssetWorkflow,
   primaryBase,
+  promoteJob,
   queueByBase,
+  queueEtaText,
   refreshQueue,
   removeAsset,
   renameAsset,
@@ -73,6 +76,46 @@ async function copyErr(job: Job) {
     notify('已复制错误信息', 'ok', 2000)
   } catch {
     notify('复制失败（剪贴板被其他程序占用？）', 'warn')
+  }
+}
+
+/**
+ * 把资产文件字节拉成本地 Blob：走 Rust 中转（comfy_view_bytes）。
+ * ComfyUI 不发 CORS 头，WebView 里 fetch /view 会被跨域拦掉（Failed to fetch）。
+ * base64 用 data URL 让浏览器原生解码成 Blob，比 atob 手撸快。
+ */
+async function assetBlob(a: Asset): Promise<Blob> {
+  const base = a.base ?? primaryBase()
+  const r = await api.viewBytes(base, a.filename, a.subfolder, a.type)
+  return await (await fetch(`data:application/octet-stream;base64,${r.b64}`)).blob()
+}
+
+/**
+ * 一键复制图片到剪贴板（贴进微信/QQ 直接发）：非 PNG 先经 canvas 转 PNG
+ * （image/png 是剪贴板位图最通用的格式，JPEG/GIF/WebP 直接写很多应用不认）。
+ */
+async function copyAssetToClipboard(a: Asset) {
+  if (a.kind !== 'image') {
+    notify('视频不支持复制，请用下载', 'warn', 4000)
+    return
+  }
+  try {
+    const blob = await assetBlob(a)
+    let png: Blob = blob
+    if (blob.type !== 'image/png') {
+      const bmp = await createImageBitmap(blob)
+      const c = document.createElement('canvas')
+      c.width = bmp.width
+      c.height = bmp.height
+      c.getContext('2d')?.drawImage(bmp, 0, 0)
+      png = await new Promise<Blob>((resolve, reject) =>
+        c.toBlob((b) => (b ? resolve(b) : reject(new Error('转换失败'))), 'image/png')
+      )
+    }
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })])
+    notify('已复制图片，可直接粘贴发送', 'ok', 2500)
+  } catch (e) {
+    notify(`复制失败：${e}`, 'error', 6000)
   }
 }
 
@@ -325,6 +368,97 @@ function removeCurrent() {
   closeLb()
 }
 
+// ---- 视频逐帧预览（仅视频；GIF 是 <img> 没有帧概念，不做）----
+// <video> 拿不到真实帧率，按 30fps 折算单帧步长——对慢动作定位足够用
+const lbVideo = ref<HTMLVideoElement | null>(null)
+const FRAME_STEP = 1 / 30
+const lbTime = ref(0) // 响应式时间指针（timeupdate 驱动，约 4 次/秒）
+const lbDur = ref(0)
+const lbPlaying = ref(false)
+const frameLabel = computed(() => {
+  if (!lbDur.value) return ''
+  const f = Math.round(lbTime.value * 30) + 1
+  return `${lbTime.value.toFixed(2)}s / ${lbDur.value.toFixed(2)}s · ≈帧 ${f}`
+})
+
+function togglePlay() {
+  const v = lbVideo.value
+  if (!v) return
+  if (v.paused) void v.play().catch(() => {})
+  else v.pause()
+}
+
+function stepFrame(d: number) {
+  const v = lbVideo.value
+  if (!v) return
+  v.pause()
+  v.currentTime = Math.min(v.duration || 0, Math.max(0, v.currentTime + d * FRAME_STEP))
+}
+
+/**
+ * 截取视频当前帧 → 直接进剪贴板（Ctrl+V 即用），结果区留底一份。
+ * 不能直接对播放中的 <video> 截图：跨源源会污染 canvas（toBlob 抛 SecurityError）
+ * ——字节经 Rust 中转拿回后用 blob URL（同源）喂给离屏 video，
+ * seek 到同一时间点再截，内容与画面所见一致。
+ */
+async function captureVideoFrame() {
+  const src = lbAsset.value
+  const v = lbVideo.value
+  if (!src || !v) return
+  const t = v.currentTime
+  notify('正在截取当前帧…', 'info', 2000)
+  try {
+    const blob = await assetBlob(src)
+    const url = URL.createObjectURL(blob)
+    const off = document.createElement('video')
+    off.muted = true
+    off.preload = 'auto'
+    off.src = url
+    await new Promise<void>((resolve, reject) => {
+      off.onloadedmetadata = () => resolve()
+      off.onerror = () => reject(new Error('视频加载失败'))
+    })
+    off.currentTime = Math.min(t, off.duration || t)
+    await new Promise<void>((resolve) => {
+      off.onseeked = () => resolve()
+      window.setTimeout(resolve, 3000) // 兜底：seek 事件偶发不触发就按当前位置截
+    })
+    const c = document.createElement('canvas')
+    c.width = off.videoWidth || 720
+    c.height = off.videoHeight || 1280
+    c.getContext('2d')?.drawImage(off, 0, 0, c.width, c.height)
+    URL.revokeObjectURL(url)
+    const png = await new Promise<Blob>((resolve, reject) =>
+      c.toBlob((b) => (b ? resolve(b) : reject(new Error('截帧失败'))), 'image/png')
+    )
+    // ① 直接进剪贴板（主诉求：Ctrl+V 即用）
+    let copied = false
+    try {
+      await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })])
+      copied = true
+    } catch {
+      /* 剪贴板被占用/权限失败：结果区留底兜底 */
+    }
+    // ② 结果区留底（落临时文件 → 上传主节点 input/studio）
+    const path = await saveTempBlob(png, 'png')
+    const base = primaryBase()
+    const res = await api.uploadImage(base, path, undefined, 'studio', true)
+    const name = String(res?.name ?? '')
+    if (name) {
+      addManualAsset({ base, filename: name, subfolder: String(res?.subfolder ?? 'studio') })
+    }
+    notify(
+      copied
+        ? '已截取当前帧：剪贴板可直接 Ctrl+V（结果区也留了一份）'
+        : '已截取当前帧（剪贴板写入失败，结果区可查看）',
+      copied ? 'ok' : 'warn',
+      4000
+    )
+  } catch (e) {
+    notify(`截帧失败：${e}`, 'error', 8000)
+  }
+}
+
 // ---- 灯箱舞台底色：透明 PNG/GIF 需要换底色对比查看（棋盘格/深/浅，持久化） ----
 const LB_BG_KEY = 'comfyui-studio.lbBg:v1'
 type LbBg = 'checker' | 'dark' | 'light'
@@ -459,6 +593,15 @@ function onKey(e: KeyboardEvent) {
     if (k === 'Escape') closeLb()
     else if (k === 'ArrowLeft' || k === 'a' || k === 'A') stepLb(-1)
     else if (k === 'ArrowRight' || k === 'd' || k === 'D') stepLb(1)
+    else if (lbAsset.value?.kind === 'video') {
+      // 视频专属：,/. 逐帧（视频软件惯例），空格播放/暂停
+      if (k === ',') stepFrame(-1)
+      else if (k === '.') stepFrame(1)
+      else if (k === ' ') {
+        e.preventDefault() // 空格防页面滚动
+        togglePlay()
+      }
+    }
     return
   }
 
@@ -551,6 +694,11 @@ onUnmounted(() => {
           class="faint"
           :title="queueDetailTitle"
         >待处理 {{ state.queueRemaining }}</span>
+        <span
+          v-if="queueEtaText && activeJobs.length"
+          class="faint q-eta"
+          title="按各节点历史平均耗时估算（并行时取最慢节点）；跑完第一个任务后开始积累"
+        >· {{ queueEtaText }}</span>
         <span class="spacer" />
         <button
           v-if="activeJobs.length"
@@ -586,6 +734,14 @@ onUnmounted(() => {
             {{ job.error ? '失败' : STATUS_TEXT[job.status] }} · {{ dur(job) }}
           </span>
           <span v-if="job.outputs.length" class="faint q-files">{{ job.outputs.length }} 文件</span>
+          <button
+            v-if="job.status === 'queued' && job.graph"
+            class="btn ghost sm q-x"
+            title="插队：重排该节点队列，让它下一个执行"
+            @click="promoteJob(job)"
+          >
+            ⏫
+          </button>
           <button
             v-if="job.status === 'queued' && job.graph && enabledWorkers().length > 1"
             class="btn ghost sm q-x"
@@ -720,6 +876,7 @@ onUnmounted(() => {
                 📌
               </button>
               <button class="tool" title="重命名" @click="startRename(a)">✎</button>
+              <button v-if="a.kind === 'image'" class="tool" title="复制图片（可直接粘贴发送）" @click="copyAssetToClipboard(a)">⧉</button>
               <button class="tool" title="下载到本地" @click="downloadOne(a)">⬇</button>
               <button class="tool danger" title="移除" @click="removeAsset(a)">✕</button>
             </div>
@@ -741,14 +898,29 @@ onUnmounted(() => {
       >
         <video
           v-if="lbAsset.kind === 'video'"
+          ref="lbVideo"
           :key="lbAsset.key"
           :src="assetUrl(lbAsset)"
           controls
           autoplay
           loop
           playsinline
+          @play="lbPlaying = true"
+          @pause="lbPlaying = false"
+          @timeupdate="lbTime = lbVideo?.currentTime ?? 0"
+          @loadedmetadata="lbDur = lbVideo?.duration ?? 0"
         />
         <img v-else :key="lbAsset.key" :src="assetUrl(lbAsset)" :alt="displayName(lbAsset)" />
+        <!-- 视频逐帧控制条（原生进度条上方悬浮；快捷键 , / . / 空格） -->
+        <div v-if="lbAsset.kind === 'video'" class="v-ctrl" @click.stop @contextmenu.prevent>
+          <button class="v-btn" title="上一帧（,）" @click="stepFrame(-1)">⏮</button>
+          <button class="v-btn" :title="lbPlaying ? '暂停（空格）' : '播放（空格）'" @click="togglePlay">
+            {{ lbPlaying ? '⏸' : '▶' }}
+          </button>
+          <button class="v-btn" title="下一帧（.）" @click="stepFrame(1)">⏭</button>
+          <button class="v-btn" title="截取当前帧为图片（存进结果区）" @click="captureVideoFrame">📷</button>
+          <span v-if="frameLabel" class="v-time">{{ frameLabel }}</span>
+        </div>
       </div>
       <button class="nav next" title="下一张（→ / D）" @click="stepLb(1)">›</button>
       <div
@@ -814,6 +986,7 @@ onUnmounted(() => {
           打开工作流
         </button>
         <button class="btn sm" @click="startLbRename">✎ 重命名</button>
+        <button v-if="lbAsset.kind === 'image'" class="btn sm" title="复制图片（可直接粘贴发送）" @click="copyAssetToClipboard(lbAsset)">⧉ 复制</button>
         <button class="btn sm" @click="downloadOne(lbAsset)">下载</button>
         <button class="btn sm" :class="{ on: lbAsset.pinned }" @click="togglePinAsset(lbAsset)">
           {{ lbAsset.pinned ? '取消固定' : '固定' }}
@@ -851,6 +1024,7 @@ onUnmounted(() => {
       <button class="ctx-item" @click="ctxRun(applyAssetParams)" title="把提交这张图时的参数回填到表单">⤴ 载入参数</button>
       <button class="ctx-item" @click="ctxRun(openAssetWorkflow)">📂 打开工作流</button>
       <button class="ctx-item" @click="ctxRun(downloadOne)">⬇ 下载到本地</button>
+      <button v-if="ctxMenu.asset.kind === 'image'" class="ctx-item" @click="ctxRun(copyAssetToClipboard)">⧉ 复制图片</button>
       <button class="ctx-item" @click="ctxRun(startRename)">✎ 重命名</button>
       <button class="ctx-item" @click="ctxRun(togglePinAsset)">
         📌 {{ ctxMenu.asset.pinned ? '取消固定' : '固定' }}
@@ -1346,6 +1520,46 @@ onUnmounted(() => {
 .stage.lb-bg-light img,
 .stage.lb-bg-light video {
   background: #e8eaf2;
+}
+/* 视频逐帧控制条：悬浮在原生进度条上方 */
+.v-ctrl {
+  position: absolute;
+  left: 50%;
+  transform: translateX(-50%);
+  bottom: 68px;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  background: rgba(13, 16, 23, 0.78);
+  border: 1px solid var(--border-soft);
+  border-radius: 999px;
+  padding: 4px 10px;
+}
+.v-btn {
+  border: none;
+  background: transparent;
+  color: #e7ecf5;
+  font-size: 13px;
+  line-height: 1;
+  padding: 3px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.14s;
+}
+.v-btn:hover {
+  background: rgba(255, 255, 255, 0.14);
+}
+.v-time {
+  font-size: 11px;
+  color: #cfd6e4;
+  font-variant-numeric: tabular-nums;
+  padding-left: 6px;
+  white-space: nowrap;
+}
+/* 队列 ETA（等宽数字防跳动） */
+.q-eta {
+  font-variant-numeric: tabular-nums;
 }
 /* 底色切换段控件 */
 .lb-bg-seg {

@@ -101,6 +101,14 @@ export const api = {
       kind,
       dest,
     }),
+  /** 取 /view 文件字节（base64）：截帧/复制图片用——ComfyUI 无 CORS 头，前端 fetch 会被拦 */
+  viewBytes: (base: string, filename: string, subfolder: string, kind: string) =>
+    invoke<{ b64: string; size: number }>('comfy_view_bytes', {
+      base,
+      filename,
+      subfolder,
+      kind,
+    }),
   /** 把一份产出转存进 input 目录（应用内把结果图拖到参考图控件时用） */
   copyToInput: (
     base: string,

@@ -168,6 +168,7 @@ pub fn run() {
             comfy::comfy_copy_output_to_input,
             comfy::comfy_transfer_input,
             comfy::comfy_save_output,
+            comfy::comfy_view_bytes,
             comfy::detect_local_comfy,
             // ---- 本地进程 ----
             launcher::start_comfy,
