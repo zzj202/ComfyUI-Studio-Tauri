@@ -42,6 +42,8 @@ try {
 /** 已成功加载的目录：canonicalize 回写 dir 会再触发 watch，靠它防二次加载 */
 let lastLoaded = ''
 
+let pollTimer: number | null = null
+
 /** 目录变化即自动加载（点目录卡 / 面包屑 / 换目录都走这里，无需手动刷新） */
 watch(dir, (v) => {
   try {
@@ -53,12 +55,31 @@ watch(dir, (v) => {
   if (v && v !== lastLoaded) void load()
 })
 
-/** 打开状态从关到开时：目录已加载过就展示缓存，没加载过（首次）才拉取；
- *  immediate 兜住「恢复时已处于打开态」的启动路径（此时不会再有变化触发 watch） */
+/** 静默轮询：不打 loading 不清列表，新文件落进目录后 5 秒内自动出现 */
+async function silentRefresh() {
+  if (!dir.value) return
+  try {
+    const data = await api.listLocalMedia(dir.value)
+    lastLoaded = data.dir
+    items.value = data.items
+    if (data.dir !== dir.value) dir.value = data.dir
+  } catch {
+    /* 节点离线/目录暂不可访问：轮询失败静默跳过 */
+  }
+}
+
+/** 面板打开期间开启 5s 轮询（收起即停）；打开时总是先刷一次拿最新内容 */
 watch(
   () => ui.localFilesOpen,
   (open_) => {
-    if (open_ && dir.value && !items.value.length) void load()
+    if (pollTimer != null) {
+      window.clearInterval(pollTimer)
+      pollTimer = null
+    }
+    if (open_ && dir.value) {
+      void load()
+      pollTimer = window.setInterval(() => void silentRefresh(), 5000)
+    }
   },
   { immediate: true }
 )

@@ -454,3 +454,10 @@ textarea {
   color: var(--text-faint);
   line-height: 1.55;
 }
+
+/* 应用内拖拽激活期间（store.beginDrag 超过 5px 阈值时挂上）：禁止原生文本选择，
+   否则拖动时 mousemove 会框选沿途文字（参数区整片反蓝） */
+body.drag-active,
+body.drag-active * {
+  user-select: none !important;
+}

@@ -117,6 +117,8 @@ function onDragMove(e: PointerEvent) {
   if (!dragGhost.item) {
     if (Math.hypot(e.clientX - dragStart.x, e.clientY - dragStart.y) < 5) return
     dragGhost.item = dragItem
+    // 锁住原生文本选择：拖动时 mousemove 会框选沿途文字（参数区一片反蓝）
+    document.body.classList.add('drag-active')
   }
   dragGhost.x = e.clientX
   dragGhost.y = e.clientY
@@ -124,6 +126,7 @@ function onDragMove(e: PointerEvent) {
 
 function onDragUp(e: PointerEvent) {
   window.removeEventListener('pointermove', onDragMove)
+  document.body.classList.remove('drag-active')
   const item = dragItem
   const started = dragGhost.item != null
   dragGhost.item = null
@@ -152,6 +155,11 @@ function onDragUp(e: PointerEvent) {
 export function isDragClick(): boolean {
   return dragClickAt > 0
 }
+
+// 拖拽激活期间禁止原生文本选择（body.drag-active CSS 之外的事件级兜底）
+document.addEventListener('selectstart', (e) => {
+  if (dragGhost.item) e.preventDefault()
+})
 
 /** 把一份结果资产的工作流打开：优先输出目录直读，不行就下载到应用数据目录再解析。
  *  视频和图片走同一条链路——ComfyUI 的视频产物同样内嵌 API 图（Rust 侧二进制扫描能捞到） */

@@ -83,13 +83,37 @@ pub fn run() {
             .build()
             .map_err(|e| format!("创建主窗口失败：{e}"))?;
 
-            // 点 ✕ 不退出，隐藏到托盘（后台挂机出图；Alt+2 / 托盘单击均可呼回）
+            // 点 ✕ 不退出，隐藏到托盘（后台挂机出图；Alt+2 / 托盘单击均可呼回）。
+            // 窗口状态保存策略：✕ 隐藏前保存一次（=「这次用完了」）；拖动/调整大小
+            // 800ms 防抖落盘——插件自带的保存时机是窗口销毁/正常退出，覆盖不到
+            // 「✕ 只隐藏」和「dev 直接杀进程」这两条真实退出路径。
+            // 注意：2.5.0 的 save_window_state 在 AppHandleExt（应用级）上，WindowExt 只有 restore。
             {
+                use tauri_plugin_window_state::AppHandleExt;
                 let w2 = win.clone();
+                let ah = win.app_handle().clone();
+                let save_flags = tauri_plugin_window_state::StateFlags::SIZE
+                    | tauri_plugin_window_state::StateFlags::POSITION
+                    | tauri_plugin_window_state::StateFlags::MAXIMIZED;
+                let last_save = std::sync::Mutex::new(
+                    std::time::Instant::now() - std::time::Duration::from_secs(60),
+                );
                 win.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
-                        api.prevent_close();
-                        let _ = w2.hide();
+                    match event {
+                        tauri::WindowEvent::CloseRequested { api, .. } => {
+                            api.prevent_close();
+                            let _ = ah.save_window_state(save_flags);
+                            let _ = w2.hide();
+                        }
+                        tauri::WindowEvent::Resized(_) | tauri::WindowEvent::Moved(_) => {
+                            if let Ok(mut last) = last_save.lock() {
+                                if last.elapsed() > std::time::Duration::from_millis(800) {
+                                    *last = std::time::Instant::now();
+                                    let _ = ah.save_window_state(save_flags);
+                                }
+                            }
+                        }
+                        _ => {}
                     }
                 });
             }
