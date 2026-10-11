@@ -24,6 +24,9 @@ use tauri::command;
 fn client() -> reqwest::Client {
     static HTTP: LazyLock<reqwest::Client> = LazyLock::new(|| {
         reqwest::Client::builder()
+            // 显式禁用代理：节点地址都是用户配置的（环回/内网/云直连），
+            // 挂梯子时环境变量代理会把 127.0.0.1 的请求也吞掉导致「无法提交」
+            .no_proxy()
             .timeout(Duration::from_secs(300))
             .pool_idle_timeout(Duration::from_secs(90))
             .pool_max_idle_per_host(8)

@@ -114,7 +114,8 @@ fn ensure_dirs() -> Result<PathBuf, String> {
 }
 
 /// 重命名素材库/本地目录里的一个媒体文件（同目录内改名，不移动）。
-/// 新名经 safe_name 校验（禁路径分隔符/..），同名已存在则拒绝（不覆盖）。
+/// 新名经 safe_name 校验（禁路径分隔符/..）；同名已存在时自动加序号
+/// 「name (2).ext」「name (3).ext」（与下载防覆盖同款，不覆盖已有文件）。
 #[command]
 pub fn rename_local_file(path: String, new_name: String) -> Result<String, String> {
     let p = PathBuf::from(&path);
@@ -123,9 +124,28 @@ pub fn rename_local_file(path: String, new_name: String) -> Result<String, Strin
     }
     let n = safe_name(&new_name)?;
     let dir = p.parent().ok_or_else(|| "路径没有父目录".to_string())?;
-    let dest = dir.join(&n);
+    let mut dest = dir.join(&n);
     if dest.exists() {
-        return Err(format!("「{}」已存在，换个名字", n));
+        let stem = Path::new(&n)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| n.clone());
+        let ext = Path::new(&n)
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
+        let mut k = 2u32;
+        loop {
+            let cand = dir.join(format!("{} ({}){}", stem, k, ext));
+            if !cand.exists() {
+                dest = cand;
+                break;
+            }
+            k += 1;
+            if k > 999 {
+                return Err("同名文件太多，换个名字".into());
+            }
+        }
     }
     fs::rename(&p, &dest).map_err(|e| format!("重命名失败：{}", e))?;
     Ok(dest.to_string_lossy().to_string())
@@ -568,6 +588,42 @@ pub fn rename_workflow(old: String, new: String) -> Result<Value, String> {
     fs::rename(&src, &dst).map_err(|e| format!("重命名失败：{}", e))?;
     cleanup_group_dir(&dir, &src);
     Ok(json!({ "ok": true, "name": to }))
+}
+
+/// 复制一份工作流（同目录内复制，分组不变）。
+/// 副本名自动避开冲突：「原名-副本.json」「原名-副本2.json」…
+#[command]
+pub fn copy_workflow(src: String) -> Result<Value, String> {
+    let from = safe_rel_path(&src)?;
+    let dir = ensure_dirs()?.join("workflows");
+    let src_path = wf_file_path(&dir, &from);
+    if !src_path.exists() {
+        return Err(format!("工作流不存在：{}", from));
+    }
+    let s = from; // safe_rel_path 返回的规范化相对路径（String）
+    let (base_no_ext, ext) = match s.rfind('.') {
+        Some(i) if i > 0 => (s[..i].to_string(), s[i..].to_string()),
+        _ => (s.clone(), String::new()),
+    };
+    let mut to = format!("{}-副本{}", base_no_ext, ext);
+    let mut k = 2u32;
+    loop {
+        if !wf_file_path(&dir, &to).exists() {
+            break;
+        }
+        to = format!("{}-副本{}{}", base_no_ext, k, ext);
+        k += 1;
+        if k > 999 {
+            return Err("副本名太多，请先改名".into());
+        }
+    }
+    let to_rel = safe_rel_path(&to)?;
+    let dst = wf_file_path(&dir, &to_rel);
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{}", e))?;
+    }
+    fs::copy(&src_path, &dst).map_err(|e| format!("复制失败：{}", e))?;
+    Ok(json!({ "ok": true, "name": to_rel }))
 }
 
 /// 新建空分组（workflows/ 下的一级子目录；同名已存在则拒绝）

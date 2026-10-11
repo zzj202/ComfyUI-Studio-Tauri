@@ -76,9 +76,12 @@ pub fn run() {
             .center()
             .data_directory(store::app_root()?.join("webview"))
             // 禁用 GPU 合成加速：排查 WebView2 启动即崩（Crashpad 有 3 份 minidump）。
-            // 注意此参数会整体替换默认 browser args，需带上 wry 默认的 feature 开关
+            // 注意此参数会整体替换默认 browser args，需带上 wry 默认的 feature 开关。
+            // --proxy-bypass-list=<-loopback>：环境里挂着代理（HTTP_PROXY 等）时，
+            // WebView 的 <img> 预览 / WS 连接发往 127.0.0.1 会被代理吞掉——
+            // 表现为「本地节点能提交上传，但预览空白、结果区没有资产」。强制环回直连。
             .additional_browser_args(
-                "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu",
+                "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu --proxy-bypass-list=<-loopback>",
             )
             .build()
             .map_err(|e| format!("创建主窗口失败：{e}"))?;
@@ -187,6 +190,7 @@ pub fn run() {
             store::save_workflow,
             store::delete_workflow,
             store::rename_workflow,
+            store::copy_workflow,
             store::create_workflow_group,
             store::delete_workflow_group,
             store::import_workflow,

@@ -189,6 +189,55 @@ function onWfClick(w: WorkflowMeta) {
   void selectWorkflow(w.name)
 }
 
+// ---- 右键菜单：聚合工作流/分组的常用操作 ----
+const wctx = ref<{ x: number; y: number; kind: 'wf' | 'group'; name: string } | null>(null)
+
+function openWfCtx(e: MouseEvent, w: WorkflowMeta) {
+  e.preventDefault()
+  wctx.value = {
+    x: Math.min(e.clientX, window.innerWidth - 190),
+    y: Math.min(e.clientY, window.innerHeight - 240),
+    kind: 'wf',
+    name: w.name,
+  }
+}
+
+function openGroupCtx(e: MouseEvent, name: string) {
+  e.preventDefault()
+  wctx.value = {
+    x: Math.min(e.clientX, window.innerWidth - 190),
+    y: Math.min(e.clientY, window.innerHeight - 110),
+    kind: 'group',
+    name,
+  }
+}
+
+function wctxRun(fn: (name: string) => void) {
+  // 先快照再清空：菜单闭包里不能读 wctx.value（此刻已是 null，读了会抛错）
+  const c = wctx.value
+  wctx.value = null
+  if (c) fn(c.name)
+}
+
+function closeWctx() {
+  wctx.value = null
+}
+
+/** 创建工作流副本：复制后直接选中副本 */
+async function duplicateWorkflow(name: string) {
+  try {
+    const r = await api.copyWorkflow(name)
+    await loadWorkflows()
+    await selectWorkflow(r.name)
+    notify(`已创建副本「${r.name}」`, 'ok', 4000)
+  } catch (e) {
+    notify(`复制失败：${e}`, 'error', 8000)
+  }
+}
+
+// 点其他地方关菜单（菜单容器上 stop 了冒泡，不会误关）
+window.addEventListener('click', closeWctx)
+
 // ---- 工作流行内改名：✎ → 输入框（只改文件名段，分组不变），Enter/失焦确认，Esc 取消 ----
 const editingWf = ref<string | null>(null)
 const editWfName = ref('')
@@ -389,8 +438,9 @@ async function openDir() {
           class="group-head"
           :class="{ 'group-hot': reorder.active && reorder.groupHot === row.name }"
           :data-group-name="row.name"
-          :title="row.name ? '点击展开/收起 · 把工作流拖到这里归组' : '未分组：拖到这里移出分组'"
+          :title="row.name ? '点击展开/收起 · 把工作流拖到这里归组（右键更多）' : '未分组：拖到这里移出分组'"
           @click="toggleGroup(row.name)"
+          @contextmenu.prevent="row.name && openGroupCtx($event, row.name)"
         >
           <span class="tri" :class="{ open: !row.collapsed }" />
           <template v-if="editingGroup === row.name">
@@ -428,9 +478,10 @@ async function openDir() {
           }"
           :data-wf-idx="ri"
           :data-drop-zone="'wf:' + row.w.name"
-          :title="row.w.name + ' · 点击载入 · 拖动排序 · 拖到组头归组'"
+          :title="row.w.name + ' · 点击载入 · 拖动排序 · 拖到组头归组 · 右键更多'"
           @click="onWfClick(row.w)"
           @pointerdown="onItemPointerDown($event, ri)"
+          @contextmenu.prevent="openWfCtx($event, row.w)"
         >
           <template v-if="editingWf === row.w.name">
             <input
@@ -485,6 +536,67 @@ async function openDir() {
       <button v-else class="group-add" title="新建分组（workflows/ 下建一个子目录）" @click="creatingGroup = true">
         ＋ 新建分组
       </button>
+
+      <!-- 右键菜单：工作流（载入/固定/改名/副本/归组/删除）· 分组（改名/删除） -->
+      <div
+        v-if="wctx"
+        class="wctx"
+        :style="{ left: wctx.x + 'px', top: wctx.y + 'px' }"
+        @click.stop
+        @contextmenu.prevent
+      >
+        <template v-if="wctx.kind === 'wf'">
+          <button
+            class="wctx-item"
+            @click="wctxRun((name) => { const w = state.workflows.find((x) => x.name === name); if (w) onWfClick(w) })"
+          >
+            ▶ 载入
+          </button>
+          <button class="wctx-item" @click="wctxRun((name) => toggleWorkflowPin(name))">
+            {{ isWorkflowPinned(wctx.name) ? '📌 取消固定' : '📌 固定' }}
+          </button>
+          <button
+            class="wctx-item"
+            @click="wctxRun((name) => { const w = state.workflows.find((x) => x.name === name); if (w) startRename(w) })"
+          >
+            ✎ 改名
+          </button>
+          <button class="wctx-item" @click="wctxRun((name) => void duplicateWorkflow(name))">
+            ⧉ 创建副本
+          </button>
+          <div class="wctx-sep" />
+          <button
+            v-for="g in state.workflowGroups"
+            :key="g"
+            class="wctx-item"
+            :disabled="state.workflows.find((x) => x.name === wctx!.name)?.group === g"
+            :title="`移入分组「${g}」`"
+            @click="wctxRun((name) => { const w = state.workflows.find((x) => x.name === name); if (w) void moveToGroup(w, g) })"
+          >
+            {{ state.workflows.find((x) => x.name === wctx!.name)?.group === g ? '✓' : '' }}📂 {{ g }}
+          </button>
+          <button
+            v-if="state.workflows.find((x) => x.name === wctx!.name)?.group"
+            class="wctx-item"
+            @click="wctxRun((name) => { const w = state.workflows.find((x) => x.name === name); if (w) void moveToGroup(w, '') })"
+          >
+            ⇱ 移出分组
+          </button>
+          <div class="wctx-sep" />
+          <button
+            class="wctx-item danger"
+            :disabled="isWorkflowPinned(wctx.name)"
+            :title="isWorkflowPinned(wctx.name) ? '已固定，先取消固定' : ''"
+            @click="wctxRun((name) => remove(name))"
+          >
+            ✕ 删除
+          </button>
+        </template>
+        <template v-else>
+          <button class="wctx-item" @click="wctxRun((name) => startGroupRename(name))">✎ 分组改名</button>
+          <button class="wctx-item danger" @click="wctxRun((name) => removeGroup(name))">✕ 删除分组</button>
+        </template>
+      </div>
     </div>
   </section>
 </template>
@@ -735,5 +847,55 @@ async function openDir() {
   background: var(--bg-1);
   color: inherit;
   outline: none;
+}
+/* 右键菜单（样式与结果区 ctx-menu 一致） */
+.wctx {
+  position: fixed;
+  z-index: 130;
+  min-width: 170px;
+  max-height: 60vh;
+  overflow-y: auto;
+  padding: 5px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.4);
+  display: flex;
+  flex-direction: column;
+}
+.wctx-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: none;
+  background: transparent;
+  color: var(--text);
+  font-size: 12.5px;
+  text-align: left;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.wctx-item:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.wctx-item.danger:hover {
+  background: #f871711f;
+  color: var(--err);
+}
+.wctx-item:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.wctx-item:disabled:hover {
+  background: transparent;
+  color: var(--text);
+}
+.wctx-sep {
+  height: 1px;
+  background: var(--border-soft);
+  margin: 4px 6px;
 }
 </style>

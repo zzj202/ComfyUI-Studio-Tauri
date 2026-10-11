@@ -61,6 +61,8 @@ export const api = {
   deleteWorkflow: (name: string) => invoke<any>('delete_workflow', { name }),
   renameWorkflow: (oldName: string, newName: string) =>
     invoke<{ ok: boolean; name: string }>('rename_workflow', { old: oldName, new: newName }),
+  /** 复制一份工作流（同目录，副本名自动避开冲突），返回副本名 */
+  copyWorkflow: (name: string) => invoke<{ ok: boolean; name: string }>('copy_workflow', { src: name }),
   importWorkflow: (src: string, name?: string) =>
     invoke<{ ok: boolean; name: string }>('import_workflow', { src, name: name ?? null }),
 

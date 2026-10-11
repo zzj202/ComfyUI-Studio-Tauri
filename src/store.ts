@@ -163,11 +163,24 @@ document.addEventListener('selectstart', (e) => {
 
 /** 把一份结果资产的工作流打开：优先输出目录直读，不行就下载到应用数据目录再解析。
  *  视频和图片走同一条链路——ComfyUI 的视频产物同样内嵌 API 图（Rust 侧二进制扫描能捞到） */
+/** 丢弃某工作流的已填参数缓存（内存+落盘），并断开当前表单与它的关联。
+ *  用资源打开工作流时用：资源内嵌参数才是真相，防旧缓存覆盖、也防 buildFields
+ *  开头的快照把旧值写回（当前正开着同名工作流的场景）。 */
+function discardFieldValues(name: string) {
+  fieldValueCache.delete(name)
+  if (fieldsWorkflow === name) fieldsWorkflow = null
+  persistFieldValues()
+}
+
 export async function openAssetWorkflow(a: Asset) {
   async function openImported(name: string) {
+    // 资源内嵌的参数（提示词/种子/图片引用）就是「这个资源自己的值」：
+    // 清掉同名工作流残留的已填参数缓存（内存+落盘），否则 buildFields
+    // 会用旧值覆盖资源内嵌参数——表现为「新资源打开，参数还是以前的」
+    discardFieldValues(name)
     await loadWorkflows()
     await selectWorkflow(name)
-    notify(`已打开工作流「${name}」`, 'ok', 5000)
+    notify(`已打开工作流「${name}」（参数已还原为该资源内嵌值）`, 'ok', 5000)
   }
   try {
     // 应用数据目录；\\?\ 前缀是 Windows 长路径标记，拼接前去掉
@@ -1603,6 +1616,32 @@ export async function interrupt() {
 /** 每台启用节点的待处理数（refreshQueue 填充），队列头部悬停明细用 */
 export const queueByBase = ref<Record<string, number>>({})
 
+/** 历史兜底：WS 断连/丢「executing null」事件时，运行中的任务永远收不到收尾信号，
+ *  产出就进不了结果区。每轮队列轮询时对运行中的任务查一次 /history——
+ *  有产出（finishJob 幂等，status done 自动跳过）就补入库；执行出错也标 error。
+ *  开销：每 4s 每个运行中任务一个 history 请求，可忽略。 */
+async function pollFinishJob(j: Job) {
+  if (j.status !== 'running') return
+  const base = j.base ?? primaryBase()
+  try {
+    const res = await api.historyItem(base, j.promptId)
+    const entry = res?.[j.promptId]
+    if (!entry) return
+    if (entry.status?.status_str === 'error') {
+      j.status = 'error'
+      j.error = '执行出错（从历史记录补记）'
+      j.finishedAt = Date.now()
+      return
+    }
+    await finishJob(j.promptId, base)
+  } catch {
+    /* 轮询失败静默：下一轮再试 */
+  }
+}
+
+/** 已提示过「实时通道被拒」的节点（每节点每次会话只提示一次） */
+const wsBlockedWarned = new Set<string>()
+
 export async function refreshQueue() {
   const bases = enabledWorkers().map((w) => w.base)
   if (!bases.length && state.settings.baseUrl) bases.push(state.settings.baseUrl)
@@ -1614,6 +1653,17 @@ export async function refreshQueue() {
     bases.forEach((b, i) => {
       const q = qs[i]
       if (!q) return // 该节点不可达，跳过不拖累合计
+      // HTTP 可达但 WS 一直连不上 → 新版 ComfyUI 的 Origin/Sec-Fetch-Site 校验
+      // 把应用的网络通道拒了（WS 403、缩略图 403）。产出有 history 兜底不受影响，
+      // 但实时进度/自动入库体验受损 → 指引用户加启动参数，每个节点只提示一次。
+      if (healthOf(b) === 'down' && !wsBlockedWarned.has(b)) {
+        wsBlockedWarned.add(b)
+        notify(
+          `节点「${workerName(b)}」可达但实时通道未连上：新版 ComfyUI 需在启动参数加 --enable-cors-header "*" 后重启 ComfyUI（否则缩略图不显示、进度不实时；产出仍有历史兜底）`,
+          'warn',
+          15000
+        )
+      }
       const n = (q?.queue_running?.length ?? 0) + (q?.queue_pending?.length ?? 0)
       detail[b] = n
       total += n
@@ -1622,6 +1672,10 @@ export async function refreshQueue() {
     state.queueRemaining = total
   } catch {
     /* ignore */
+  }
+  // 历史兜底（见 pollFinishJob）：只查运行中的任务
+  for (const j of state.jobs) {
+    if (j.status === 'running') void pollFinishJob(j)
   }
 }
 
