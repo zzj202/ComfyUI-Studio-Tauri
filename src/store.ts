@@ -386,6 +386,7 @@ export async function init() {
   loadImageOrigin()
   restoreAssets()
   loadPersistedFieldValues()
+  loadBatchSourceSnap()
   await Promise.all([loadWorkflows(), loadTemplates()])
   // 恢复上次打开的工作流（列表里还存在才恢复；不存在则保持未选择）
   let lastWorkflow: string | null = null
@@ -433,6 +434,9 @@ async function restoreQueueFromServer() {
   }
   if (!targets.length) return
   let restored = 0
+  // 持久化索引（方案 A）：promptId → 提交时刻/workerId/params。/queue 里的用不上
+  // params（extra_data 已带），但 startedAt 和 workerId 只有这里有。
+  const pendMap = new Map(loadPendingRecs().map((r) => [r.promptId, r]))
   for (const { base, id } of targets) {
     try {
       const q = await api.queue(base)
@@ -452,21 +456,23 @@ async function restoreQueueFromServer() {
           const nodeCount = graph && typeof graph === 'object' ? Object.keys(graph).length : 0
           // 提交时随 extra_data 存的参数快照（有的话）：恢复的任务完成后，产出资产照样能「载入参数」
           const extra = row?.[3]
+          const rec = pendMap.get(promptId)
           const params =
             extra && typeof extra === 'object' && extra.params && typeof extra.params === 'object'
               ? (extra.params as Record<string, any>)
-              : undefined
+              : rec?.params
           state.jobs.unshift({
             promptId,
-            workflow: String(extra?.workflow_name ?? '刷新前的任务'),
+            workflow: String(extra?.workflow_name ?? rec?.workflow ?? '刷新前的任务'),
             status,
             value: 0,
             max: nodeCount,
-            startedAt: Date.now(),
+            // 持久化索引里有真实提交时刻（恢复时刻已经晚于提交很久，直接用会毁掉耗时）
+            startedAt: rec?.startedAt ?? Date.now(),
             outputs: [],
             params,
             base,
-            workerId: id || undefined,
+            workerId: id || rec?.workerId || undefined,
             // 留存服务器队列里的原图：恢复来的任务也能「改派」到别的节点
             graph: graph && typeof graph === 'object' ? graph : undefined,
           })
@@ -479,6 +485,48 @@ async function restoreQueueFromServer() {
   }
   if (restored) {
     notify(`已恢复队列里 ${restored} 个未完成任务，进度继续跟踪`, 'info', 6000)
+  }
+  // ---- history 对账：重启期间已经跑完的任务不在 /queue 里，按持久化索引去
+  // /history 补收——产出照常进结果区（含精确执行耗时）。收尾后仍查无此任务
+  // （且不在队列）的，标记为已被外部清空。 ----
+  let doneRecovered = 0
+  let gone = 0
+  for (const rec of pendMap.values()) {
+    if (state.jobs.some((j) => j.base === rec.base && j.promptId === rec.promptId)) continue
+    const job: Job = {
+      promptId: rec.promptId,
+      workflow: rec.workflow,
+      status: 'queued',
+      value: 0,
+      max: 0,
+      startedAt: rec.startedAt,
+      outputs: [],
+      params: rec.params,
+      workerId: rec.workerId,
+      base: rec.base,
+    }
+    state.jobs.unshift(job)
+    try {
+      await finishJob(rec.promptId, rec.base)
+    } catch {
+      /* finishJob 内部已处理 */
+    }
+    if (job.status === 'done') {
+      doneRecovered++
+    } else if (job.status === 'queued') {
+      // /queue 和 /history 都没有 → 服务端已被清空
+      job.status = 'cancelled'
+      job.error = '服务端队列中已不存在（可能被外部中断或清空）'
+      job.finishedAt = Date.now()
+      removePendingRec(rec.promptId, rec.base) // 终态
+      gone++
+    }
+  }
+  if (doneRecovered) {
+    notify(`上次关机时有 ${doneRecovered} 个任务已跑完，产出已补进结果区`, 'ok', 8000)
+  }
+  if (gone) {
+    notify(`${gone} 个任务在服务端已不存在（可能被外部清空）`, 'warn', 8000)
   }
 }
 
@@ -785,6 +833,7 @@ function connectWs() {
           job.error = message
           job.finishedAt = Date.now()
         }
+        removePendingRec(promptId, base) // 终态
         notify(`任务出错：${message}`, 'error', 8000)
       },
       needsLive: () =>
@@ -913,6 +962,7 @@ async function finishJob(promptId: string, base: string) {
       const prev = baseAvgMs.get(base)
       baseAvgMs.set(base, prev == null ? durMs : Math.round(prev * 0.7 + durMs * 0.3))
       addAssets(job)
+      removePendingRec(job.promptId, base) // 终态：从持久化索引移除（资产已带参数快照）
       notify(`生成完成（${job.outputs.length} 个文件）`, 'ok')
       // 应用内没有排队/进行中的任务了（这一批跑完）且窗口在后台 → 发一条系统通知
       // （批次场景下只在整批结束弹一条，避免 N 连弹）
@@ -923,9 +973,9 @@ async function finishJob(promptId: string, base: string) {
         )
       }
     }
-  } catch (e) {
-    job.status = 'error'
-    job.error = String(e)
+  } catch {
+    // 查 history 失败（网络抖动等）不标 error：任务保持原状态，
+    // history 轮询几秒后会自动重试，直到拿到结果或超时判废
   }
 }
 
@@ -1035,6 +1085,169 @@ function loadPersistedFieldValues() {
   } catch {
     /* 忽略损坏的历史数据 */
   }
+}
+
+// ---- 排队任务持久化（防关机丢上下文，方案 A）----
+// 已提交到 ComfyUI 的任务，服务端队列就是执行真相源（重启应用后 restoreQueueFromServer
+// 能恢复壳与 params）——这里补的是轻量索引：提交时刻、workerId，以及**对账依据**：
+// 重启期间已跑完的任务不在 /queue 里，只有凭这份索引查 /history 才能把产出补进结果区。
+// 任务完成/取消后随 watch 自动从索引消失（资产已带参数快照，不留冗余）。
+
+const PENDING_KEY = 'comfyui-studio.pendingJobs:v1'
+
+interface PendingRec {
+  promptId: string
+  base: string
+  workflow: string
+  workerId?: string
+  startedAt: number
+  params?: Record<string, any>
+}
+
+/** 磁盘索引的内存缓存：合并式写的基础——写时保留「state.jobs 里没有、但还没被
+ *  确认终态」的记录（如节点离线未完成对账的），防止一次全量重写把别人抹掉 */
+let pendingCache: PendingRec[] | null = null
+
+function loadPendingRecs(): PendingRec[] {
+  if (pendingCache) return pendingCache
+  try {
+    const raw = localStorage.getItem(PENDING_KEY)
+    const list = raw ? JSON.parse(raw) : []
+    pendingCache = Array.isArray(list)
+      ? list.filter((r: any) => r && typeof r.promptId === 'string' && typeof r.base === 'string')
+      : []
+  } catch {
+    pendingCache = []
+  }
+  return pendingCache
+}
+
+/** 确认一条记录到达终态（完成/失败/取消/丢弃）：从索引里真正移除 */
+function removePendingRec(promptId: string, base: string) {
+  const recs = loadPendingRecs()
+  const next = recs.filter((r) => !(r.promptId === promptId && r.base === base))
+  pendingCache = next
+  try {
+    localStorage.setItem(PENDING_KEY, JSON.stringify(next))
+  } catch {
+    /* ignore */
+  }
+}
+
+function persistPendingJobs() {
+  try {
+    const recs = loadPendingRecs()
+    // upsert：state.jobs 里的 queued/running 覆盖同名记录；磁盘上多出的（未对账的
+    // 离线节点记录等）保留不动——只有 removePendingRec 才真正删除
+    for (const j of state.jobs) {
+      if (j.status !== 'queued' && j.status !== 'running') continue
+      const base = j.base ?? primaryBase()
+      const rec: PendingRec = {
+        promptId: j.promptId,
+        base,
+        workflow: j.workflow,
+        workerId: j.workerId,
+        startedAt: j.startedAt,
+        params: j.params,
+      }
+      const i = recs.findIndex((r) => r.promptId === rec.promptId && r.base === base)
+      if (i >= 0) recs[i] = rec
+      else recs.unshift(rec)
+    }
+    pendingCache = recs
+    localStorage.setItem(PENDING_KEY, JSON.stringify(recs))
+  } catch {
+    /* 存储失败不影响主流程 */
+  }
+}
+
+let pendingTimer = 0
+watch(
+  state.jobs,
+  () => {
+    window.clearTimeout(pendingTimer)
+    pendingTimer = window.setTimeout(persistPendingJobs, 800)
+  },
+  { deep: true }
+)
+
+/** 批量拆行源文本快照（防断电保险丝，方案 B）：整段文本留底，断电后可一键重投 */
+const BATCH_SNAP_KEY = 'comfyui-studio.batchSnap:v1'
+
+export const batchSourceSnap = ref<{
+  text: string
+  fieldKey: string
+  fieldLabel: string
+  count: number
+  at: number
+  file: string
+} | null>(null)
+
+function saveBatchSourceSnap(text: string, fieldKey: string, fieldLabel: string, count: number) {
+  // 每批一个独立文件（带时间戳），互不覆盖——前面批次还没执行的也各有留底
+  const d = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const name = `批次-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
+  const snap = { text, fieldKey, fieldLabel, count, at: d.getTime(), file: name }
+  try {
+    localStorage.setItem(BATCH_SNAP_KEY, JSON.stringify(snap))
+  } catch {
+    /* ignore */
+  }
+  batchSourceSnap.value = snap
+  // 同步镜像一份可读文本到 data/batch-snapshots/：文件管理器里直接能看能拷，
+  // 不怕清浏览器缓存。失败静默（localStorage 副本仍是主数据）。
+  const header = [
+    '# ComfyUI Studio 批量拆行快照',
+    `# 字段: ${fieldLabel}`,
+    `# 条数: ${count}（每条独立任务）`,
+    `# 保存时间: ${d.toLocaleString()}`,
+    '# 重新载入: 应用结果区队列上方的「⏳ 重新载入」按钮；',
+    '#          或手动把下面两条分隔线之间的内容粘贴到对应字段后「✂ 拆行提交」',
+    '# ==================== 快照内容开始 ====================',
+    '',
+    text,
+    '',
+    '# ==================== 快照内容结束 ====================',
+    '',
+  ].join('\n')
+  void api.writeBatchSnapshot(name, header).catch(() => {})
+}
+
+export function loadBatchSourceSnap() {
+  try {
+    const raw = localStorage.getItem(BATCH_SNAP_KEY)
+    if (raw) {
+      const snap = JSON.parse(raw)
+      if (snap && typeof snap.text === 'string') batchSourceSnap.value = snap
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+export function dismissBatchSourceSnap() {
+  const s = batchSourceSnap.value
+  try {
+    localStorage.removeItem(BATCH_SNAP_KEY)
+  } catch {
+    /* ignore */
+  }
+  batchSourceSnap.value = null
+  if (s?.file) void api.deleteBatchSnapshot(s.file).catch(() => {}) // 同步删除对应的文本镜像
+}
+
+/** 重新载入快照：把留底的整段文本按原字段打开拆行确认弹窗（重投会覆盖快照） */
+export function requeueBatchSourceSnap() {
+  const s = batchSourceSnap.value
+  if (!s) return
+  const lines = splitBatchLines(s.text)
+  if (lines.length < 2) {
+    notify('快照内容拆不出多条，已丢弃', 'warn', 4000)
+    dismissBatchSourceSnap()
+    return
+  }
+  batchTextPending.value = { fieldKey: s.fieldKey, fieldLabel: s.fieldLabel, lines, raw: s.text }
 }
 
 /** 编辑过程中实时快照（防抖 400ms），刷新/崩溃也不丢已填内容。
@@ -1391,6 +1604,9 @@ function submitBatchText(
       return { ...(baseSnapshot ?? {}), [fieldKey]: line }
     }
   )
+  // 方案 B 保险丝：整段源文本留底——断电后 ComfyUI 队列没了也能一键重投
+  // （A 的对账只覆盖「ComfyUI 还活着」的场景）
+  saveBatchSourceSnap(lines.join('\n'), fieldKey, fieldLabel, items.length)
   notify(
     perLine > 1
       ? `「${fieldLabel}」已按行拆分：${items.length} 条 × ${perLine} 张 = ${items.length * perLine} 个任务`
@@ -1651,21 +1867,33 @@ export async function interrupt() {
 /** 每台启用节点的待处理数（refreshQueue 填充），队列头部悬停明细用 */
 export const queueByBase = ref<Record<string, number>>({})
 
-/** 历史兜底：WS 断连/丢「executing null」事件时，运行中的任务永远收不到收尾信号，
- *  产出就进不了结果区。每轮队列轮询时对运行中的任务查一次 /history——
+/** 历史兜底：WS 断连/丢「executing null」事件时，队列里的任务永远收不到收尾信号，
+ *  产出就进不了结果区。每轮队列轮询时对 queued+running 的任务查一次 /history——
  *  有产出（finishJob 幂等，status done 自动跳过）就补入库；执行出错也标 error。
- *  开销：每 4s 每个运行中任务一个 history 请求，可忽略。 */
+ *  queued 也查：恢复自持久化的任务若 WS 死着，状态永远停在 queued——history 里
+ *  一旦出现条目（开跑后写入）就说明它有进展，跑完自然收尾。执行中 history 无条目，
+ *  静默跳过无副作用。开销：每 4s 每个活动任务一个 history 请求，可忽略。 */
 async function pollFinishJob(j: Job) {
-  if (j.status !== 'running') return
+  if (j.status !== 'running' && j.status !== 'queued') return
   const base = j.base ?? primaryBase()
   try {
     const res = await api.historyItem(base, j.promptId)
     const entry = res?.[j.promptId]
-    if (!entry) return
+    if (!entry) {
+      // 跑了超久（与 waitForJob 同为 2h）仍无 history 条目 → 判废，防永久卡 running
+      if (j.status === 'running' && Date.now() - (j.execStartedAt ?? j.startedAt) > 2 * 3600_000) {
+        j.status = 'error'
+        j.error = '任务超过 2 小时无响应（服务端可能已重启清队列）'
+        j.finishedAt = Date.now()
+        removePendingRec(j.promptId, base) // 终态
+      }
+      return
+    }
     if (entry.status?.status_str === 'error') {
       j.status = 'error'
       j.error = '执行出错（从历史记录补记）'
       j.finishedAt = Date.now()
+      removePendingRec(j.promptId, base) // 终态
       return
     }
     await finishJob(j.promptId, base)
@@ -1708,9 +1936,9 @@ export async function refreshQueue() {
   } catch {
     /* ignore */
   }
-  // 历史兜底（见 pollFinishJob）：只查运行中的任务
+  // 历史兜底（见 pollFinishJob）：queued+running 都查（恢复的任务可能停在 queued）
   for (const j of state.jobs) {
-    if (j.status === 'running') void pollFinishJob(j)
+    if (j.status === 'running' || j.status === 'queued') void pollFinishJob(j)
   }
 }
 
@@ -1740,6 +1968,7 @@ export async function discardJob(job: Job) {
   }
   const i = state.jobs.indexOf(job)
   if (i >= 0) state.jobs.splice(i, 1)
+  removePendingRec(job.promptId, base) // 用户主动移除 = 索引同步删除
   void refreshQueue()
 }
 
@@ -1789,6 +2018,7 @@ export async function interruptAll() {
   for (const j of active) {
     const i = state.jobs.indexOf(j)
     if (i >= 0) state.jobs.splice(i, 1)
+    removePendingRec(j.promptId, j.base ?? primaryBase()) // 全部中断 = 索引同步删除
   }
   void refreshQueue()
   if (failed.length) {

@@ -191,6 +191,8 @@ pub fn run() {
             store::delete_workflow,
             store::rename_workflow,
             store::copy_workflow,
+            store::write_batch_snapshot,
+            store::delete_batch_snapshot,
             store::create_workflow_group,
             store::delete_workflow_group,
             store::import_workflow,

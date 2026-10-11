@@ -44,6 +44,11 @@ export const api = {
   /** 重命名本地目录里的媒体文件（同目录改名），返回新路径；同名已存在则拒绝 */
   renameLocalFile: (path: string, newName: string) =>
     invoke<string>('rename_local_file', { path, newName }),
+  /** 批量拆行快照：写一份带 BOM 的可读文本（data/batch-snapshots/<name>.txt，每批一份互不覆盖） */
+  writeBatchSnapshot: (name: string, content: string) =>
+    invoke<{ ok: boolean; file: string }>('write_batch_snapshot', { name, content }),
+  /** 删除一份批量快照文本（用户丢弃时） */
+  deleteBatchSnapshot: (name: string) => invoke('delete_batch_snapshot', { name }),
   getSettings: () => invoke<Record<string, any>>('get_settings'),
   saveSettings: (value: Record<string, any>) =>
     invoke<Record<string, any>>('save_settings', { value }),

@@ -107,10 +107,32 @@ pub fn migrate_from_legacy() {
 
 fn ensure_dirs() -> Result<PathBuf, String> {
     let root = app_root()?;
-    for sub in ["workflows", "templates", "outputs", "favorites"] {
+    for sub in ["workflows", "templates", "outputs", "favorites", "batch-snapshots"] {
         fs::create_dir_all(root.join(sub)).map_err(|e| format!("创建目录失败：{}", e))?;
     }
     Ok(root)
+}
+
+/// 批量拆行源文本快照落成**可读文本**（data/batch-snapshots/<name>.txt）。
+/// 每次批量一个独立文件（name 带时间戳），互不覆盖——前面批次还没执行的也有留底。
+/// 内容必须带 UTF-8 BOM：部分 Windows 编辑器对无 BOM 的 UTF-8 中文渲染成方框。
+#[command]
+pub fn write_batch_snapshot(name: String, content: String) -> Result<Value, String> {
+    let dir = ensure_dirs()?.join("batch-snapshots");
+    let path = dir.join(format!("{}.txt", safe_name(&name)?));
+    // 一次性清理旧版固定名文件（已被带时间戳的多文件方案取代）
+    let _ = fs::remove_file(dir.join("batch-snapshot.txt"));
+    // UTF-8 BOM：记事本/Notepad2 等编辑器见到 BOM 才稳妥地按 UTF-8 + 中文字体处理
+    fs::write(&path, format!("\u{FEFF}{}", content)).map_err(|e| format!("写入快照失败：{}", e))?;
+    Ok(json!({ "ok": true, "file": path.to_string_lossy() }))
+}
+
+/// 删除一份批量快照文本（用户在提示条点「丢弃」时调用）。
+#[command]
+pub fn delete_batch_snapshot(name: String) -> Result<Value, String> {
+    let path = ensure_dirs()?.join("batch-snapshots").join(format!("{}.txt", safe_name(&name)?));
+    let _ = fs::remove_file(&path);
+    Ok(json!({ "ok": true }))
 }
 
 /// 重命名素材库/本地目录里的一个媒体文件（同目录内改名，不移动）。

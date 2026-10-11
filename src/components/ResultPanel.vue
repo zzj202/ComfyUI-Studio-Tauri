@@ -14,6 +14,9 @@ import {
   enabledWorkers,
   interruptAll,
   isDragClick,
+  batchSourceSnap,
+  dismissBatchSourceSnap,
+  requeueBatchSourceSnap,
   jobRemainText,
   markAllAssetsRead,
   markAssetRead,
@@ -831,6 +834,17 @@ onUnmounted(() => {
         </div>
         <span class="q-total-txt">{{ doneRatio }}%</span>
       </div>
+      <!-- 断电保险丝（方案 B）：有批量源文本快照且队列已空 → 提示重投或丢弃 -->
+      <div v-if="batchSourceSnap && !activeJobs.length" class="q-snap">
+        <span class="q-snap-txt">
+          ⏳ 上次有 <b>{{ batchSourceSnap.count }}</b> 条批量提示词未提交完成（{{ new Date(batchSourceSnap.at).toLocaleString() }}），源文本已留底
+        </span>
+        <span class="spacer" />
+        <button class="btn sm" title="把留底的整段文本重新打开拆行确认弹窗" @click="requeueBatchSourceSnap()">
+          重新载入
+        </button>
+        <button class="btn ghost sm" title="不再保留这份快照" @click="dismissBatchSourceSnap()">丢弃</button>
+      </div>
       <div class="q-body">
         <div v-if="!state.jobs.length" class="q-empty">队列空 · 任务进度显示在这里</div>
         <div
@@ -1327,6 +1341,29 @@ onUnmounted(() => {
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
   flex: none;
+}
+/* 断电保险丝提示条：批量源文本快照待处置 */
+.q-snap {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 14px 6px;
+  padding: 6px 10px;
+  border: 1px solid #f59e0b55;
+  background: #f59e0b12;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  color: var(--text-dim);
+  flex-wrap: wrap;
+}
+.q-snap-txt {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.q-snap-txt b {
+  color: var(--accent);
 }
 .q-state.run {
   color: var(--cyan);

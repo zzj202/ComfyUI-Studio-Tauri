@@ -18,10 +18,17 @@ export const BATCH_TEXT_MAX = 50
 /** 孤立的代码栏标记行（从 markdown 复制分镜时残留的 ``` / plaintext 等） */
 const FENCE_LINE_RE = /^\s*(?:`{3,}|~{3,}|'''|"'''|plaintext|text|json)\s*$/i
 
-/** 行首编号（keycap emoji / 括号编号 / 数字+分隔符 / #编号）；无则 null */
+/** 行首编号（keycap emoji / 括号编号 / 数字+分隔符 / #编号）；无则 null。
+ *  keycap 支持多位连写与特殊字形：1️⃣ / 1️⃣1️⃣（=11） / 🔟（=10，单码点） */
 function blockStartNum(line: string): number | null {
-  let m = line.match(/^\s*(\d{1,3})(?:\uFE0F)?\u20E3\s*/) // 1️⃣（keycap）
-  if (m) return Number(m[1])
+  // ① keycap：单个或连写（每个键帽 = 数字+VS16?+U+20E3；🔟 是独立的单码点 emoji）
+  let m = line.match(/^\s*((?:\d\uFE0F?\u20E3)+|🔟)\s*/)
+  if (m) {
+    if (m[1] === '🔟') return 10
+    const digits = [...m[1].matchAll(/(\d)\uFE0F?\u20E3/g)].map((x) => x[1]).join('')
+    const n = Number(digits)
+    if (Number.isFinite(n)) return n
+  }
   m = line.match(/^\s*[【\[]\s*(\d{1,3})\s*[】\]]/) // 【1】 / [1]
   if (m) return Number(m[1])
   m = line.match(/^\s*(\d{1,3})\s*[.、)）：:]\s*\S/) // 1. / 1、 / 1) / 1） / 1: / 1：
