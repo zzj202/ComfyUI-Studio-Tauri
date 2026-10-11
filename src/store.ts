@@ -759,6 +759,7 @@ function connectWs() {
       onProgress: ({ promptId, node, value, max }) => {
         const job = state.jobs.find((j) => j.base === base && j.promptId === promptId)
         if (!job) return
+        if (!job.execStartedAt) job.execStartedAt = Date.now() // 首个进度事件 = 实际开始执行
         job.status = 'running'
         job.value = value
         job.max = max
@@ -771,6 +772,7 @@ function connectWs() {
         } else {
           const job = state.jobs.find((j) => j.base === base && j.promptId === promptId)
           if (job) {
+            if (!job.execStartedAt) job.execStartedAt = Date.now()
             job.status = 'running'
             job.node = node
           }
@@ -886,12 +888,28 @@ async function finishJob(promptId: string, base: string) {
     const res = await api.historyItem(base, promptId)
     const entry = res?.[promptId]
     if (entry) {
+      // history 的 status.messages 里有精确的执行起止时间戳：{"prompt_id", "timestamp"}。
+      // timestamp 是毫秒（实测 v0.39：1791743291514）；自适应防旧版秒单位（>1e12 视为毫秒）
+      const toMs = (ts: unknown) => {
+        const n = Number(ts)
+        return n > 1e12 ? n : Math.round(n * 1000)
+      }
+      const msgs: any[] = entry.status?.messages ?? []
+      const startMsg = msgs.find((m) => m?.[0] === 'execution_start')
+      const succMsg = msgs.find((m) => m?.[0] === 'execution_success')
+      if (startMsg?.[1]?.timestamp) {
+        job.execStartedAt = toMs(startMsg[1].timestamp)
+      }
+      if (succMsg?.[1]?.timestamp) {
+        job.finishedAt = toMs(succMsg[1].timestamp)
+      }
       job.outputs = normalizeOutputs(entry)
       job.status = 'done'
       job.value = job.max || 1
-      job.finishedAt = Date.now()
-      // 记录该机单任务耗时（指数滑动平均）：队列完成 ETA 的估算依据
-      const durMs = Math.max(1000, (job.finishedAt ?? Date.now()) - job.startedAt)
+      job.finishedAt = job.finishedAt ?? Date.now()
+      // 记录该机单任务耗时（指数滑动平均）：队列完成 ETA 的估算依据——
+      // 用「执行起点」而非提交起点，排队时间不污染 ETA
+      const durMs = Math.max(1000, (job.finishedAt ?? Date.now()) - (job.execStartedAt ?? job.startedAt))
       const prev = baseAvgMs.get(base)
       baseAvgMs.set(base, prev == null ? durMs : Math.round(prev * 0.7 + durMs * 0.3))
       addAssets(job)
@@ -916,30 +934,47 @@ async function finishJob(promptId: string, base: string) {
 const baseAvgMs = reactive(new Map<string, number>())
 
 export const queueEtaText = computed(() => {
-  if (!state.jobs.some((j) => j.status === 'queued' || j.status === 'running')) return ''
+  const active = state.jobs.filter((j) => j.status === 'queued' || j.status === 'running')
+  if (!active.length) return ''
+  // 无样本的机器用全局平均兜底（否则它名下的任务会被直接忽略导致低估）；
+  // 全局也无样本（第一个任务还没跑完）时不显示——没有依据的预估没有意义
+  const globalAvg =
+    baseAvgMs.size > 0
+      ? Math.round([...baseAvgMs.values()].reduce((a, b) => a + b, 0) / baseAvgMs.size)
+      : 0
+  if (!globalAvg) return ''
+  const avgFor = (base: string) => baseAvgMs.get(base) ?? globalAvg
+  // 每台机器串行消化自己名下任务：总剩余 = 排队任务全耗时 + 在跑任务的剩余折算，
+  // 多机并行时取最慢那台；「约 X 分钟」预估的就是这些队列任务还将耗费的总时间
   let slowest = 0
-  for (const [base, avg] of baseAvgMs) {
-    const mine = state.jobs.filter(
-      (j) =>
-        (j.base ?? primaryBase()) === base &&
-        (j.status === 'queued' || j.status === 'running')
-    )
-    if (!mine.length) continue
+  for (const base of new Set(active.map((j) => j.base ?? primaryBase()))) {
     let remain = 0
-    for (const j of mine) {
-      // 运行中的按进度折算剩余比例（保底 5%：最后一步的收尾/写盘也要时间），排队的按全耗时
+    for (const j of active.filter((x) => (x.base ?? primaryBase()) === base)) {
       if (j.status === 'running' && j.max > 0) {
-        remain += avg * Math.max(0.05, 1 - j.value / j.max)
+        remain += avgFor(base) * Math.max(0.05, 1 - j.value / j.max)
       } else {
-        remain += avg
+        remain += avgFor(base)
       }
     }
     slowest = Math.max(slowest, remain)
   }
   if (!slowest) return ''
-  const m = Math.round(slowest / 60000)
-  return m >= 1 ? `约 ${m} 分钟` : '1 分钟内'
+  const s = Math.round(slowest / 1000)
+  return s >= 90 ? `约 ${Math.round(s / 60)} 分钟` : `约 ${s} 秒`
 })
+
+/** 单任务剩余预估（队列行内显示）：平均执行时长 × 剩余比例；无样本返回空 */
+export function jobRemainText(job: Job): string {
+  if (job.status !== 'running' || !job.max) return ''
+  const base = job.base ?? primaryBase()
+  let avg = baseAvgMs.get(base)
+  if (avg == null) {
+    if (!baseAvgMs.size) return ''
+    avg = Math.round([...baseAvgMs.values()].reduce((a, b) => a + b, 0) / baseAvgMs.size)
+  }
+  const s = Math.round((avg * Math.max(0.05, 1 - job.value / job.max)) / 1000)
+  return s >= 90 ? `剩约 ${Math.round(s / 60)} 分钟` : `剩约 ${s} 秒`
+}
 
 // ---------------------------------------------------------------- 工作流
 
@@ -1365,12 +1400,12 @@ function submitBatchText(
   )
 }
 
-/** 「✂ 拆行提交」按钮：把字段当前内容按行拆分，弹预览确认后批量提交（显式操作，总是弹窗） */
+/** 「✂ 拆行提交」按钮：把字段当前内容按行/编号分镜块拆分，弹预览确认后批量提交（显式操作，总是弹窗） */
 export function openBatchTextDialog(f: FieldSchema) {
   const raw = String(f.value ?? '')
   const lines = splitBatchLines(raw)
   if (lines.length < 2) {
-    notify('框里内容不足两行，无需拆行（每行一条提示词）', 'warn', 4000)
+    notify('内容不足两条，无需拆分（按换行或 1️⃣/1./【1】等编号块识别）', 'warn', 4000)
     return
   }
   batchTextPending.value = { fieldKey: f.key, fieldLabel: f.label, lines, raw }

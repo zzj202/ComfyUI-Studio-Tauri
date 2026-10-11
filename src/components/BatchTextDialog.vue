@@ -29,7 +29,7 @@ const jobCount = computed(() => lines.value.length * perLine.value)
       </div>
       <div class="modal-body">
         <div class="hint">
-          按行拆分「{{ p.fieldLabel }}」：每行一条提示词、独立成任务，第 1 个沿用当前种子、其余自动换新不重样。
+          按换行/编号分镜块拆分「{{ p.fieldLabel }}」：每条独立成任务，第 1 个沿用当前种子、其余自动换新不重样。编号块（1️⃣/1./【1】…）会整块保留（标题+描述+音效），自动去除 plaintext 等代码栏残留。
         </div>
         <div class="bt-count">
           <span>每条生成</span>

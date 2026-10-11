@@ -116,6 +116,9 @@ export interface Job {
   max: number
   node?: string
   startedAt: number
+  /** 实际开始执行的时刻（首个进度事件 / history 的 execution_start）：批量入队时
+   *  所有任务 startedAt 几乎相同，「耗时」必须从执行起点算起，否则把排队时间也累加进去 */
+  execStartedAt?: number
   finishedAt?: number
   error?: string
   outputs: OutputItem[]

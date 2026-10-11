@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api, saveTempBlob, viewUrl } from '../api/tauri'
 import { downloadDir } from '@tauri-apps/api/path'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -14,6 +14,7 @@ import {
   enabledWorkers,
   interruptAll,
   isDragClick,
+  jobRemainText,
   markAllAssetsRead,
   markAssetRead,
   notify,
@@ -47,14 +48,54 @@ const activeJobs = computed(() =>
   state.jobs.filter((j) => j.status === 'running' || j.status === 'queued')
 )
 
+// ---- 队列汇总：状态计数 chips（点击筛选）/ 总进度条 / 实时秒级 tick ----
+type QFilter = 'all' | 'running' | 'queued' | 'done'
+const qFilter = ref<QFilter>('all')
+const runningCount = computed(() => state.jobs.filter((j) => j.status === 'running').length)
+const queuedCount = computed(() => state.jobs.filter((j) => j.status === 'queued').length)
+const finishedCount = computed(
+  () =>
+    state.jobs.filter(
+      (j) => j.status === 'done' || j.status === 'error' || j.status === 'cancelled'
+    ).length
+)
+const doneRatio = computed(() =>
+  state.jobs.length ? Math.round((finishedCount.value / state.jobs.length) * 100) : 0
+)
+
+const filteredJobs = computed(() => {
+  if (qFilter.value === 'running') return state.jobs.filter((j) => j.status === 'running')
+  if (qFilter.value === 'queued') return state.jobs.filter((j) => j.status === 'queued')
+  if (qFilter.value === 'done')
+    return state.jobs.filter(
+      (j) => j.status === 'done' || j.status === 'error' || j.status === 'cancelled'
+    )
+  return state.jobs
+})
+
+/** 秒级心跳：有运行中任务时每秒跳一下（行内耗时/剩余预估实时刷新），空闲即停 */
+const nowTick = ref(Date.now())
+let tickTimer: number | null = null
+watch(activeJobs, (a) => {
+  if (a.length && tickTimer == null) {
+    tickTimer = window.setInterval(() => (nowTick.value = Date.now()), 1000)
+  } else if (!a.length && tickTimer != null) {
+    window.clearInterval(tickTimer)
+    tickTimer = null
+  }
+})
+
 function pct(job: Job) {
   if (!job.max) return job.status === 'done' ? 100 : 0
   return Math.min(100, Math.round((job.value / job.max) * 100))
 }
 
-function dur(job: Job) {
-  const end = job.finishedAt ?? Date.now()
-  return ((end - job.startedAt) / 1000).toFixed(1) + 's'
+function dur(job: Job, now: number) {
+  const end = job.finishedAt ?? now
+  // 耗时从「实际开始执行」算起（批量入队时 startedAt 几乎相同，直接用会把排队时间累加进去）；
+  // 排队中的任务没有执行起点，显示已等待时间
+  const from = job.status === 'queued' ? job.startedAt : (job.execStartedAt ?? job.startedAt)
+  return ((end - from) / 1000).toFixed(1) + 's'
 }
 
 /** ✕ 按钮：运行中=中断并移除；排队中=取消排队并移除；已结束=仅移除记录（store.discardJob） */
@@ -734,25 +775,41 @@ onUnmounted(() => {
 
 <template>
   <section class="panel">
-    <!-- 队列：紧凑条，高度很短 -->
+    <!-- 队列：状态汇总 chips（点击筛选）+ 总进度条 + 实时任务行 -->
     <div class="queue">
       <header class="q-head">
         <h2>队列</h2>
-        <span
-          v-if="activeJobs.length"
-          class="live-badge"
-          :title="queueDetailTitle"
-        >{{ activeJobs.length }} 个进行中</span>
-        <span
-          v-else-if="state.queueRemaining"
-          class="faint"
-          :title="queueDetailTitle"
-        >待处理 {{ state.queueRemaining }}</span>
+        <div class="q-chips">
+          <button
+            class="q-chip"
+            :class="{ on: qFilter === 'running', live: runningCount > 0 }"
+            :title="runningCount ? queueDetailTitle : '没有运行中的任务'"
+            @click="qFilter = qFilter === 'running' ? 'all' : 'running'"
+          >
+            <span class="q-chip-dot run" />运行中 {{ runningCount }}
+          </button>
+          <button
+            class="q-chip"
+            :class="{ on: qFilter === 'queued' }"
+            :title="queuedCount ? '只看排队中' : '没有排队的任务'"
+            @click="qFilter = qFilter === 'queued' ? 'all' : 'queued'"
+          >
+            <span class="q-chip-dot queued" />排队 {{ queuedCount }}
+          </button>
+          <button
+            class="q-chip"
+            :class="{ on: qFilter === 'done' }"
+            title="只看已完成/失败"
+            @click="qFilter = qFilter === 'done' ? 'all' : 'done'"
+          >
+            <span class="q-chip-dot fin" />完成 {{ finishedCount }}
+          </button>
+        </div>
         <span
           v-if="queueEtaText && activeJobs.length"
           class="faint q-eta"
-          title="按各节点历史平均耗时估算（并行时取最慢节点）；跑完第一个任务后开始积累"
-        >· {{ queueEtaText }}</span>
+          title="按各节点历史平均耗时估算队列剩余（并行时取最慢节点）；跑完第一个任务后开始积累"
+        >{{ queueEtaText }}</span>
         <span class="spacer" />
         <button
           v-if="activeJobs.length"
@@ -762,17 +819,25 @@ onUnmounted(() => {
         >
           ■ 全部中断
         </button>
-        <button class="btn ghost sm" @click="refreshQueue">刷新</button>
+        <button class="btn ghost sm" title="刷新队列状态" @click="refreshQueue">↻</button>
         <button class="btn ghost sm" :disabled="!state.settings.outputDir" @click="openOutputDir">
-          输出目录
+          📂
         </button>
       </header>
+      <!-- 总进度：已完成/总数（含失败与取消） -->
+      <div v-if="state.jobs.length" class="q-total" :title="`已完成 ${finishedCount}/${state.jobs.length}`">
+        <div class="q-total-bar">
+          <div class="q-total-fill" :style="{ width: doneRatio + '%' }" />
+        </div>
+        <span class="q-total-txt">{{ doneRatio }}%</span>
+      </div>
       <div class="q-body">
         <div v-if="!state.jobs.length" class="q-empty">队列空 · 任务进度显示在这里</div>
         <div
-          v-for="job in state.jobs"
+          v-for="job in filteredJobs"
           :key="job.promptId"
           class="q-row"
+          :class="{ filtered: qFilter !== 'all' }"
           @contextmenu.prevent="openJobCtx($event, job)"
         >
           <span class="dot" :class="job.status" />
@@ -787,9 +852,13 @@ onUnmounted(() => {
           >
             <span class="q-node-dot" />{{ job.pinnedWorkerId ? '📌 ' : '' }}{{ workerName(job.base) }}
           </span>
-          <div v-if="job.status === 'running' || job.status === 'queued'" class="q-bar">
+          <div v-if="job.status === 'running'" class="q-bar">
             <div class="q-fill" :style="{ width: pct(job) + '%' }" />
           </div>
+          <span v-if="job.status === 'running'" class="q-state run" :title="`第 ${job.value}/${job.max || '?'} 步`">
+            {{ pct(job) }}%<template v-if="jobRemainText(job)"> · {{ jobRemainText(job) }}</template>
+          </span>
+          <span v-else-if="job.status === 'queued'" class="q-state">排队 · 已等 {{ dur(job, nowTick) }}</span>
           <span
             v-else
             class="q-state"
@@ -797,7 +866,7 @@ onUnmounted(() => {
             :title="job.error && expandedErrId !== job.promptId ? '点击展开完整错误' : ''"
             @click="job.error && toggleErr(job)"
           >
-            {{ job.error ? '失败' : STATUS_TEXT[job.status] }} · {{ dur(job) }}
+            {{ job.error ? '失败' : STATUS_TEXT[job.status] }} · {{ dur(job, nowTick) }}
           </span>
           <span v-if="job.outputs.length" class="faint q-files">{{ job.outputs.length }} 文件</span>
           <button
@@ -1186,6 +1255,83 @@ onUnmounted(() => {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* 状态计数 chips：点击筛选任务列表 */
+.q-chips {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.q-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.q-chip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.q-chip.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.q-chip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  flex: none;
+}
+.q-chip-dot.run {
+  background: var(--cyan);
+}
+.q-chip.live .q-chip-dot.run {
+  animation: q-pulse 1.4s ease-in-out infinite;
+}
+.q-chip-dot.queued {
+  background: #f59e0b;
+}
+.q-chip-dot.fin {
+  background: #22c55e;
+}
+/* 总进度条（header 下的一根细条） */
+.q-total {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 0 14px 6px;
+}
+.q-total-bar {
+  flex: 1;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  overflow: hidden;
+}
+.q-total-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--cyan));
+  transition: width 0.4s ease;
+}
+.q-total-txt {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+.q-state.run {
+  color: var(--cyan);
+  font-variant-numeric: tabular-nums;
+}
 .spacer {
   flex: 1;
 }
@@ -1235,6 +1381,11 @@ onUnmounted(() => {
 @keyframes pulse {
   50% {
     opacity: 0.4;
+  }
+}
+@keyframes q-pulse {
+  50% {
+    opacity: 0.35;
   }
 }
 .q-wf {
