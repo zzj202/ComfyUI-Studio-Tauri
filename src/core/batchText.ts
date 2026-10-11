@@ -29,7 +29,7 @@ function blockStartNum(line: string): number | null {
     const n = Number(digits)
     if (Number.isFinite(n)) return n
   }
-  m = line.match(/^\s*[【\[]\s*(\d{1,3})\s*[】\]]/) // 【1】 / [1]
+  m = line.match(/^\s*[【\[]\s*(\d{1,3})[^】\]]*[】\]]/) // 【1】 / [1] / 【01｜双人互动】标题（编号后可带任意标题）
   if (m) return Number(m[1])
   m = line.match(/^\s*(\d{1,3})\s*[.、)）：:]\s*\S/) // 1. / 1、 / 1) / 1） / 1: / 1：
   if (m) return Number(m[1])
