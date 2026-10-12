@@ -91,7 +91,13 @@ export interface WorkflowMeta {
   updatedAt: number
 }
 
-export type JobStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled'
+export type JobStatus =
+  | 'queued'
+  | 'running'
+  | 'done'
+  | 'error'
+  | 'cancelled'
+  | 'paused' // 已暂停：已从 ComfyUI 队列摘除/中断，graph 与参数完整保留，恢复时按原序重投
 
 /** 一个计算节点（远程 ComfyUI 实例）配置 */
 export interface WorkerProfile {

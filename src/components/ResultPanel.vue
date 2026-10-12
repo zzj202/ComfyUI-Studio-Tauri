@@ -22,6 +22,7 @@ import {
   markAssetRead,
   notify,
   openAssetWorkflow,
+  pauseQueue,
   pinJobToWorker,
   primaryBase,
   promoteJob,
@@ -32,6 +33,7 @@ import {
   renameAsset,
   rerunAsset,
   requeueJob,
+  resumeQueue,
   retryJob,
   state,
   toggleAssetRead,
@@ -45,6 +47,7 @@ const STATUS_TEXT: Record<Job['status'], string> = {
   done: '已完成',
   error: '失败',
   cancelled: '已取消',
+  paused: '已暂停',
 }
 
 const activeJobs = computed(() =>
@@ -52,10 +55,11 @@ const activeJobs = computed(() =>
 )
 
 // ---- 队列汇总：状态计数 chips（点击筛选）/ 总进度条 / 实时秒级 tick ----
-type QFilter = 'all' | 'running' | 'queued' | 'done'
+type QFilter = 'all' | 'running' | 'queued' | 'paused' | 'done'
 const qFilter = ref<QFilter>('all')
 const runningCount = computed(() => state.jobs.filter((j) => j.status === 'running').length)
 const queuedCount = computed(() => state.jobs.filter((j) => j.status === 'queued').length)
+const pausedCount = computed(() => state.jobs.filter((j) => j.status === 'paused').length)
 const finishedCount = computed(
   () =>
     state.jobs.filter(
@@ -69,6 +73,7 @@ const doneRatio = computed(() =>
 const filteredJobs = computed(() => {
   if (qFilter.value === 'running') return state.jobs.filter((j) => j.status === 'running')
   if (qFilter.value === 'queued') return state.jobs.filter((j) => j.status === 'queued')
+  if (qFilter.value === 'paused') return state.jobs.filter((j) => j.status === 'paused')
   if (qFilter.value === 'done')
     return state.jobs.filter(
       (j) => j.status === 'done' || j.status === 'error' || j.status === 'cancelled'
@@ -801,6 +806,14 @@ onUnmounted(() => {
           </button>
           <button
             class="q-chip"
+            :class="{ on: qFilter === 'paused', held: pausedCount > 0 }"
+            :title="pausedCount ? '只看已暂停' : '没有已暂停的任务'"
+            @click="qFilter = qFilter === 'paused' ? 'all' : 'paused'"
+          >
+            <span class="q-chip-dot held" />暂停 {{ pausedCount }}
+          </button>
+          <button
+            class="q-chip"
             :class="{ on: qFilter === 'done' }"
             title="只看已完成/失败"
             @click="qFilter = qFilter === 'done' ? 'all' : 'done'"
@@ -817,7 +830,23 @@ onUnmounted(() => {
         <button
           v-if="activeJobs.length"
           class="btn ghost sm q-stop"
-          title="中断所有节点上运行中的任务，并移除所有排队任务（只动本应用提交的）"
+          title="暂停：中断运行中的任务、摘除排队的任务（参数与执行图保留，可一键恢复）"
+          @click="pauseQueue"
+        >
+          ⏸ 暂停
+        </button>
+        <button
+          v-if="pausedCount"
+          class="btn sm q-resume"
+          title="按原顺序用原参数重新提交所有已暂停的任务"
+          @click="resumeQueue"
+        >
+          ▶ 恢复 {{ pausedCount }}
+        </button>
+        <button
+          v-if="activeJobs.length"
+          class="btn ghost sm q-stop"
+          title="中断所有节点上运行中的任务，并移除所有排队任务（只动本应用提交的，不可恢复）"
           @click="interruptAll"
         >
           ■ 全部中断
@@ -873,6 +902,9 @@ onUnmounted(() => {
             {{ pct(job) }}%<template v-if="jobRemainText(job)"> · {{ jobRemainText(job) }}</template>
           </span>
           <span v-else-if="job.status === 'queued'" class="q-state">排队 · 已等 {{ dur(job, nowTick) }}</span>
+          <span v-else-if="job.status === 'paused'" class="q-state held" title="已暂停：点「▶ 恢复」按原参数重新提交">
+            ⏸ 已暂停 · 待恢复
+          </span>
           <span
             v-else
             class="q-state"
@@ -1313,8 +1345,22 @@ onUnmounted(() => {
 .q-chip-dot.queued {
   background: #f59e0b;
 }
+.q-chip-dot.held {
+  background: #a78bfa;
+}
+.q-chip.held {
+  border-color: #a78bfa88;
+  color: #a78bfa;
+}
 .q-chip-dot.fin {
   background: #22c55e;
+}
+.q-state.held {
+  color: #a78bfa;
+}
+.q-resume {
+  color: var(--accent);
+  border: 1px solid var(--accent);
 }
 /* 总进度条（header 下的一根细条） */
 .q-total {

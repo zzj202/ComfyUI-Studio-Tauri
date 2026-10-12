@@ -12,7 +12,7 @@ import { BATCH_TEXT_MAX, splitBatchLines } from './core/batchText'
 import { cooldownWorker, selectWorker } from './core/scheduler'
 import { ensureAudio, playChime } from './core/chime'
 import { isPermissionGranted, requestPermission, sendNotification } from '@tauri-apps/plugin-notification'
-import type { Asset, FieldSchema, Job, ParamTemplate, WorkflowMeta, WorkerProfile } from './core/types'
+import type { Asset, FieldSchema, Job, JobStatus, ParamTemplate, WorkflowMeta, WorkerProfile } from './core/types'
 import { ui } from './ui'
 
 export const state = reactive({
@@ -493,6 +493,23 @@ async function restoreQueueFromServer() {
   let gone = 0
   for (const rec of pendMap.values()) {
     if (state.jobs.some((j) => j.base === rec.base && j.promptId === rec.promptId)) continue
+    // 暂停的任务：已从 ComfyUI 队列摘除、history 也无产出条目——直接恢复暂停态，
+    // 不进对账（否则会被误判为「已被外部清空」）
+    if (rec.status === 'paused') {
+      state.jobs.unshift({
+        promptId: rec.promptId,
+        workflow: rec.workflow,
+        status: 'paused',
+        value: 0,
+        max: 0,
+        startedAt: rec.startedAt,
+        outputs: [],
+        params: rec.params,
+        workerId: rec.workerId,
+        base: rec.base,
+      })
+      continue
+    }
     const job: Job = {
       promptId: rec.promptId,
       workflow: rec.workflow,
@@ -944,6 +961,13 @@ async function finishJob(promptId: string, base: string) {
         return n > 1e12 ? n : Math.round(n * 1000)
       }
       const msgs: any[] = entry.status?.messages ?? []
+      // history 条目也可能执行出错（如被中断）：标 error 而不是误收成 done
+      if (entry.status?.status_str === 'error') {
+        job.status = 'error'
+        job.error = '执行出错（从历史记录补记）'
+        job.finishedAt = Date.now()
+        return
+      }
       const startMsg = msgs.find((m) => m?.[0] === 'execution_start')
       const succMsg = msgs.find((m) => m?.[0] === 'execution_success')
       if (startMsg?.[1]?.timestamp) {
@@ -1026,6 +1050,125 @@ export function jobRemainText(job: Job): string {
   return s >= 90 ? `剩约 ${Math.round(s / 60)} 分钟` : `剩约 ${s} 秒`
 }
 
+// ---- 队列暂停/恢复：ComfyUI 无原生暂停，用「中断+摘除 + 原图重投」模拟 ----
+// 暂停 = 运行中 → /interrupt（进度作废），排队 → /queue delete 摘除；任务转 paused
+// 保留 graph/params。恢复 = 按原顺序用原图重新提交（种子在 graph 里，结果可复现）。
+
+/** 暂停队列：停掉运行中的、摘除排队的，全部转为 paused 保留记录 */
+export async function pauseQueue() {
+  const active = state.jobs.filter((j) => j.status === 'running' || j.status === 'queued')
+  if (!active.length) {
+    notify('没有进行中的任务', 'info', 3000)
+    return
+  }
+  queuePaused.value = true
+  const byBase = new Map<string, { run: Job[]; queued: Job[] }>()
+  for (const j of active) {
+    const b = j.base ?? primaryBase()
+    const e = byBase.get(b) ?? { run: [], queued: [] }
+    ;(j.status === 'running' ? e.run : e.queued).push(j)
+    byBase.set(b, e)
+  }
+  const failed: string[] = []
+  for (const [base, { run, queued }] of byBase) {
+    if (run.length) {
+      try {
+        await api.interrupt(base)
+      } catch {
+        failed.push(workerName(base))
+      }
+    }
+    if (queued.length) {
+      try {
+        await api.queueDelete(
+          base,
+          queued.map((j) => j.promptId)
+        )
+      } catch {
+        failed.push(workerName(base))
+      }
+    }
+  }
+  // 摘除/中断成功的转 paused（graph/params 完整保留）；操作失败的保持原状态
+  // （任务实际还在跑/在队列，恢复时不能重投，否则重复出图）
+  for (const j of active) {
+    const failedNode = failed.includes(workerName(j.base ?? primaryBase()))
+    if (!failedNode) j.status = 'paused'
+  }
+  persistPendingJobs()
+  if (failed.length) {
+    notify(
+      `已暂停（节点 ${failed.join('、')} 操作失败，其任务仍在原状态）`,
+      'warn',
+      8000
+    )
+  } else {
+    notify(`已暂停 ${active.length} 个任务，点「▶ 恢复」继续执行`, 'ok', 6000)
+  }
+}
+
+/** 恢复队列：paused 任务按「原执行顺序」（数组倒序）用原图重新提交。
+ *  刷新后 graph 丢失的，用工作流文件 + 参数快照重建（种子在 params 里，结果可复现）。 */
+export async function resumeQueue() {
+  const paused = state.jobs.filter((j) => j.status === 'paused').reverse()
+  if (!paused.length) {
+    notify('没有已暂停的任务', 'info', 3000)
+    queuePaused.value = false
+    return
+  }
+  const failed: string[] = []
+  for (const j of paused) {
+    const base = j.base ?? primaryBase()
+    let graph = j.graph
+    if (!graph) {
+      // 刷新后内存里的执行图丢了：工作流文件还在磁盘上，用参数快照重建
+      // （params 的 key 是 nodeId::input，applyValues 直接覆盖节点输入，种子也在里面）
+      try {
+        const baseGraph = await api.readWorkflow(j.workflow)
+        graph = j.params ? applyValues(baseGraph, j.params) : baseGraph
+        j.graph = graph
+      } catch (e) {
+        j.status = 'error'
+        j.error = `执行图已丢失且工作流「${j.workflow}」不可读：${e}`
+        j.finishedAt = Date.now()
+        failed.push(j.workflow || j.promptId)
+        continue
+      }
+    }
+    try {
+      const res = await api.submit(base, graph, j.workflow || undefined, j.params ? JSON.stringify(j.params) : undefined)
+      const err = extractSubmitError(res, j.graph)
+      if (err) throw new Error(err)
+      const i = state.jobs.indexOf(j)
+      if (i >= 0) {
+        state.jobs[i] = {
+          ...j,
+          promptId: String(res.prompt_id), // 重投 = 新 promptId，旧索引记录一并移除
+          status: 'queued',
+          value: 0,
+          max: 0,
+          startedAt: Date.now(),
+          execStartedAt: undefined,
+          finishedAt: undefined,
+          error: undefined,
+          outputs: [],
+        }
+        removePendingRec(j.promptId, base)
+      }
+    } catch (e) {
+      failed.push(j.workflow || j.promptId)
+      console.warn('[resume] 重投失败', j.promptId, e)
+    }
+  }
+  persistPendingJobs()
+  if (failed.length) {
+    notify(`已恢复部分任务，${failed.length} 个重投失败：${failed.join('、')}`, 'warn', 10000)
+  } else {
+    queuePaused.value = false
+    notify(`已恢复 ${paused.length} 个任务，继续执行`, 'ok', 5000)
+  }
+}
+
 // ---------------------------------------------------------------- 工作流
 
 export async function selectWorkflow(name: string) {
@@ -1101,12 +1244,16 @@ interface PendingRec {
   workflow: string
   workerId?: string
   startedAt: number
+  status?: JobStatus // 暂停的任务记为 paused：重启对账时直接恢复暂停态，不进 history 对账
   params?: Record<string, any>
 }
 
 /** 磁盘索引的内存缓存：合并式写的基础——写时保留「state.jobs 里没有、但还没被
  *  确认终态」的记录（如节点离线未完成对账的），防止一次全量重写把别人抹掉 */
 let pendingCache: PendingRec[] | null = null
+
+/** 队列全局暂停：true 时拦截新提交；paused 任务已从 ComfyUI 队列摘除，恢复时重投 */
+export const queuePaused = ref(false)
 
 function loadPendingRecs(): PendingRec[] {
   if (pendingCache) return pendingCache
@@ -1137,10 +1284,10 @@ function removePendingRec(promptId: string, base: string) {
 function persistPendingJobs() {
   try {
     const recs = loadPendingRecs()
-    // upsert：state.jobs 里的 queued/running 覆盖同名记录；磁盘上多出的（未对账的
+    // upsert：state.jobs 里的 queued/running/paused 覆盖同名记录；磁盘上多出的（未对账的
     // 离线节点记录等）保留不动——只有 removePendingRec 才真正删除
     for (const j of state.jobs) {
-      if (j.status !== 'queued' && j.status !== 'running') continue
+      if (j.status !== 'queued' && j.status !== 'running' && j.status !== 'paused') continue
       const base = j.base ?? primaryBase()
       const rec: PendingRec = {
         promptId: j.promptId,
@@ -1148,6 +1295,7 @@ function persistPendingJobs() {
         workflow: j.workflow,
         workerId: j.workerId,
         startedAt: j.startedAt,
+        status: j.status,
         params: j.params,
       }
       const i = recs.findIndex((r) => r.promptId === rec.promptId && r.base === base)
@@ -1481,6 +1629,10 @@ watch(submitWorkerId, (v) => {
 
 export function submit(batch = submitBatch.value) {
   ensureAudio() // 用户手势时机预热 AudioContext（完成音效需要）
+  if (queuePaused.value) {
+    notify('队列已暂停，请先点「▶ 恢复」再提交', 'warn', 4000)
+    return
+  }
   if (!state.graph) {
     notify('请先选择一个工作流', 'warn')
     return
@@ -1574,6 +1726,10 @@ function submitBatchText(
   count = submitBatch.value
 ) {
   ensureAudio()
+  if (queuePaused.value) {
+    notify('队列已暂停，请先点「▶ 恢复」再提交', 'warn', 4000)
+    return
+  }
   if (!state.graph) {
     notify('请先选择一个工作流', 'warn')
     return
