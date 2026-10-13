@@ -436,7 +436,7 @@ async function restoreQueueFromServer() {
   let restored = 0
   // 持久化索引（方案 A）：promptId → 提交时刻/workerId/params。/queue 里的用不上
   // params（extra_data 已带），但 startedAt 和 workerId 只有这里有。
-  const pendMap = new Map(loadPendingRecs().map((r) => [r.promptId, r]))
+  const pendMap = new Map<string, PendingRec>(loadPendingRecs().map((r) => [r.promptId, r]))
   for (const { base, id } of targets) {
     try {
       const q = await api.queue(base)
@@ -491,10 +491,11 @@ async function restoreQueueFromServer() {
   // （且不在队列）的，标记为已被外部清空。 ----
   let doneRecovered = 0
   let gone = 0
-  for (const rec of pendMap.values()) {
-    if (state.jobs.some((j) => j.base === rec.base && j.promptId === rec.promptId)) continue
-    // 暂停的任务：已从 ComfyUI 队列摘除、history 也无产出条目——直接恢复暂停态，
-    // 不进对账（否则会被误判为「已被外部清空」）
+  // 并行对账（串行 50 条 = 50 次往返太慢）； paused 的直接恢复暂停态
+  const toReconcile = [...pendMap.values()].filter(
+    (rec: PendingRec) => !state.jobs.some((j) => j.base === rec.base && j.promptId === rec.promptId)
+  )
+  for (const rec of toReconcile) {
     if (rec.status === 'paused') {
       state.jobs.unshift({
         promptId: rec.promptId,
@@ -508,29 +509,35 @@ async function restoreQueueFromServer() {
         workerId: rec.workerId,
         base: rec.base,
       })
-      continue
+    } else {
+      const job: Job = {
+        promptId: rec.promptId,
+        workflow: rec.workflow,
+        status: 'queued',
+        value: 0,
+        max: 0,
+        startedAt: rec.startedAt,
+        outputs: [],
+        params: rec.params,
+        workerId: rec.workerId,
+        base: rec.base,
+      }
+      state.jobs.unshift(job)
+      void finishJob(rec.promptId, rec.base).catch(() => {
+        /* finishJob 内部已处理 */
+      })
     }
-    const job: Job = {
-      promptId: rec.promptId,
-      workflow: rec.workflow,
-      status: 'queued',
-      value: 0,
-      max: 0,
-      startedAt: rec.startedAt,
-      outputs: [],
-      params: rec.params,
-      workerId: rec.workerId,
-      base: rec.base,
-    }
-    state.jobs.unshift(job)
-    try {
-      await finishJob(rec.promptId, rec.base)
-    } catch {
-      /* finishJob 内部已处理 */
-    }
-    if (job.status === 'done') {
-      doneRecovered++
-    } else if (job.status === 'queued') {
+  }
+  if (toReconcile.some((r) => r.status !== 'paused')) {
+    // 给并行 finishJob 一点收敛时间，再统计补收/消失
+    await new Promise((r) => setTimeout(r, 1200))
+  }
+  for (const rec of toReconcile) {
+    if (rec.status === 'paused') continue
+    const job = state.jobs.find((j) => j.base === rec.base && j.promptId === rec.promptId)
+    if (!job) continue
+    if (job.status === 'done') doneRecovered++
+    else if (job.status === 'queued') {
       // /queue 和 /history 都没有 → 服务端已被清空
       job.status = 'cancelled'
       job.error = '服务端队列中已不存在（可能被外部中断或清空）'
@@ -2045,6 +2052,8 @@ export const queueByBase = ref<Record<string, number>>({})
 async function pollFinishJob(j: Job) {
   if (j.status !== 'running' && j.status !== 'queued') return
   const base = j.base ?? primaryBase()
+  // WS 活着的节点：queued 的收尾由 WS 事件负责，轮询不重复查（批量排队时省 N-1 个请求/4s）
+  if (j.status === 'queued' && healthOf(base) === 'up') return
   try {
     const res = await api.historyItem(base, j.promptId)
     const entry = res?.[j.promptId]
