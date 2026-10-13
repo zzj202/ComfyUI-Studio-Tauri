@@ -1107,6 +1107,48 @@ export async function pauseQueue() {
   }
 }
 
+/** 恢复单个 paused 任务（重投逻辑与 resumeQueue 共用）：原地更新任务对象，返回是否成功 */
+async function resumeOne(j: Job): Promise<boolean> {
+  const base = j.base ?? primaryBase()
+  let graph = j.graph
+  if (!graph) {
+    // 刷新后内存里的执行图丢了：工作流文件还在磁盘上，用参数快照重建
+    // （params 的 key 是 nodeId::input，applyValues 直接覆盖节点输入，种子也在里面）
+    try {
+      const baseGraph = await api.readWorkflow(j.workflow)
+      graph = j.params ? applyValues(baseGraph, j.params) : baseGraph
+      j.graph = graph
+    } catch (e) {
+      j.status = 'error'
+      j.error = `执行图已丢失且工作流「${j.workflow}」不可读：${e}`
+      j.finishedAt = Date.now()
+      return false
+    }
+  }
+  try {
+    const res = await api.submit(base, graph, j.workflow || undefined, j.params ? JSON.stringify(j.params) : undefined)
+    const err = extractSubmitError(res, graph)
+    if (err) throw new Error(err)
+    // 原地更新（不替换对象）：弹窗/列表的引用保持有效
+    Object.assign(j, {
+      promptId: String(res.prompt_id), // 重投 = 新 promptId，旧索引记录一并移除
+      status: 'queued',
+      value: 0,
+      max: 0,
+      startedAt: Date.now(),
+      execStartedAt: undefined,
+      finishedAt: undefined,
+      error: undefined,
+      outputs: [],
+    })
+    removePendingRec(j.promptId, base)
+    return true
+  } catch (e) {
+    console.warn('[resume] 重投失败', j.promptId, e)
+    return false
+  }
+}
+
 /** 恢复队列：paused 任务按「原执行顺序」（数组倒序）用原图重新提交。
  *  刷新后 graph 丢失的，用工作流文件 + 参数快照重建（种子在 params 里，结果可复现）。 */
 export async function resumeQueue() {
@@ -1118,47 +1160,7 @@ export async function resumeQueue() {
   }
   const failed: string[] = []
   for (const j of paused) {
-    const base = j.base ?? primaryBase()
-    let graph = j.graph
-    if (!graph) {
-      // 刷新后内存里的执行图丢了：工作流文件还在磁盘上，用参数快照重建
-      // （params 的 key 是 nodeId::input，applyValues 直接覆盖节点输入，种子也在里面）
-      try {
-        const baseGraph = await api.readWorkflow(j.workflow)
-        graph = j.params ? applyValues(baseGraph, j.params) : baseGraph
-        j.graph = graph
-      } catch (e) {
-        j.status = 'error'
-        j.error = `执行图已丢失且工作流「${j.workflow}」不可读：${e}`
-        j.finishedAt = Date.now()
-        failed.push(j.workflow || j.promptId)
-        continue
-      }
-    }
-    try {
-      const res = await api.submit(base, graph, j.workflow || undefined, j.params ? JSON.stringify(j.params) : undefined)
-      const err = extractSubmitError(res, j.graph)
-      if (err) throw new Error(err)
-      const i = state.jobs.indexOf(j)
-      if (i >= 0) {
-        state.jobs[i] = {
-          ...j,
-          promptId: String(res.prompt_id), // 重投 = 新 promptId，旧索引记录一并移除
-          status: 'queued',
-          value: 0,
-          max: 0,
-          startedAt: Date.now(),
-          execStartedAt: undefined,
-          finishedAt: undefined,
-          error: undefined,
-          outputs: [],
-        }
-        removePendingRec(j.promptId, base)
-      }
-    } catch (e) {
-      failed.push(j.workflow || j.promptId)
-      console.warn('[resume] 重投失败', j.promptId, e)
-    }
+    if (!(await resumeOne(j))) failed.push(j.workflow || j.promptId)
   }
   persistPendingJobs()
   if (failed.length) {
@@ -1167,6 +1169,17 @@ export async function resumeQueue() {
     queuePaused.value = false
     notify(`已恢复 ${paused.length} 个任务，继续执行`, 'ok', 5000)
   }
+}
+
+/** 弹窗「恢复此任务」：单个 paused 任务重投 */
+export async function resumeSingle(job: Job) {
+  const ok = await resumeOne(job)
+  persistPendingJobs()
+  notify(
+    ok ? '已恢复该任务，进入执行队列' : '恢复失败（详见任务行错误信息）',
+    ok ? 'ok' : 'warn',
+    5000
+  )
 }
 
 // ---------------------------------------------------------------- 工作流

@@ -34,6 +34,7 @@ import {
   rerunAsset,
   requeueJob,
   resumeQueue,
+  resumeSingle,
   retryJob,
   state,
   toggleAssetRead,
@@ -104,6 +105,89 @@ function dur(job: Job, now: number) {
   // 排队中的任务没有执行起点，显示已等待时间
   const from = job.status === 'queued' ? job.startedAt : (job.execStartedAt ?? job.startedAt)
   return ((end - from) / 1000).toFixed(1) + 's'
+}
+
+// ---- 查看任务提示词：点击行首按钮弹出模态窗口（空间充足、排版从容） ----
+const promptModal = ref<Job | null>(null)
+
+function openPromptModal(job: Job) {
+  promptModal.value = job
+}
+
+/** 弹窗任务在当前筛选列表中的位置（1 起）；-1 = 已不在列表（被删除等） */
+const modalIdx = computed(() => {
+  const i = promptModal.value ? filteredJobs.value.indexOf(promptModal.value) : -1
+  return i
+})
+
+/** 上一个/下一个：在当前筛选列表内循环导航 */
+function navModal(dir: 1 | -1) {
+  const list = filteredJobs.value
+  if (!list.length) {
+    promptModal.value = null
+    return
+  }
+  let i = promptModal.value ? list.indexOf(promptModal.value) : -1
+  i = i + dir
+  if (i >= list.length) i = 0
+  if (i < 0) i = list.length - 1
+  promptModal.value = list[i]
+}
+
+/** 弹窗内删除任务：中断/摘除 + 移除记录，然后自动跳到相邻任务 */
+async function removeModalJob() {
+  const job = promptModal.value
+  if (!job) return
+  const idx = filteredJobs.value.indexOf(job)
+  await discardJob(job)
+  const list = filteredJobs.value
+  if (!list.length) {
+    promptModal.value = null
+    return
+  }
+  promptModal.value = list[Math.max(0, Math.min(idx, list.length - 1))]
+}
+
+/** 弹窗 A/D 快捷键：上一个/下一个任务（输入框聚焦时不触发） */
+function onPmKey(e: KeyboardEvent) {
+  if (!promptModal.value) return
+  const t = e.target as HTMLElement | null
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+  const k = e.key
+  if (k === 'a' || k === 'A') navModal(-1)
+  else if (k === 'd' || k === 'D') navModal(1)
+}
+window.addEventListener('keydown', onPmKey)
+
+/** 参数快照 → 展示分段：字段名（key 取 input 段）+ 值，长文本（提示词）排前面 */
+const modalSegs = computed(() => {
+  const p = promptModal.value?.params
+  if (!p) return []
+  return Object.entries(p)
+    .filter(([, v]) => v != null && String(v).trim())
+    .map(([k, v]) => ({ name: k.split('::').pop() ?? k, value: String(v) }))
+    .sort((a, b) => b.value.length - a.value.length)
+})
+
+async function copyJobPrompt(job: Job) {
+  const segs = modalSegs.value.length && promptModal.value === job ? modalSegs.value : jobSegs(job)
+  if (!segs.length) return
+  try {
+    await navigator.clipboard.writeText(segs.map((s) => `【${s.name}】${s.value}`).join('\n\n'))
+    notify('已复制该任务的全部提示词', 'ok', 2500)
+  } catch {
+    notify('复制失败', 'error', 4000)
+  }
+}
+
+/** 参数快照 → 展示分段（非弹窗场景用：如复制按钮直接调用） */
+function jobSegs(job: Job) {
+  const p = job.params
+  if (!p) return []
+  return Object.entries(p)
+    .filter(([, v]) => v != null && String(v).trim())
+    .map(([k, v]) => ({ name: k.split('::').pop() ?? k, value: String(v) }))
+    .sort((a, b) => b.value.length - a.value.length)
 }
 
 /** ✕ 按钮：运行中=中断并移除；排队中=取消排队并移除；已结束=仅移除记录（store.discardJob） */
@@ -883,6 +967,15 @@ onUnmounted(() => {
           :class="{ filtered: qFilter !== 'all' }"
           @contextmenu.prevent="openJobCtx($event, job)"
         >
+          <button
+            v-if="job.params && Object.keys(job.params).length"
+            class="q-exp-btn"
+            title="查看该任务的提示词"
+            @click.stop="openPromptModal(job)"
+          >
+            ⓘ
+          </button>
+          <span v-else class="q-exp-btn empty" />
           <span class="dot" :class="job.status" />
           <span class="q-wf" :title="job.workflow">{{ job.workflow || '—' }}</span>
           <span
@@ -944,6 +1037,86 @@ onUnmounted(() => {
           <div v-if="job.error && expandedErrId === job.promptId" class="q-err" @click.stop>
             <span>{{ job.error }}</span>
             <button class="btn ghost sm" title="复制错误信息" @click="copyErr(job)">⧉ 复制</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- 提示词查看弹窗：导航 + 全套操作 -->
+      <div v-if="promptModal" class="modal-mask" @click.self="promptModal = null">
+        <div class="modal q-prompt-modal">
+          <div class="modal-head">
+            <button
+              class="btn ghost sm"
+              title="上一个任务（快捷键 A）"
+              :disabled="!filteredJobs.length"
+              @click="navModal(-1)"
+            >
+              ❮
+            </button>
+            <span class="q-pm-pos">{{ modalIdx >= 0 ? modalIdx + 1 : '—' }} / {{ filteredJobs.length }}</span>
+            <h3 class="q-pm-title">
+              {{ promptModal.workflow || '任务' }} ·
+              <span :class="'st-' + promptModal.status">{{ STATUS_TEXT[promptModal.status] }}</span>
+            </h3>
+            <button
+              class="btn ghost sm"
+              title="下一个任务（快捷键 D）"
+              :disabled="!filteredJobs.length"
+              @click="navModal(1)"
+            >
+              ❯
+            </button>
+            <button class="btn ghost sm" @click="promptModal = null">✕</button>
+          </div>
+          <div class="modal-body q-pm-body">
+            <div v-for="(seg, i) in modalSegs" :key="i" class="q-prompt-seg">
+              <div class="q-prompt-name">{{ seg.name }}</div>
+              <div class="q-prompt-val">{{ seg.value }}</div>
+            </div>
+          </div>
+          <div class="q-pm-foot">
+            <span class="faint">{{ modalSegs.length }} 个字段 · 参数快照与提交时一致</span>
+            <span class="spacer" />
+            <button
+              v-if="promptModal.status === 'queued' && promptModal.graph"
+              class="btn ghost sm"
+              title="插队：重排该节点队列，让它下一个执行"
+              @click="promoteJob(promptModal)"
+            >
+              ⏫ 插队
+            </button>
+            <button
+              v-if="promptModal.status === 'queued' && promptModal.graph && enabledWorkers().length > 1"
+              class="btn ghost sm"
+              title="改派：从当前节点摘除，重新提交到其他空闲节点"
+              @click="requeueJob(promptModal)"
+            >
+              ⇄ 改派
+            </button>
+            <button
+              v-if="promptModal.status === 'paused'"
+              class="btn"
+              title="恢复此任务：按原参数重新提交"
+              @click="resumeSingle(promptModal)"
+            >
+              ▶ 恢复此任务
+            </button>
+            <button
+              v-if="(promptModal.status === 'error' || promptModal.status === 'cancelled') && promptModal.graph"
+              class="btn ghost sm"
+              title="重试：用当时的参数原样重新提交"
+              @click="retryJob(promptModal)"
+            >
+              ↻ 重试
+            </button>
+            <button class="btn ghost sm" @click="copyJobPrompt(promptModal)">⧉ 复制全部</button>
+            <button
+              class="btn sm q-pm-del"
+              title="删除：运行中先中断、排队中先摘除，并移除本地记录"
+              @click="removeModalJob"
+            >
+              ✕ 删除任务
+            </button>
           </div>
         </div>
       </div>
@@ -1361,6 +1534,108 @@ onUnmounted(() => {
 .q-resume {
   color: var(--accent);
   border: 1px solid var(--accent);
+}
+/* 行首查看按钮（提示词弹窗） */
+.q-exp-btn {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: none;
+  color: var(--text-faint);
+  font-size: 12px;
+  cursor: pointer;
+  border-radius: 4px;
+  padding: 0;
+}
+.q-exp-btn:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+/* 提示词弹窗：宽体 + 滚动正文 + 底部操作条 */
+.q-prompt-modal {
+  width: 760px;
+  max-width: 92vw;
+  height: min(640px, 86vh);
+  display: flex;
+  flex-direction: column;
+}
+.q-pm-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.q-prompt-seg {
+  min-width: 0;
+}
+.q-prompt-name {
+  font-size: 11px;
+  color: var(--accent);
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+.q-prompt-val {
+  font-size: 12.5px;
+  line-height: 1.7;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-all;
+  padding: 8px 10px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: var(--bg-2);
+}
+.q-pm-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-top: 1px solid var(--border-soft);
+  flex: none;
+  font-size: 11px;
+  flex-wrap: wrap;
+}
+.q-pm-pos {
+  font-size: 11px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+.q-pm-title {
+  margin: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+}
+.q-pm-title .st-done {
+  color: #22c55e;
+}
+.q-pm-title .st-error {
+  color: var(--err);
+}
+.q-pm-title .st-paused {
+  color: #a78bfa;
+}
+.q-pm-title .st-running {
+  color: var(--cyan);
+}
+.q-pm-del {
+  color: var(--err);
+  border: 1px solid var(--err);
+}
+.q-pm-del:hover {
+  background: #f871711f;
 }
 /* 总进度条（header 下的一根细条） */
 .q-total {
