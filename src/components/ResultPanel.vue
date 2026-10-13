@@ -102,7 +102,17 @@ interface BatchGroup {
   done: number
 }
 const NO_BATCH = '__nobatch__'
-const collapsedBatches = ref(new Set<string>()) // 折叠的批次 key（内存态，默认全展开）
+// 折叠态持久化：刷新后保持上次的批次折叠状态
+const CB_KEY = 'comfyui-studio.collapsedBatches:v1'
+function loadCollapsedBatches(): string[] {
+  try {
+    const r = JSON.parse(localStorage.getItem(CB_KEY) ?? '[]')
+    return Array.isArray(r) ? r.filter((x) => typeof x === 'string') : []
+  } catch {
+    return []
+  }
+}
+const collapsedBatches = ref(new Set<string>(loadCollapsedBatches())) // 折叠的批次 key
 
 const batchGroups = computed<BatchGroup[]>(() => {
   const map = new Map<string, BatchGroup>()
@@ -129,7 +139,46 @@ function toggleBatch(key: string) {
   const s = collapsedBatches.value
   s.has(key) ? s.delete(key) : s.add(key)
   collapsedBatches.value = new Set(s) // 触发响应式
+  try {
+    localStorage.setItem(CB_KEY, JSON.stringify([...s]))
+  } catch {
+    /* ignore */
+  }
 }
+
+// ---- 队列列表高度：底部拖拽条调高（80–600px），持久化 ----
+const QUEUE_H_KEY = 'comfyui-studio.queueBodyH:v1'
+const queueBodyH = ref(118)
+try {
+  const saved = Number(localStorage.getItem(QUEUE_H_KEY))
+  if (saved >= 80 && saved <= 600) queueBodyH.value = Math.round(saved)
+} catch {
+  /* ignore */
+}
+let hDragging = false
+let hDragStartY = 0
+let hDragStartH = 0
+function onHeightDragStart(e: MouseEvent) {
+  hDragging = true
+  hDragStartY = e.clientY
+  hDragStartH = queueBodyH.value
+  e.preventDefault()
+}
+function onHeightDragMove(e: MouseEvent) {
+  if (!hDragging) return
+  queueBodyH.value = Math.max(80, Math.min(600, Math.round(hDragStartH + e.clientY - hDragStartY)))
+}
+function onHeightDragEnd() {
+  if (!hDragging) return
+  hDragging = false
+  try {
+    localStorage.setItem(QUEUE_H_KEY, String(queueBodyH.value))
+  } catch {
+    /* ignore */
+  }
+}
+window.addEventListener('mousemove', onHeightDragMove)
+window.addEventListener('mouseup', onHeightDragEnd)
 
 function batchTime(g: BatchGroup) {
   const d = new Date(g.startedAt)
@@ -1013,7 +1062,7 @@ onUnmounted(() => {
         </button>
         <button class="btn ghost sm" title="不再保留这份快照" @click="dismissBatchSourceSnap()">丢弃</button>
       </div>
-      <div class="q-body">
+      <div class="q-body" :style="{ maxHeight: queueBodyH + 'px' }">
         <div v-if="!state.jobs.length" class="q-empty">队列空 · 任务进度显示在这里</div>
         <template v-for="g in batchGroups" :key="g.key">
           <!-- 批次组头：摘要 + 折叠开关（单任务组也显示，信息一致） -->
@@ -1115,6 +1164,11 @@ onUnmounted(() => {
         </div>
           </template>
         </template>
+      </div>
+
+      <!-- 队列列表高度拖拽条 -->
+      <div class="q-hdrag" title="拖动调整队列列表高度" @mousedown="onHeightDragStart">
+        <span />
       </div>
 
       <!-- 提示词查看弹窗：导航 + 全套操作 -->
@@ -1845,6 +1899,26 @@ onUnmounted(() => {
   flex: none;
   width: 30px;
   text-align: right;
+}
+/* 队列列表高度拖拽条 */
+.q-hdrag {
+  height: 7px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: row-resize;
+  flex: none;
+}
+.q-hdrag span {
+  width: 42px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--border-soft);
+  transition: background 0.15s;
+}
+.q-hdrag:hover span,
+.q-hdrag:active span {
+  background: var(--accent);
 }
 .q-empty {
   font-size: 11.5px;
