@@ -1135,9 +1135,10 @@ async function resumeOne(j: Job): Promise<boolean> {
     const res = await api.submit(base, graph, j.workflow || undefined, j.params ? JSON.stringify(j.params) : undefined)
     const err = extractSubmitError(res, graph)
     if (err) throw new Error(err)
+    const oldPromptId = j.promptId // 先记旧 ID：paused 的旧记录对账不清理，必须在此显式删除
     // 原地更新（不替换对象）：弹窗/列表的引用保持有效
     Object.assign(j, {
-      promptId: String(res.prompt_id), // 重投 = 新 promptId，旧索引记录一并移除
+      promptId: String(res.prompt_id), // 重投 = 新 promptId
       status: 'queued',
       value: 0,
       max: 0,
@@ -1147,7 +1148,7 @@ async function resumeOne(j: Job): Promise<boolean> {
       error: undefined,
       outputs: [],
     })
-    removePendingRec(j.promptId, base)
+    removePendingRec(oldPromptId, base) // 删旧 paused 记录（对新 ID 删除是 no-op，旧记录会永久残留导致刷新后双份）
     return true
   } catch (e) {
     console.warn('[resume] 重投失败', j.promptId, e)
