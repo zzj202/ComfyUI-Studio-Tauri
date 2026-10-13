@@ -136,6 +136,8 @@ export interface Job {
   pinnedWorkerId?: string
   /** 冗余存产出机器的 base：节点被删/改名后仍能收尾、下载、查历史（WS/对账按它路由） */
   base?: string
+  /** 提交批次标记（同一次 runChain 的任务同组）：队列分组折叠用；恢复/重投的旧任务没有 */
+  batchId?: string
   /** 首次发现不在服务器队列的时间（幽灵任务两轮确认用，内部字段） */
   staleSince?: number
   /** 提交时的完整 prompt 图（仅内存留存）：排队任务「改派」到其他节点时带原图重新提交 */

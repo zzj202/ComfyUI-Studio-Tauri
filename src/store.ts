@@ -1061,7 +1061,6 @@ export async function pauseQueue() {
     notify('没有进行中的任务', 'info', 3000)
     return
   }
-  queuePaused.value = true
   const byBase = new Map<string, { run: Job[]; queued: Job[] }>()
   for (const j of active) {
     const b = j.base ?? primaryBase()
@@ -1155,7 +1154,6 @@ export async function resumeQueue() {
   const paused = state.jobs.filter((j) => j.status === 'paused').reverse()
   if (!paused.length) {
     notify('没有已暂停的任务', 'info', 3000)
-    queuePaused.value = false
     return
   }
   const failed: string[] = []
@@ -1166,7 +1164,6 @@ export async function resumeQueue() {
   if (failed.length) {
     notify(`已恢复部分任务，${failed.length} 个重投失败：${failed.join('、')}`, 'warn', 10000)
   } else {
-    queuePaused.value = false
     notify(`已恢复 ${paused.length} 个任务，继续执行`, 'ok', 5000)
   }
 }
@@ -1265,8 +1262,9 @@ interface PendingRec {
  *  确认终态」的记录（如节点离线未完成对账的），防止一次全量重写把别人抹掉 */
 let pendingCache: PendingRec[] | null = null
 
-/** 队列全局暂停：true 时拦截新提交；paused 任务已从 ComfyUI 队列摘除，恢复时重投 */
-export const queuePaused = ref(false)
+/** 队列全局暂停：有 paused 任务即视为暂停中（纯状态推导，刷新/重启后依然生效）——
+ *  拦截新提交；全部恢复或移除后自动解除 */
+export const queuePaused = computed(() => state.jobs.some((j) => j.status === 'paused'))
 
 function loadPendingRecs(): PendingRec[] {
   if (pendingCache) return pendingCache
@@ -1949,6 +1947,7 @@ async function runChain(
 ) {
   let ok = 0
   const done_ = [] as { base: string; promptId: string }[]
+  const batchId = `b${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}` // 批次分组标记
   try {
     for (let i = 0; i < total; i++) {
       const values = collectValues(state.fields.filter((f) => f.kind !== 'multiimage'))
@@ -1976,6 +1975,7 @@ async function runChain(
         workerId: r.workerId,
         base: r.base,
         graph: r.graph,
+        batchId,
       })
       // 防内存膨胀：只清已结束的旧记录（保底 150 条）；排队/运行中的绝不截——
       // 截了 waitForJob 找不到记录会立刻按「已取消」收尾，onExecuting/onProgress

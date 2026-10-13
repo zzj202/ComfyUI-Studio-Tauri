@@ -61,6 +61,13 @@ const qFilter = ref<QFilter>('all')
 const runningCount = computed(() => state.jobs.filter((j) => j.status === 'running').length)
 const queuedCount = computed(() => state.jobs.filter((j) => j.status === 'queued').length)
 const pausedCount = computed(() => state.jobs.filter((j) => j.status === 'paused').length)
+/** 待处理总数（排队+运行+暂停）：>0 说明任务还在队列里，批量快照提示条不该出现 */
+const pendingCount = computed(
+  () =>
+    state.jobs.filter(
+      (j) => j.status === 'queued' || j.status === 'running' || j.status === 'paused'
+    ).length
+)
 const finishedCount = computed(
   () =>
     state.jobs.filter(
@@ -81,6 +88,54 @@ const filteredJobs = computed(() => {
     )
   return state.jobs
 })
+
+// ---- 批次分组：同一次提交（runChain）的任务聚为一组，组头摘要可折叠 ----
+interface BatchGroup {
+  key: string
+  batchId?: string
+  startedAt: number // 组内最早提交时刻
+  jobs: Job[]
+  running: number
+  queued: number
+  paused: number
+  failed: number
+  done: number
+}
+const NO_BATCH = '__nobatch__'
+const collapsedBatches = ref(new Set<string>()) // 折叠的批次 key（内存态，默认全展开）
+
+const batchGroups = computed<BatchGroup[]>(() => {
+  const map = new Map<string, BatchGroup>()
+  for (const j of filteredJobs.value) {
+    const key = j.batchId ?? NO_BATCH
+    let g = map.get(key)
+    if (!g) {
+      g = { key, batchId: j.batchId, startedAt: j.startedAt, jobs: [], running: 0, queued: 0, paused: 0, failed: 0, done: 0 }
+      map.set(key, g)
+    }
+    g.jobs.push(j)
+    g.startedAt = Math.min(g.startedAt, j.startedAt)
+    if (j.status === 'running') g.running++
+    else if (j.status === 'queued') g.queued++
+    else if (j.status === 'paused') g.paused++
+    else if (j.status === 'error' || j.status === 'cancelled') g.failed++
+    else if (j.status === 'done') g.done++
+  }
+  // 新批次在上
+  return [...map.values()].sort((a, b) => b.startedAt - a.startedAt)
+})
+
+function toggleBatch(key: string) {
+  const s = collapsedBatches.value
+  s.has(key) ? s.delete(key) : s.add(key)
+  collapsedBatches.value = new Set(s) // 触发响应式
+}
+
+function batchTime(g: BatchGroup) {
+  const d = new Date(g.startedAt)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
 
 /** 秒级心跳：有运行中任务时每秒跳一下（行内耗时/剩余预估实时刷新），空闲即停 */
 const nowTick = ref(Date.now())
@@ -947,10 +1002,10 @@ onUnmounted(() => {
         </div>
         <span class="q-total-txt">{{ doneRatio }}%</span>
       </div>
-      <!-- 断电保险丝（方案 B）：有批量源文本快照且队列已空 → 提示重投或丢弃 -->
-      <div v-if="batchSourceSnap && !activeJobs.length" class="q-snap">
+      <!-- 断电保险丝（方案 B）：批量源文本快照仅在队列真正清空时提示（暂停/排队中不出现） -->
+      <div v-if="batchSourceSnap && !pendingCount" class="q-snap">
         <span class="q-snap-txt">
-          ⏳ 上次有 <b>{{ batchSourceSnap.count }}</b> 条批量提示词未提交完成（{{ new Date(batchSourceSnap.at).toLocaleString() }}），源文本已留底
+          上次批量提交的 <b>{{ batchSourceSnap.count }}</b> 条提示词已不在队列中（{{ new Date(batchSourceSnap.at).toLocaleString() }}），源文本已留底
         </span>
         <span class="spacer" />
         <button class="btn sm" title="把留底的整段文本重新打开拆行确认弹窗" @click="requeueBatchSourceSnap()">
@@ -960,13 +1015,32 @@ onUnmounted(() => {
       </div>
       <div class="q-body">
         <div v-if="!state.jobs.length" class="q-empty">队列空 · 任务进度显示在这里</div>
-        <div
-          v-for="job in filteredJobs"
-          :key="job.promptId"
-          class="q-row"
-          :class="{ filtered: qFilter !== 'all' }"
-          @contextmenu.prevent="openJobCtx($event, job)"
-        >
+        <template v-for="g in batchGroups" :key="g.key">
+          <!-- 批次组头：摘要 + 折叠开关（单任务组也显示，信息一致） -->
+          <button class="q-batch" :title="`批次 ${batchTime(g)} · 点击${collapsedBatches.has(g.key) ? '展开' : '折叠'}`" @click="toggleBatch(g.key)">
+            <span class="q-batch-tri" :class="{ open: !collapsedBatches.has(g.key) }" />
+            <span class="q-batch-time">{{ g.batchId ? batchTime(g) : '—' }}</span>
+            <span v-if="g.running" class="q-batch-n run">▶{{ g.running }}</span>
+            <span v-if="g.queued" class="q-batch-n">◌{{ g.queued }}</span>
+            <span v-if="g.paused" class="q-batch-n held">⏸{{ g.paused }}</span>
+            <span v-if="g.failed" class="q-batch-n fail">✕{{ g.failed }}</span>
+            <span v-if="g.done" class="q-batch-n ok">✓{{ g.done }}</span>
+            <span class="q-batch-bar">
+              <div
+                class="q-batch-fill"
+                :style="{ width: (g.jobs.length ? Math.round(((g.done + g.failed) / g.jobs.length) * 100) : 0) + '%' }"
+              />
+            </span>
+            <span class="q-batch-pct">{{ g.jobs.length ? Math.round(((g.done + g.failed) / g.jobs.length) * 100) : 0 }}%</span>
+          </button>
+          <template v-if="!collapsedBatches.has(g.key)">
+            <div
+              v-for="job in g.jobs"
+              :key="job.promptId"
+              class="q-row"
+              :class="{ filtered: qFilter !== 'all', 'in-batch': true }"
+              @contextmenu.prevent="openJobCtx($event, job)"
+            >
           <button
             v-if="job.params && Object.keys(job.params).length"
             class="q-exp-btn"
@@ -1039,6 +1113,8 @@ onUnmounted(() => {
             <button class="btn ghost sm" title="复制错误信息" @click="copyErr(job)">⧉ 复制</button>
           </div>
         </div>
+          </template>
+        </template>
       </div>
 
       <!-- 提示词查看弹窗：导航 + 全套操作 -->
@@ -1698,6 +1774,77 @@ onUnmounted(() => {
   overflow-y: auto;
   overflow-x: hidden;
   padding: 0 14px 8px;
+}
+/* 批次组头：摘要行（时间 + 各状态计数 + 总进度） */
+.q-batch {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 3px 4px;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 10.5px;
+  cursor: pointer;
+  border-radius: 4px;
+  text-align: left;
+}
+.q-batch:hover {
+  background: var(--bg-3);
+}
+.q-batch-tri {
+  width: 0;
+  height: 0;
+  border-left: 4px solid var(--text-faint);
+  border-top: 3px solid transparent;
+  border-bottom: 3px solid transparent;
+  transition: transform 0.15s;
+  flex: none;
+}
+.q-batch-tri.open {
+  transform: rotate(90deg);
+}
+.q-batch-time {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+.q-batch-n {
+  font-variant-numeric: tabular-nums;
+  flex: none;
+}
+.q-batch-n.run {
+  color: var(--cyan);
+}
+.q-batch-n.held {
+  color: #a78bfa;
+}
+.q-batch-n.fail {
+  color: var(--err);
+}
+.q-batch-n.ok {
+  color: #22c55e;
+}
+.q-batch-bar {
+  flex: 1;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--bg-3);
+  overflow: hidden;
+  min-width: 40px;
+}
+.q-batch-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent), var(--cyan));
+  transition: width 0.4s ease;
+}
+.q-batch-pct {
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  flex: none;
+  width: 30px;
+  text-align: right;
 }
 .q-empty {
   font-size: 11.5px;
