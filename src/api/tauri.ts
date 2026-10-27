@@ -39,11 +39,15 @@ export const api = {
     }>('list_local_media', { path }),
   /** 读取本地媒体文件字节（base64）：素材面板复制图片/视频截帧用（asset 源跨域污染 canvas，必须 Rust 中转） */
   readLocalFile: (path: string) => invoke<string>('read_local_file', { path }),
+  saveLocalBytes: (dir: string, name: string, b64: string) =>
+    invoke<string>('save_local_bytes', { dir, name, b64 }),
   /** 复制本地文件进应用收藏库（favorites/），返回收藏后的路径（同名覆盖，前端按路径去重） */
   copyToFavorites: (src: string) => invoke<string>('copy_to_favorites', { src }),
   /** 重命名本地目录里的媒体文件（同目录改名），返回新路径；同名已存在则拒绝 */
   renameLocalFile: (path: string, newName: string) =>
     invoke<string>('rename_local_file', { path, newName }),
+  /** 把本地文件移进系统回收站（可还原，不物理删除）；素材面板删除用 */
+  trashLocalFile: (path: string) => invoke('trash_delete_file', { path }),
   /** 批量拆行快照：写一份带 BOM 的可读文本（data/batch-snapshots/<name>.txt，每批一份互不覆盖） */
   writeBatchSnapshot: (name: string, content: string) =>
     invoke<{ ok: boolean; file: string }>('write_batch_snapshot', { name, content }),

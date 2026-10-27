@@ -74,6 +74,16 @@ export async function writePngToClipboard(png: Blob): Promise<void> {
   await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })])
 }
 
+/** Blob → base64（分块拼，防大图 applyArguments 超限）——截帧保存落盘用 */
+export async function blobToB64(blob: Blob): Promise<string> {
+  const buf = new Uint8Array(await blob.arrayBuffer())
+  const chunks: string[] = []
+  for (let i = 0; i < buf.length; i += 0x8000) {
+    chunks.push(String.fromCharCode(...buf.subarray(i, i + 0x8000)))
+  }
+  return btoa(chunks.join(''))
+}
+
 /** 复制本地图片到剪贴板（统一转 PNG：gif/webp/bmp 都能直接粘贴发送） */
 export async function copyLocalImageToClipboard(path: string): Promise<void> {
   const url = b64ToBlobUrl(await api.readLocalFile(path), extMime(path))

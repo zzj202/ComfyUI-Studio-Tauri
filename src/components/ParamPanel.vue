@@ -358,17 +358,17 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .group-body {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
-  gap: 14px 16px;
-  padding: 14px 12px;
+  gap: 10px 14px;
+  padding: 10px 12px;
 }
 /* 模板里配置了同行号的参数 → 一条横向参数行（字段多时自动换行） */
 .param-line {
   grid-column: 1 / -1;
   display: flex;
   flex-wrap: wrap;
-  gap: 14px 16px;
+  gap: 10px 14px;
   align-items: flex-start;
-  padding: 8px 10px;
+  padding: 6px 10px;
   border: 1px dashed var(--border-soft);
   border-radius: var(--radius-sm);
   background: var(--bg-2);
@@ -376,6 +376,14 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .param-line > :deep(.field) {
   flex: 1;
   min-width: 140px;
+}
+/* 参数行内的媒体卡压缩：小缩略图 + 更小的行间距，整行高度不被卡片撑高 */
+.param-line > :deep(.thumb) {
+  width: 56px;
+  height: 56px;
+}
+.param-line > :deep(.img-side) {
+  gap: 5px;
 }
 /* 长文本 / 多图节点：默认占满整行 */
 .group-body > .wide {

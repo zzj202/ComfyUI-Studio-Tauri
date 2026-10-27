@@ -210,6 +210,7 @@ async function save() {
             <span class="conv-item"><code>+</code>暴露但不编号（排在带数字的后面）</span>
             <span class="conv-item"><code>图</code>图片上传卡（图片 / 上传 / image / img 同义）</span>
             <span class="conv-item"><code>多图</code>多图上传（多张 / multiimg 同义）；实际提交数 = 图数 × 批次</span>
+            <span class="conv-item"><code>视频</code>视频上传卡（VHS_LoadVideo 等加载视频节点；vid / video 同义）※ 多输入节点上 图/多图/视频 只套到名字匹配的那个输入，不影响其余参数</span>
             <span class="conv-item"><code>种子</code>随机种子控件（随机 / seed 同义）</span>
             <span class="conv-item"><code>长文</code>多行文本（长文本 / 多行 / textarea 同义）</span>
             <span class="conv-item"><code>文本</code>单行文本（text 同义）</span>

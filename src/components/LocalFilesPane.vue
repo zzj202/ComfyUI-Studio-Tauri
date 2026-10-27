@@ -5,15 +5,15 @@
  * - 缩略图经 convertFileSrc（assetProtocol scope 已全放行）直接显示；视频悬停播放
  * - 打开期间 5s 静默轮询，新文件自动出现
  * - 按住卡片拖到左侧参数区图片卡 = 设为参考图（复用应用内拖拽总线）
- * - 右键：✎ 重命名（行内，扩展名锁定）/ 📂 打开所在位置
- * - 点击卡片 = 预览浮层（视频 ⏮⏸⏭📷 + Q/E/空格/R；图片 ⧉ + Ctrl+C）
+ * - 右键：✎ 重命名（行内，扩展名锁定）/ 🗑 删除（确认后移入系统回收站）/ 📂 打开所在位置
+ * - 点击卡片 = 预览浮层（视频 ⏮⏸⏭📷 + Q/E/空格/R；图片 ⧉ + Ctrl+C；Del 删除）
  */
 import { computed, nextTick, ref, watch } from 'vue'
 import { convertFileSrc } from '@tauri-apps/api/core'
-import { open } from '@tauri-apps/plugin-dialog'
+import { ask, open } from '@tauri-apps/plugin-dialog'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { api } from '../api/tauri'
-import { captureLocalFrame, copyLocalImageToClipboard, writePngToClipboard } from '../core/localMedia'
+import { blobToB64, captureLocalFrame, copyLocalImageToClipboard, writePngToClipboard } from '../core/localMedia'
 import { beginDrag, notify } from '../store'
 import { ui } from '../ui'
 
@@ -248,6 +248,37 @@ async function captureFrame(it: MediaItem) {
   }
 }
 
+/**
+ * 截帧保存到视频所在文件夹（p1.png、p2.png…依次编号，已有文件不覆盖）。
+ * 编号 = 目录里现有 p*.png 的最大号 + 1；保存后静默刷新，新图 5s 轮询内也会自动出现。
+ */
+async function saveFrame(it: MediaItem) {
+  const i = Math.max(it.path.lastIndexOf('\\'), it.path.lastIndexOf('/'))
+  const dir = i > 0 ? it.path.slice(0, i) : ''
+  if (!dir) {
+    notify('拿不到视频所在文件夹', 'warn', 4000)
+    return
+  }
+  const t = pvVideo.value?.currentTime ?? 0
+  notify('正在截取当前帧…', 'info', 2000)
+  try {
+    const png = await captureLocalFrame(it.path, t)
+    // 扫描现有 p*.png 取最大编号（避免覆盖；多窗格/手动放的同名文件都算）
+    const listing = await api.listLocalMedia(dir)
+    let max = 0
+    for (const row of listing.items ?? []) {
+      if (row.isDir) continue
+      const m = /^p(\d+)\.png$/i.exec(String(row.name ?? ''))
+      if (m) max = Math.max(max, Number(m[1]))
+    }
+    const saved = await api.saveLocalBytes(dir, `p${max + 1}.png`, await blobToB64(png))
+    notify(`已保存：${saved}`, 'ok', 5000)
+    void silentRefresh()
+  } catch (e) {
+    notify(`截帧保存失败：${e}`, 'error', 8000)
+  }
+}
+
 /** 复制本地图片到剪贴板（统一转 PNG，gif/webp 都能贴） */
 async function copyImage(it: MediaItem) {
   try {
@@ -258,7 +289,7 @@ async function copyImage(it: MediaItem) {
   }
 }
 
-/** 预览浮层的键盘：Q/E 逐帧、空格播放/暂停、R 截帧、Ctrl+C 复制图片。
+/** 预览浮层的键盘：Q/E 逐帧、空格播放/暂停、R 截帧、Ctrl+C 复制图片、Del 删除（回收站）。
  *  两个窗格各有一份监听，但同一时刻最多一个 preview 非空，不会双触发。 */
 function onPvKey(e: KeyboardEvent) {
   if (!preview.value) return
@@ -271,6 +302,11 @@ function onPvKey(e: KeyboardEvent) {
     return
   }
   if (e.ctrlKey || e.metaKey || e.altKey) return
+  if (k === 'Delete') {
+    e.preventDefault()
+    void deleteItem(preview.value)
+    return
+  }
   if (preview.value.kind !== 'video') return
   if (k === 'q' || k === 'Q') stepPv(-1)
   else if (k === 'e' || k === 'E') stepPv(1)
@@ -278,6 +314,7 @@ function onPvKey(e: KeyboardEvent) {
     e.preventDefault()
     togglePv()
   } else if (k === 'r' || k === 'R') void captureFrame(preview.value)
+  else if (k === 's' || k === 'S') void saveFrame(preview.value)
 }
 window.addEventListener('keydown', onPvKey)
 
@@ -307,6 +344,32 @@ function startRename(it: MediaItem) {
 
 function cancelRename() {
   editingPath.value = null
+}
+
+// ---- 删除（移入系统回收站）：原生确认弹窗 → trash::delete → 本地移除 ----
+const deleting = ref(false)
+
+async function deleteItem(it: MediaItem) {
+  if (deleting.value) return
+  deleting.value = true
+  try {
+    const ok = await ask(`把「${it.name}」移入系统回收站？`, {
+      title: '删除文件',
+      kind: 'warning',
+      okLabel: '移入回收站',
+      cancelLabel: '取消',
+    })
+    if (!ok) return
+    await api.trashLocalFile(it.path)
+    items.value = items.value.filter((x) => x.path !== it.path)
+    if (preview.value?.path === it.path) preview.value = null
+    if (editingPath.value === it.path) editingPath.value = null
+    notify(`已移入回收站：${it.name}（可在回收站还原）`, 'ok', 3000)
+  } catch (e) {
+    notify(`删除失败：${e}`, 'error', 8000)
+  } finally {
+    deleting.value = false
+  }
 }
 
 async function confirmRename() {
@@ -340,7 +403,7 @@ function openCtx(e: MouseEvent, it: MediaItem) {
   if (it.isDir) return
   ctx.value = {
     x: Math.min(e.clientX, window.innerWidth - 190),
-    y: Math.min(e.clientY, window.innerHeight - 100),
+    y: Math.min(e.clientY, window.innerHeight - 130),
     item: it,
   }
 }
@@ -473,6 +536,7 @@ window.addEventListener('click', onDocClick)
       @contextmenu.prevent
     >
       <button class="lf-ctx-item" @click="ctxRun((it) => startRename(it))">✎ 重命名</button>
+      <button class="lf-ctx-item danger" @click="ctxRun((it) => deleteItem(it))">🗑 删除（回收站）</button>
       <button class="lf-ctx-item" @click="ctxRun((it) => revealItemInDir(it.path).catch(() => {}))">
         📂 打开所在位置
       </button>
@@ -503,9 +567,19 @@ window.addEventListener('click', onDocClick)
           <button class="btn sm" title="截取当前画面（R）：只进剪贴板，Ctrl+V 即用" @click="captureFrame(preview)">
             📷 截帧
           </button>
+          <button
+            class="btn sm"
+            title="截取当前帧保存到视频所在文件夹（S）：p1.png、p2.png…依次编号，不覆盖已有"
+            @click="saveFrame(preview)"
+          >
+            📸 存文件夹
+          </button>
         </template>
         <button v-if="preview.kind === 'image'" class="btn sm" title="复制图片（Ctrl+C，可直接粘贴发送）" @click="copyImage(preview)">
           ⧉ 复制
+        </button>
+        <button class="btn sm ghost danger" title="移入系统回收站（Delete）" :disabled="deleting" @click="deleteItem(preview)">
+          🗑
         </button>
         <span class="mono" :title="preview.path">{{ preview.name }}</span>
         <span class="spacer" />
@@ -742,6 +816,14 @@ window.addEventListener('click', onDocClick)
 .lf-ctx-item:hover {
   background: var(--accent-soft);
   color: var(--accent);
+}
+.lf-ctx-item.danger:hover {
+  background: rgba(232, 78, 78, 0.14);
+  color: var(--err, #e84e4e);
+}
+.btn.danger:not(:disabled):hover {
+  color: var(--err, #e84e4e);
+  border-color: rgba(232, 78, 78, 0.45);
 }
 /* 预览浮层 */
 .lf-preview {

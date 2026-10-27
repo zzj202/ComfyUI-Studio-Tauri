@@ -173,6 +173,17 @@ pub fn rename_local_file(path: String, new_name: String) -> Result<String, Strin
     Ok(dest.to_string_lossy().to_string())
 }
 
+/// 把本地文件移进系统回收站（可还原，不物理删除）。素材面板右键「删除」用：
+/// 用户浏览的是自己的 Downloads / 桌面文件夹，直接 fs::remove 太危险，一律走回收站。
+#[command]
+pub fn trash_delete_file(path: String) -> Result<(), String> {
+    let p = PathBuf::from(&path);
+    if !p.is_file() {
+        return Err("文件不存在（可能已删除或路径失效）".into());
+    }
+    trash::delete(&p).map_err(|e| format!("移入回收站失败：{}", e))
+}
+
 /// 把一个本地文件复制进应用收藏库（favorites/），返回收藏后的完整路径。
 /// 「收藏」条用：素材集中存放在应用数据目录里，而不是引用散落各处的原始路径。
 /// 同名文件覆盖（重复添加同一文件只留一份，前端按路径去重）。
@@ -426,6 +437,37 @@ pub fn read_local_file(path: String) -> Result<String, String> {
     let bytes = fs::read(&p).map_err(|e| format!("读取文件失败：{}", e))?;
     use base64::Engine as _;
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+}
+
+/// 把字节（base64）写到指定目录下的文件——素材面板「截帧保存」用：
+/// PNG 帧存进视频所在目录（p1.png、p2.png…依次编号，编号由前端扫描生成）。
+/// 安全限制：只允许图片扩展名；目录必须已存在；目标已存在报错（防覆盖）。
+#[command]
+pub fn save_local_bytes(dir: String, name: String, b64: String) -> Result<String, String> {
+    let n = safe_name(&name)?;
+    let ext = n
+        .rsplit('.')
+        .next()
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    const IMAGES: &[&str] = &["png", "jpg", "jpeg", "webp", "gif", "bmp"];
+    if !IMAGES.contains(&ext.as_str()) {
+        return Err("只支持保存图片文件".into());
+    }
+    let d = PathBuf::from(dir.trim());
+    if !d.is_dir() {
+        return Err(format!("目录不存在：{}", dir));
+    }
+    let path = d.join(&n);
+    if path.exists() {
+        return Err(format!("文件已存在：{}", n));
+    }
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim().as_bytes())
+        .map_err(|e| format!("base64 解码失败：{}", e))?;
+    fs::write(&path, bytes).map_err(|e| format!("写入文件失败：{}", e))?;
+    Ok(path.to_string_lossy().to_string())
 }
 
 #[command]

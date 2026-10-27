@@ -322,6 +322,18 @@ fn mime_for(name: &str) -> &'static str {
         "image/gif"
     } else if n.ends_with(".bmp") {
         "image/bmp"
+    } else if n.ends_with(".mp4") || n.ends_with(".m4v") {
+        "video/mp4"
+    } else if n.ends_with(".webm") {
+        "video/webm"
+    } else if n.ends_with(".mov") {
+        "video/quicktime"
+    } else if n.ends_with(".mkv") {
+        "video/x-matroska"
+    } else if n.ends_with(".avi") {
+        "video/x-msvideo"
+    } else if n.ends_with(".flv") {
+        "video/x-flv"
     } else {
         "application/octet-stream"
     }

@@ -48,6 +48,26 @@ const SELECT_BY_NAME = /(_name|sampler|scheduler|model|vae|lora|control_net|upsc
 
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i
 
+/** 视频文件扩展名（VHS_LoadVideo 等加载视频节点的值/选项） */
+export const VIDEO_EXT = /\.(mp4|webm|mov|mkv|avi|m4v|flv)$/i
+
+/** 加载视频节点类名（VHS_LoadVideo / LoadVideo / LoadVideoUpload 等） */
+const VIDEO_LOADER_RE = /loadvideo|vhs_/i
+
+/** 加载视频节点的输入名 → 内置中文标签（组件级映射，不依赖定制模板/标题约定） */
+const VIDEO_INPUT_LABELS: Record<string, string> = {
+  video: '视频',
+  force_rate: '强制帧率',
+  custom_width: '自定义宽度',
+  custom_height: '自定义高度',
+  frame_load_cap: '帧数上限',
+  skip_first_frames: '跳过开头帧',
+  select_every_nth: '隔帧抽取',
+  format: '帧格式',
+  load_cap: '帧数上限',
+  offset_frames: '跳过开头帧',
+}
+
 export function isApiGraph(g: any): boolean {
   if (!g || typeof g !== 'object' || Array.isArray(g)) return false
   return Object.values(g).some((n: any) => n && typeof n === 'object' && n.class_type)
@@ -107,7 +127,21 @@ export function parseGraph(graph: any, objectInfo?: Record<string, any> | null):
       // 标题约定覆盖自动推断（模板绑定之后在 buildFields 里还能再覆盖一层）
       // 显示名只在节点只有一个可编辑输入时生效，多输入节点保留输入名、标题作分组名
       if (info.label && editable.length === 1) field.label = info.label
-      if (info.kindHint) field.kind = info.kindHint
+      // 加载视频节点：输入名是英文技术参数 → 套内置中文标签（标题已起名时不覆盖）
+      if (VIDEO_LOADER_RE.test(classType) && field.label === inputName) {
+        field.label = VIDEO_INPUT_LABELS[inputName] ?? field.label
+      }
+      if (info.kindHint) {
+        // 功能词控件提示：单输入节点直接套；多输入节点（如 VHS_LoadVideo 的
+        // 「加载视频|视频|20」）的图/多图/视频提示只套到名字对应的输入上，
+        // 防止整节点的数字/下拉全被改成媒体上传卡
+        const h = info.kindHint
+        const mediaHint =
+          h === 'video' ? /video/i : h === 'image' || h === 'multiimage' ? /image|img/i : null
+        if (editable.length === 1 || !mediaHint || mediaHint.test(inputName)) {
+          field.kind = h
+        }
+      }
       if (info.num != null) {
         field.row = info.num // 相同数字 → 同一行
         field.titleNum = info.num
@@ -164,9 +198,18 @@ function buildField(ctx: BuildCtx): FieldSchema | null {
     const o = opts ?? {}
 
     if (Array.isArray(type)) {
+      const list = type.map((x) => String(x))
+      // 加载视频节点（VHS_LoadVideo 等）：下拉选项全是视频文件 → 视频上传卡
+      const vidHits = list.filter((x) => VIDEO_EXT.test(x))
+      if (list.length && (vidHits.length === list.length || VIDEO_EXT.test(String(ctx.raw ?? '')))) {
+        f.kind = 'video'
+        f.options = list
+        f.value = ctx.raw == null ? (list[0] ?? '') : String(ctx.raw)
+        return f
+      }
       f.kind = 'select'
-      f.options = type.map((x) => String(x))
-      f.value = ctx.raw == null ? (f.options[0] ?? '') : String(ctx.raw)
+      f.options = list
+      f.value = ctx.raw == null ? (list[0] ?? '') : String(ctx.raw)
       return f
     }
     if (type === 'BOOLEAN') {
@@ -219,6 +262,17 @@ function buildField(ctx: BuildCtx): FieldSchema | null {
   const rawStr = String(ctx.raw ?? '')
   if (name === 'image' || (name.includes('image') && IMAGE_EXT.test(rawStr))) {
     f.kind = 'image'
+    f.value = ctx.raw == null ? '' : rawStr
+    return f
+  }
+  // 未连线的 video 类输入必然是服务器上的视频文件名（VHS_LoadVideo / LoadVideo 等）
+  const videoNode = /loadvideo|vhs_/i.test(ctx.classType)
+  if (
+    (name === 'video' && videoNode) ||
+    (name.includes('video') && VIDEO_EXT.test(rawStr)) ||
+    (videoNode && name === 'video')
+  ) {
+    f.kind = 'video'
     f.value = ctx.raw == null ? '' : rawStr
     return f
   }
@@ -334,4 +388,5 @@ export const KIND_LABELS: Record<FieldKind, string> = {
   toggle: '开关',
   image: '图片',
   multiimage: '多图上传',
+  video: '视频',
 }

@@ -7,6 +7,7 @@ export type FieldKind =
   | 'toggle'
   | 'image'
   | 'multiimage'
+  | 'video'
 
 export type FieldAction = 'randomize' | 'clear' | 'step'
 

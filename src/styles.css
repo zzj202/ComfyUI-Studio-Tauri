@@ -333,11 +333,16 @@ textarea {
 .field-label .name {
   color: var(--text);
   font-weight: 500;
+  white-space: nowrap; /* 中文名不折行（「自定义高度」不再断成两行） */
 }
 .field-label .code {
   color: var(--text-faint);
   font-size: 11px;
   font-family: ui-monospace, 'Cascadia Code', Consolas, monospace;
+  min-width: 0;
+  overflow: hidden; /* 放不下时省略号，而不是把中文名挤折行 */
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .card {

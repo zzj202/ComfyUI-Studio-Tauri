@@ -676,26 +676,35 @@ export async function renameWorkflow(oldName: string, newName: string) {
 }
 
 /**
- * 把一份结果资产设为某个工作流的参考图（拖资产到工作流卡片）：
- * 切到该模板（已在当前则不重载）→ 应用到第一个图片字段（单图）或多图字段追加。
+ * 把一份结果资产设为某个工作流的参考素材（拖资产到工作流卡片）：
+ * 图片资产 → 第一个图片字段（单图）或多图字段追加；视频资产 → 第一个视频字段。
  * 复用 FieldControl 的取值规则：input 里已有文件直接引用并记上传源；output 先 copyToInput 到主节点。
  */
 export async function applyAssetToWorkflow(a: Asset, wfName: string) {
-  if (a.kind !== 'image') {
-    notify('只有图片能设为参考图', 'warn')
+  if (a.kind !== 'image' && a.kind !== 'video') {
+    notify('只有图片/视频能设为参考素材', 'warn')
     return
   }
   try {
     if (state.currentWorkflow !== wfName) await selectWorkflow(wfName)
-    let field = state.fields.find((f) => f.kind === 'image')
+    let field: FieldSchema | undefined
     let multi = false
-    if (!field) {
-      field = state.fields.find((f) => f.kind === 'multiimage')
-      multi = true
-    }
-    if (!field) {
-      notify(`「${wfName}」没有图片字段，无法设参考图`, 'warn', 5000)
-      return
+    if (a.kind === 'video') {
+      field = state.fields.find((f) => f.kind === 'video')
+      if (!field) {
+        notify(`「${wfName}」没有视频字段，无法设参考视频`, 'warn', 5000)
+        return
+      }
+    } else {
+      field = state.fields.find((f) => f.kind === 'image')
+      if (!field) {
+        field = state.fields.find((f) => f.kind === 'multiimage')
+        multi = true
+      }
+      if (!field) {
+        notify(`「${wfName}」没有图片字段，无法设参考图`, 'warn', 5000)
+        return
+      }
     }
     let path: string
     if (a.type === 'input') {
@@ -714,7 +723,7 @@ export async function applyAssetToWorkflow(a: Asset, wfName: string) {
     } else {
       field.value = path
     }
-    notify(`已设为「${wfName}」的参考图`, 'ok', 3000)
+    notify(a.kind === 'video' ? `已设为「${wfName}」的参考视频` : `已设为「${wfName}」的参考图`, 'ok', 3000)
   } catch (e) {
     notify(`引用资产失败：${e}`, 'error', 8000)
   }
@@ -1648,10 +1657,7 @@ watch(submitWorkerId, (v) => {
 
 export function submit(batch = submitBatch.value) {
   ensureAudio() // 用户手势时机预热 AudioContext（完成音效需要）
-  if (queuePaused.value) {
-    notify('队列已暂停，请先点「▶ 恢复」再提交', 'warn', 4000)
-    return
-  }
+  // 暂停中的任务保持暂停、不参与调度（已从 ComfyUI 队列摘除），新提交照常优先执行
   if (!state.graph) {
     notify('请先选择一个工作流', 'warn')
     return
@@ -1745,10 +1751,7 @@ function submitBatchText(
   count = submitBatch.value
 ) {
   ensureAudio()
-  if (queuePaused.value) {
-    notify('队列已暂停，请先点「▶ 恢复」再提交', 'warn', 4000)
-    return
-  }
+  // 与 submit() 一致：暂停态不拦截，新批量照常提交，paused 任务留待手动恢复
   if (!state.graph) {
     notify('请先选择一个工作流', 'warn')
     return
@@ -1906,10 +1909,14 @@ async function dispatchOne(
       )
     }
     try {
-      // 图片字段按需转存到目标机（patched 只覆盖 image/multiimage 两类，其余值原样）
+      // 图片/视频字段按需转存到目标机（patched 只覆盖 image/multiimage/video 三类，其余值原样）
       const patched: Record<string, any> = { ...values }
       for (const f of state.fields) {
-        if (f.kind === 'image' && typeof values[f.key] === 'string' && values[f.key]) {
+        if (
+          (f.kind === 'image' || f.kind === 'video') &&
+          typeof values[f.key] === 'string' &&
+          values[f.key]
+        ) {
           patched[f.key] = await ensureOnWorker(values[f.key], target)
         } else if (f.kind === 'multiimage' && Array.isArray(values[f.key])) {
           const out: string[] = []

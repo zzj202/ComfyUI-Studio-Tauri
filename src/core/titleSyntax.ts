@@ -14,6 +14,9 @@ import type { FieldKind } from './types'
  *   +              暴露但不编号（排在带数字的后面）
  *   图/图片/上传    暴露 + 图片上传卡
  *   多图/多张       暴露 + 多图上传（多张图各跑一次，图数 × 批次 = 提交数）
+ *   视频/vid        暴露 + 视频上传卡（VHS_LoadVideo 等加载视频节点）
+ *                    ※ 多输入节点上，图/多图/视频 只套到名字对应的输入
+ *                      （如 VHS_LoadVideo 只影响 video，不碰其余数字/下拉）
  *   种子/随机       暴露 + 随机种子
  *   长文/长文本/多行 暴露 + 多行文本
  *   数字(词)        暴露 + 数字控件（纯数字 token 是排序号，汉字「数字」是控件）
@@ -73,6 +76,7 @@ const KIND_ALIASES: [string, FieldKind][] = [
   ['图片', 'image'],
   ['多图', 'multiimage'],
   ['多张', 'multiimage'],
+  ['视频', 'video'],
   ['长文本', 'textarea'],
   ['上传', 'image'],
   ['随机', 'seed'],
@@ -90,6 +94,8 @@ const KIND_ALIASES: [string, FieldKind][] = [
   ['image', 'image'],
   ['img', 'image'],
   ['multiimg', 'multiimage'],
+  ['vid', 'video'],
+  ['video', 'video'],
   ['seed', 'seed'],
   ['textarea', 'textarea'],
   ['number', 'number'],

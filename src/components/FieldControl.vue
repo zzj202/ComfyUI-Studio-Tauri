@@ -22,7 +22,7 @@ import {
   recordImageOrigin,
   state,
 } from '../store'
-import { randomSeed } from '../core/parseWorkflow'
+import { randomSeed, VIDEO_EXT } from '../core/parseWorkflow'
 
 const props = defineProps<{ field: FieldSchema }>()
 
@@ -74,6 +74,21 @@ function inputUrl(v: string): string | null {
 
 /** 图片字段预览 */
 const imgPreviewUrl = computed(() => (props.field.kind === 'image' ? inputUrl(String(props.field.value ?? '')) : null))
+
+/** 视频字段预览地址（值形如 "xxx.mp4" 或 "子目录/xxx.mp4"；回源逻辑与图片一致） */
+const vidPreviewUrl = computed(() => {
+  if (props.field.kind !== 'video') return null
+  const s = String(props.field.value ?? '').trim()
+  if (!s || !VIDEO_EXT.test(s)) return null
+  const i = s.indexOf('/')
+  const sub = i >= 0 ? s.slice(0, i) : ''
+  const name = i >= 0 ? s.slice(i + 1) : s
+  try {
+    return viewUrl(imageOriginBase(s), name, sub, 'input')
+  } catch {
+    return null
+  }
+})
 
 /** 多图字段的值：服务器文件名列表 */
 const imgList = computed<string[]>(() => {
@@ -142,6 +157,68 @@ async function pickAndUpload() {
   })
   if (!picked || Array.isArray(picked)) return
   await uploadPath(picked)
+}
+
+// ---- 视频字段（VHS_LoadVideo / LoadVideo 等）：上传卡 + 服务器视频列表 ----
+
+const vidOptions = ref<string[] | null>(
+  (props.field.options ?? []).length ? props.field.options!.map(String) : null
+)
+
+/** 拉服务器上该节点 video 输入的文件列表（VHS 的 combo 定义在 object_info 里） */
+async function loadVideoOptions() {
+  if (vidOptions.value) return
+  try {
+    const def = await api.objectInfo(primaryBase(), props.field.classType)
+    const nodeDef = def?.[props.field.classType]
+    const list =
+      nodeDef?.input?.required?.[props.field.inputName]?.[0] ??
+      nodeDef?.input?.optional?.[props.field.inputName]?.[0]
+    vidOptions.value = Array.isArray(list) ? list.map(String) : []
+  } catch {
+    vidOptions.value = []
+  }
+}
+
+async function refreshVideos() {
+  vidOptions.value = null
+  await loadVideoOptions()
+}
+
+/** 上传本地视频并替换当前值（与图片同链路：主节点 input/studio，跨机派发时按需转存） */
+async function uploadVideoPath(path: string) {
+  uploading.value = true
+  try {
+    const base = primaryBase()
+    const res = await api.uploadImage(base, path, undefined, 'studio', true)
+    const name = String(res?.name ?? '')
+    const sub = String(res?.subfolder ?? 'studio')
+    const value = name ? (sub ? `${sub}/${name}` : name) : null
+    if (value) {
+      recordImageOrigin(value, base)
+      await loadVideoOptions()
+      props.field.value = value
+      notify('已上传视频', 'ok', 2500)
+    }
+  } catch (e) {
+    notify(`上传失败：${e}`, 'error', 8000)
+  } finally {
+    uploading.value = false
+  }
+}
+
+async function pickAndUploadVideo() {
+  const picked = await open({
+    multiple: false,
+    filters: [{ name: '视频', extensions: ['mp4', 'webm', 'mov', 'mkv', 'avi', 'm4v', 'flv'] }],
+  })
+  if (!picked || Array.isArray(picked)) return
+  await uploadVideoPath(picked)
+}
+
+function clearVideo() {
+  props.field.value = ''
+  notify('已清空视频', 'ok', 1500)
 }
 
 // ---- 多图节点：追加式上传 ----
@@ -246,6 +323,9 @@ onMounted(() => {
   } else if (k === 'multiimage') {
     imageDropTargets.set(props.field.key, (p) => addOne(p))
     assetDropTargets.set(props.field.key, (a) => applyAsset(a))
+  } else if (k === 'video') {
+    imageDropTargets.set(props.field.key, (p) => uploadVideoPath(p))
+    assetDropTargets.set(props.field.key, (a) => applyAsset(a))
   }
 })
 onUnmounted(() => {
@@ -253,10 +333,12 @@ onUnmounted(() => {
   assetDropTargets.delete(props.field.key)
 })
 
-/** 把一份结果资产设为参考图：input 里的直接引用，output/temp 先让服务器转存进 input */
+/** 把一份结果资产设为参考素材：input 里的直接引用，output/temp 先让服务器转存进 input。
+ *  图片字段收图片资产，视频字段收视频资产。 */
 async function applyAsset(a: Asset) {
-  if (a.kind !== 'image') {
-    notify('只有图片能设为参考图', 'warn')
+  const wantVideo = props.field.kind === 'video'
+  if (a.kind !== (wantVideo ? 'video' : 'image')) {
+    notify(wantVideo ? '只有视频能设为参考视频' : '只有图片能设为参考图', 'warn')
     return
   }
   try {
@@ -271,14 +353,15 @@ async function applyAsset(a: Asset) {
       const sub = String(res?.subfolder ?? 'studio')
       path = sub ? `${sub}/${res.name}` : String(res.name)
       recordImageOrigin(path, base)
-      await loadImageOptions()
+      if (wantVideo) await loadVideoOptions()
+      else await loadImageOptions()
     }
-    if (props.field.kind === 'image') {
+    if (props.field.kind === 'video' || props.field.kind === 'image') {
       props.field.value = path
     } else if (props.field.kind === 'multiimage') {
       ensureList().push(path)
     }
-    notify('已设为参考图', 'ok', 2000)
+    notify(wantVideo ? '已设为参考视频' : '已设为参考图', 'ok', 2000)
   } catch (e) {
     notify(`引用资产失败：${e}`, 'error', 8000)
   }
@@ -464,6 +547,7 @@ function swapText() {
 }
 
 if (props.field.kind === 'image') loadImageOptions()
+if (props.field.kind === 'video') loadVideoOptions()
 </script>
 
 <template>
@@ -660,6 +744,48 @@ if (props.field.kind === 'image') loadImageOptions()
         <button class="btn sm ghost" title="清空全部图片" @click="clearImages">⌫ 清空</button>
       </div>
       <div class="multi-tip">提交时按顺序逐张 × 批次数（每张图提交批次数次，每次自动随机种子）；可拖图片文件进来，或点卡片后 Ctrl+V——资源管理器里复制的多张图也能一次全贴上</div>
+    </div>
+
+    <!-- 视频：内联预览缩略卡 + 服务器视频选择；卡片也是拖拽上传的落点 -->
+    <div
+      v-else-if="field.kind === 'video'"
+      class="img-card"
+      :data-image-key="field.key"
+      tabindex="0"
+      title="可把视频文件直接拖到卡片上"
+    >
+      <button
+        class="thumb"
+        :title="uploading ? '上传中…' : '点击上传视频，或直接把视频文件拖到这张卡片上'"
+        @click="pickAndUploadVideo"
+      >
+        <video v-if="vidPreviewUrl" :src="vidPreviewUrl" muted preload="metadata" />
+        <span v-else class="ph">{{ uploading ? '…' : '🎬' }}</span>
+      </button>
+      <div class="img-side">
+        <select
+          v-if="(vidOptions ?? []).length"
+          v-model="field.value"
+          class="select"
+          @focus="loadVideoOptions"
+        >
+          <option v-for="o in vidOptions ?? []" :key="o" :value="o">{{ o }}</option>
+        </select>
+        <input
+          v-else
+          v-model="field.value"
+          class="input"
+          placeholder="服务器上的视频，如 studio/a.mp4"
+          @focus="loadVideoOptions"
+        />
+        <div class="img-btns">
+          <button class="btn sm" :disabled="uploading" @click="pickAndUploadVideo">
+            {{ uploading ? '上传中…' : '上传视频' }}
+          </button>
+          <button class="btn sm ghost" title="清空已选视频" @click="clearVideo">⌫ 清空</button>
+          <button class="btn sm ghost" title="重新拉取服务器视频列表" @click="refreshVideos">⟳</button>
+        </div>
+      </div>
     </div>
 
     <!-- 兜底：单行文本 -->
@@ -924,7 +1050,8 @@ if (props.field.kind === 'image') loadImageOptions()
 .thumb:hover {
   border-color: var(--accent);
 }
-.thumb img {
+.thumb img,
+.thumb video {
   width: 100%;
   height: 100%;
   object-fit: cover;

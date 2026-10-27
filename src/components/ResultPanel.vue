@@ -1018,7 +1018,7 @@ onUnmounted(() => {
         <button
           v-if="activeJobs.length"
           class="btn ghost sm q-stop"
-          title="暂停：中断运行中的任务、摘除排队的任务（参数与执行图保留，可一键恢复）"
+          title="暂停：中断运行中的任务、摘除排队的任务（参数与执行图保留，可一键恢复）；暂停期间仍可提交新任务，新任务优先执行"
           @click="pauseQueue"
         >
           ⏸ 暂停
