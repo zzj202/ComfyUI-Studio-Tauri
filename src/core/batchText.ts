@@ -3,8 +3,9 @@
  *
  * 两种模式（自动识别，无需选择）：
  * 1. 编号块模式——分镜/步骤类文本：每块以编号起始行开头（跨多行），整块 = 一条提示词。
- *    识别的编号形式：`1️⃣ 标题`、`1. / 1、/ 1) / 1） / 1: / 1：`、`【1】`、`【第 1 条｜标题】`、
- *    `提示词 1：标题`、`[1]`、`[Shot 1]`、`#1`。
+ *    识别的编号形式：`1️⃣ 标题`、`1. / 1、/ 1) / 1） / 1: / 1： / 01｜标题`、`【1】`、
+ *    `【第 1 条｜标题】`、`提示词 1：标题`、`[1]`、`[Shot 1]`、`#1`，以及无数字的
+ *    `【纯中文标题】`（≥4 字符，按出现顺序赋号）。
  *    触发条件：全文 ≥2 个编号起始行且编号严格递增（连续性校验防误伤普通文本）。
  *    块内清洗：丢弃空行、孤立的代码栏标记行（``` / plaintext / json）与
  *    纯分隔线行（======== / -------- 等 ≥6 个同一分隔字符）。
@@ -50,7 +51,7 @@ function blockStartNum(line: string): number | null {
   if (m) return Number(m[1])
   m = line.match(/^\s*[【\[]\s*[^\d】\]]{0,10}?(\d{1,3})\s*[】\]]/) // [Shot 1] / 【镜头01】（前缀词+编号）
   if (m) return Number(m[1])
-  m = line.match(/^\s*(\d{1,3})\s*[.、)）：:]\s*\S/) // 1. / 1、 / 1) / 1） / 1: / 1：
+  m = line.match(/^\s*(\d{1,3})\s*[.、)）：:｜]\s*\S/) // 1. / 1、 / 1) / 1） / 1: / 1： / 01｜标题（数字+全角竖线编号式）
   if (m) return Number(m[1])
   m = line.match(/^\s*#{1,4}\s*(\d+)\b/) // #1 / ##1
   if (m) return Number(m[1])
@@ -61,8 +62,18 @@ export function splitBatchLines(text: string): string[] {
   const lines = text.split(/\r?\n/).map((s) => s.replace(/\s+$/, ''))
 
   // ---- 编号块模式：≥2 个编号起始行且编号严格递增 → 整块 = 一条 ----
+  // 【纯标题】行（括号内无数字、正文 ≥4 字符）：无编号但意图明确的块起点，
+  // 按出现顺序赋号 1..n 参与递增校验。≥4 字符是防聊天记录导出的【图片】【表情】
+  // 这类 2-3 字短词被误当块起点；含数字的【01｜标题】/【第 1 条】走 blockStartNum。
+  let titleSeq = 0
   const starts = lines
-    .map((l, i) => ({ i, n: blockStartNum(l) }))
+    .map((l, i) => {
+      const n = blockStartNum(l)
+      if (n != null) return { i, n }
+      const m = l.match(/^\s*【([^】\d]{4,})】\s*$/)
+      if (m) return { i, n: ++titleSeq }
+      return { i, n: null }
+    })
     .filter((x): x is { i: number; n: number } => x.n != null)
   if (starts.length >= 2) {
     const nums = starts.map((s) => s.n)

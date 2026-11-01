@@ -538,7 +538,14 @@ async function restoreQueueFromServer() {
     if (!job) continue
     if (job.status === 'done') doneRecovered++
     else if (job.status === 'queued') {
-      // /queue 和 /history 都没有 → 服务端已被清空
+      // 判「已消失」前复查一次 /history：第一次 finishJob 的拉取可能因
+      // 网络抖动/节点比应用晚启动而失败——查询失败 ≠ 服务端已清空，留给下次对账
+      try {
+        const again = await api.historyItem(rec.base, rec.promptId)
+        if (again?.[rec.promptId]) continue // 其实有记录：并行的 finishJob 实例会补收
+      } catch {
+        continue // 节点暂时不可达：不误杀
+      }
       job.status = 'cancelled'
       job.error = '服务端队列中已不存在（可能被外部中断或清空）'
       job.finishedAt = Date.now()
@@ -862,6 +869,9 @@ function connectWs() {
       onError: ({ promptId, message }) => {
         const job = state.jobs.find((j) => j.base === base && j.promptId === promptId)
         if (job) {
+          // 暂停任务被 /interrupt 的余波（execution_error 类事件）不改状态：
+          // paused 是用户意图，恢复时按原图重投，这里翻成 error 会毁掉恢复索引
+          if (job.status === 'paused') return
           job.status = 'error'
           job.error = message
           job.finishedAt = Date.now()
@@ -965,7 +975,8 @@ async function reapStaleJobs(base: string) {
 
 async function finishJob(promptId: string, base: string) {
   const job = state.jobs.find((j) => j.base === base && j.promptId === promptId)
-  if (!job || job.status === 'done' || job.status === 'error') return
+  // paused 同列守卫：暂停任务被 interrupt 后 finishing 事件（如 history 补记）不得改写状态
+  if (!job || job.status === 'done' || job.status === 'error' || job.status === 'paused') return
   try {
     const res = await api.historyItem(base, promptId)
     const entry = res?.[promptId]
@@ -1090,7 +1101,7 @@ export async function pauseQueue() {
       try {
         await api.interrupt(base)
       } catch {
-        failed.push(workerName(base))
+        failed.push(base)
       }
     }
     if (queued.length) {
@@ -1100,15 +1111,20 @@ export async function pauseQueue() {
           queued.map((j) => j.promptId)
         )
       } catch {
-        failed.push(workerName(base))
+        failed.push(base)
       }
     }
   }
   // 摘除/中断成功的转 paused（graph/params 完整保留）；操作失败的保持原状态
-  // （任务实际还在跑/在队列，恢复时不能重投，否则重复出图）
+  // （任务实际还在跑/在队列，恢复时不能重投，否则重复出图）。
+  // 只转此刻仍为 queued/running 的：若 interrupt 的 error 事件先到把任务标成了
+  // error，就不能再盖回 paused（僵尸暂停任务恢复时会重投一个已失败的任务）。
+  // failed 按 base 匹配（存显示名时两个同名节点会互相误伤）。
   for (const j of active) {
-    const failedNode = failed.includes(workerName(j.base ?? primaryBase()))
-    if (!failedNode) j.status = 'paused'
+    const failedNode = failed.includes(j.base ?? primaryBase())
+    if (!failedNode && (j.status === 'queued' || j.status === 'running')) {
+      j.status = 'paused'
+    }
   }
   persistPendingJobs()
   if (failed.length) {
@@ -1545,7 +1561,15 @@ function waitForJob(promptId: string, base: string, timeoutMs = 2 * 60 * 60 * 10
     let missingSince = 0 // 记录消失的起始时刻（改派换绑/清理竞态时短暂找不到）
     const timer = window.setInterval(() => {
       const job = state.jobs.find((j) => j.base === base && j.promptId === promptId)
-      if (job && (job.status === 'done' || job.status === 'error' || job.status === 'cancelled')) {
+      if (
+        job &&
+        (job.status === 'done' ||
+          job.status === 'error' ||
+          job.status === 'cancelled' ||
+          job.status === 'paused')
+      ) {
+        // paused 也按终态收尾：暂停提交链不让它干等 2h 超时（否则 activeChains
+        // 恒>0，之后每次新提交都被误判撞车链整链重掷种子），恢复后产出照常落资产
         clearInterval(timer)
         resolve(job.status === 'done')
       } else if (!job) {
@@ -2329,7 +2353,7 @@ export async function pinJobToWorker(job: Job, workerId: string) {
       return
     }
   } catch {
-    // 拉不到 /queue 就按「仍在队列」处理，与 promoteJob 的兜底一致
+    // 拉不到 /queue 就按「仍在队列」处理，与改派（requeueJob）的兜底一致
   }
   try {
     const res = await api.submit(
@@ -2412,91 +2436,6 @@ export async function retryJob(job: Job) {
     notify(`重试提交失败：${e}`, 'error', 8000)
   }
   void refreshQueue()
-}
-
-/**
- * 排队插队：让这个任务成为它所在节点的「下一个执行」。
- * ComfyUI 队列是 FIFO 且不支持优先级——做法：摘除该机全部 pending，
- * 按「目标 → 其余（原执行顺序）」立刻重新提交（提交顺序即队列顺序）。
- * 防重复烧卡：摘除瞬间某个任务可能刚好开跑/完成——先拉服务器 /queue 核对，
- * 只重新提交确认还在 pending 里的；已在 running 的让它继续跑，不动。
- */
-export async function promoteJob(job: Job) {
-  if (job.status !== 'queued') return
-  if (!job.graph) {
-    notify('这个任务没有留存提交数据，无法插队', 'warn', 6000)
-    return
-  }
-  const base = job.base ?? primaryBase()
-  const queued = state.jobs.filter(
-    (j) => (j.base ?? primaryBase()) === base && j.status === 'queued'
-  )
-  if (queued.length < 2) {
-    notify('该节点没有其他排队任务，无需插队', 'info', 4000)
-    return
-  }
-  // 服务器执行顺序 = 提交顺序 = state.jobs 倒序（本地新的在前）；目标提到最前
-  const ordered = [...queued].reverse()
-  const plan = [job, ...ordered.filter((j) => j !== job)]
-  try {
-    await api.queueDelete(
-      base,
-      plan.map((j) => j.promptId)
-    )
-  } catch (e) {
-    notify(`从节点摘除失败：${e}`, 'error', 8000)
-    return
-  }
-  // 核对摘除后的服务器现状
-  let pendingIds = new Set<string>()
-  let runningIds = new Set<string>()
-  try {
-    const q = await api.queue(base)
-    const ids = (rows: any[]) => new Set(rows.map((r) => String(r?.[1] ?? '')).filter(Boolean))
-    pendingIds = ids([...(q?.queue_pending ?? [])])
-    runningIds = ids([...(q?.queue_running ?? [])])
-  } catch {
-    // 拉不到就以「全部重新提交」为准（与旧行为一致）
-    pendingIds = new Set(plan.map((j) => j.promptId))
-  }
-  const failed: string[] = []
-  for (const j of plan) {
-    if (runningIds.has(j.promptId)) continue // 竞态中已开跑：让它跑完，不重复提交
-    if (!pendingIds.has(j.promptId)) continue // 已完成/不存在：跳过
-    try {
-      const res = await api.submit(
-        base,
-        j.graph,
-        j.workflow || undefined,
-        j.params ? JSON.stringify(j.params) : undefined
-      )
-      const err = extractSubmitError(res, j.graph)
-      if (err) throw new Error(err)
-      const i = state.jobs.indexOf(j)
-      if (i >= 0) {
-        state.jobs[i] = {
-          ...j,
-          promptId: String(res.prompt_id),
-          status: 'queued',
-          value: 0,
-          max: 0,
-          startedAt: Date.now(),
-          finishedAt: undefined,
-          error: undefined,
-          outputs: [],
-          staleSince: undefined,
-        }
-      }
-    } catch {
-      failed.push(j.workflow || j.promptId)
-    }
-  }
-  void refreshQueue()
-  if (failed.length) {
-    notify(`插队时 ${failed.length} 个任务重新提交失败（可在队列里用 ↻ 重试）`, 'error', 8000)
-  } else {
-    notify(`已插队：「${job.workflow || '任务'}」将成为该节点下一个执行`, 'ok', 4000)
-  }
 }
 
 // ---------------------------------------------------------------- 结果资产

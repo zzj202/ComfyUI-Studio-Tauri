@@ -8,7 +8,7 @@
  * - 右键：✎ 重命名（行内，扩展名锁定）/ 🗑 删除（确认后移入系统回收站）/ 📂 打开所在位置
  * - 点击卡片 = 预览浮层（视频 ⏮⏸⏭📷 + Q/E/空格/R；图片 ⧉ + Ctrl+C；Del 删除）
  */
-import { computed, nextTick, ref, watch } from 'vue'
+import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { ask, open } from '@tauri-apps/plugin-dialog'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
@@ -295,6 +295,8 @@ function onPvKey(e: KeyboardEvent) {
   if (!preview.value) return
   const t = e.target as HTMLElement | null
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+  // 结果区灯箱开着时让位：两边 onKey 都挂在 window 上，Delete/Enter 会同时命中
+  if (document.querySelector('.lightbox')) return
   const k = e.key
   if ((e.ctrlKey || e.metaKey) && (k === 'c' || k === 'C')) {
     e.preventDefault()
@@ -426,6 +428,17 @@ function onDocClick(e: MouseEvent) {
   if (!t?.closest('.lf-preview') && !t?.closest('.lf-card')) preview.value = null
 }
 window.addEventListener('click', onDocClick)
+
+// 面板用 v-if 挂载/卸载：卸载时必须清掉轮询定时器和 window 级监听，
+// 否则每次开关面板都累积一份幽灵轮询与监听（旧实例还会响应按键）
+onUnmounted(() => {
+  if (pollTimer != null) {
+    window.clearInterval(pollTimer)
+    pollTimer = null
+  }
+  window.removeEventListener('keydown', onPvKey)
+  window.removeEventListener('click', onDocClick)
+})
 </script>
 
 <template>

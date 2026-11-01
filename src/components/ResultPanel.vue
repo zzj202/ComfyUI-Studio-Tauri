@@ -25,7 +25,6 @@ import {
   pauseQueue,
   pinJobToWorker,
   primaryBase,
-  promoteJob,
   queueByBase,
   queueEtaText,
   refreshQueue,
@@ -838,6 +837,9 @@ function onKey(e: KeyboardEvent) {
   // 输入框聚焦时键盘留给输入（重命名、搜索框等）
   const t = e.target as HTMLElement | null
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
+  // 素材面板预览浮层开着时让位：它的 onPvKey 也在 window 上监听，
+  // Delete/Enter 两边同响会把「删素材确认」和「删结果资产」一次全触发
+  if (document.querySelector('.lf-preview')) return
 
   if (lbIndex.value >= 0) {
     if (lbEditing.value) return // 重命名输入中：键盘留给输入框（Esc 由输入框自己处理）
@@ -1132,14 +1134,6 @@ onUnmounted(() => {
           </span>
           <span v-if="job.outputs.length" class="faint q-files">{{ job.outputs.length }} 文件</span>
           <button
-            v-if="job.status === 'queued' && job.graph"
-            class="btn ghost sm q-x"
-            title="插队：重排该节点队列，让它下一个执行"
-            @click="promoteJob(job)"
-          >
-            ⏫
-          </button>
-          <button
             v-if="job.status === 'queued' && job.graph && enabledWorkers().length > 1"
             class="btn ghost sm q-x"
             title="改派：从当前节点摘除，重新提交到其他空闲节点"
@@ -1207,14 +1201,6 @@ onUnmounted(() => {
           <div class="q-pm-foot">
             <span class="faint">{{ modalSegs.length }} 个字段 · 参数快照与提交时一致</span>
             <span class="spacer" />
-            <button
-              v-if="promptModal.status === 'queued' && promptModal.graph"
-              class="btn ghost sm"
-              title="插队：重排该节点队列，让它下一个执行"
-              @click="promoteJob(promptModal)"
-            >
-              ⏫ 插队
-            </button>
             <button
               v-if="promptModal.status === 'queued' && promptModal.graph && enabledWorkers().length > 1"
               class="btn ghost sm"
