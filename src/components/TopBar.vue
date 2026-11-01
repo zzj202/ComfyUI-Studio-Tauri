@@ -68,11 +68,6 @@ function healthInfo(base: string): { cls: string; text: string } {
 
 <template>
   <header class="topbar">
-    <div class="brand">
-      <span class="logo">◆</span>
-      <span class="name">ComfyUI Studio</span>
-    </div>
-
     <button
       class="pill"
       :class="state.connection"
@@ -171,17 +166,6 @@ function healthInfo(base: string): { cls: string; text: string } {
   border-bottom: 1px solid var(--border);
   flex: none;
   user-select: none;
-}
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  font-weight: 700;
-  letter-spacing: 0.2px;
-}
-.logo {
-  color: var(--accent);
-  font-size: 15px;
 }
 .pill .url {
   max-width: 190px;

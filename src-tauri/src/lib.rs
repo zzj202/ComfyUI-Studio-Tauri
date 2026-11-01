@@ -70,6 +70,8 @@ pub fn run() {
                 tauri::WebviewUrl::default(),
             )
             .title("ComfyUI Studio")
+            // 自定义标题栏：系统边框去掉，页签/窗口控制画在前端 TitleBar.vue 里
+            .decorations(false)
             .inner_size(1400.0, 900.0)
             .min_inner_size(1060.0, 680.0)
             .resizable(true)

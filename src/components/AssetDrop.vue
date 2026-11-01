@@ -4,6 +4,8 @@ import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { open } from '@tauri-apps/plugin-dialog'
 import { api, type AssetInfo } from '../api/tauri'
 import { groupFields, parseGraph } from '../core/parseWorkflow'
+import { addComicPaths } from '../core/comic'
+import { IMG_EXT_RE } from '../core/clipboard'
 import { loadWorkflows, imageDropTargets, notify, selectWorkflow, state } from '../store'
 import { ui } from '../ui'
 
@@ -96,10 +98,19 @@ async function handleFile(path: string) {
   }
 }
 
-/** 拖入落点路由：JSON → 导入工作流；图片控件 → 上传参考图；其他 → 资产反查工作流 */
+/** 拖入落点路由：漫画页 → 全部加进漫画列表；JSON → 导入工作流；图片控件 → 上传参考图；其他 → 资产反查工作流 */
 async function routeDrop(paths: string[], position: { x: number; y: number }) {
   if (!paths.length) return
   const path = paths[0]
+
+  // ⓪ 漫画工坊页：拖进来的图片全部按顺序加入漫画列表
+  if (ui.view === 'comic') {
+    const imgs = paths.filter((p) => IMG_EXT_RE.test(p))
+    if (imgs.length) {
+      addComicPaths(imgs)
+      return
+    }
+  }
 
   // ① 工作流 JSON → 直接导入
   if (/\.json$/i.test(path)) {
@@ -183,7 +194,8 @@ function fmt(v: any): string {
     <div class="drop-inner">
       <div class="icon">⬇</div>
       <div class="title">松开鼠标</div>
-      <div class="sub">
+      <div class="sub" v-if="ui.view === 'comic'">全部图片按拖入顺序加入漫画列表</div>
+      <div class="sub" v-else>
         工作流 JSON → 直接导入 · 图片拖到参数卡 → 设为参考图 · ComfyUI 产出 → 反查工作流
       </div>
     </div>

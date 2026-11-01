@@ -2,6 +2,14 @@ import { reactive } from 'vue'
 
 /** 轻量 UI 开关状态（弹窗 / 抽屉） */
 export const ui = reactive({
+  /** 主视图页签：出图工作台 / 漫画工坊（状态持久化） */
+  view: ((): 'workbench' | 'comic' => {
+    try {
+      return localStorage.getItem('comfyui-studio.view:v1') === 'comic' ? 'comic' : 'workbench'
+    } catch {
+      return 'workbench' as const
+    }
+  })(),
   settingsOpen: false,
   templateOpen: false,
   logsOpen: false,

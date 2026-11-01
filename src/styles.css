@@ -41,8 +41,8 @@ html.light {
   --text-dim: #5b6579;
   --text-faint: #99a2b5;
 
-  --accent: #5566f0;
-  --accent-soft: #5566f020;
+  --accent: #6373ec;
+  --accent-soft: #6373ec1c;
   --cyan: #0891b2;
   --ok: #059669;
   --warn: #d97706;
@@ -465,4 +465,931 @@ textarea {
 body.drag-active,
 body.drag-active * {
   user-select: none !important;
+}
+
+/* ===== 漫画工坊（ComicStudio.vue） ===== */
+.comic-page {
+  flex: 1;
+  display: grid;
+  /* 左 = 图片列表 / 中 = 手机预览 / 右 = 预设+参数 */
+  grid-template-columns: minmax(0, 1fr) 302px 330px;
+  min-height: 0;
+  overflow: hidden;
+}
+.comic-preview-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 12px;
+  overflow-y: auto;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--border-soft);
+}
+.comic-mid {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  border-right: 1px solid var(--border-soft);
+}
+.comic-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border-soft);
+  flex: none;
+}
+.comic-toolbar .hint {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  margin-left: auto;
+}
+.comic-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  user-select: none; /* Shift 多选时避免出现文本选中效果 */
+}
+.c-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--bg-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-sm);
+  padding: 8px 10px;
+  flex: none;
+}
+.c-row.lifting {
+  opacity: 0.45;
+  border-style: dashed;
+}
+.c-handle {
+  cursor: grab;
+  color: var(--text-faint);
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -2px;
+  user-select: none;
+  padding: 0 2px;
+  flex: none;
+}
+.c-idx {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+.c-thumb {
+  width: 64px;
+  height: 44px;
+  object-fit: cover;
+  border-radius: 6px;
+  border: 1px solid var(--border-soft);
+  cursor: pointer;
+  flex: none;
+  background: #000;
+}
+.c-meta {
+  min-width: 0;
+  flex: 1;
+  cursor: pointer;
+}
+.c-name {
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.c-dim {
+  font-size: 11px;
+  color: var(--text-faint);
+  display: flex;
+  gap: 8px;
+  margin-top: 2px;
+}
+.c-dim em {
+  font-style: normal;
+  color: var(--cyan);
+}
+.c-ops {
+  display: flex;
+  gap: 4px;
+  flex: none;
+}
+.c-empty {
+  margin: auto;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 2.1;
+  padding: 40px 0;
+}
+.c-empty span {
+  font-size: 11.5px;
+}
+.comic-right {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 12px;
+  overflow-y: auto;
+  min-height: 0;
+}
+.phone-wrap {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+/* 手机预览：独立配色（--ph-* 变量默认跟随页面主题，.pt-light/.pt-dark 强制指定） */
+.phone {
+  --ph-bg: var(--bg-1);
+  --ph-text: var(--text);
+  --ph-faint: var(--text-faint);
+  --ph-border: var(--border-soft);
+  --ph-accent: var(--accent);
+  --ph-accent-soft: var(--accent-soft);
+  width: min(264px, 100%);
+  height: min(560px, 100%);
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  background: var(--ph-bg);
+  overflow: hidden;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.12);
+}
+.phone.pt-light {
+  --ph-bg: #ffffff;
+  --ph-text: #222222;
+  --ph-faint: #9a9a9a;
+  --ph-border: #ececec;
+  --ph-accent: #d9346b;
+  --ph-accent-soft: #ffe9f1;
+}
+.phone.pt-dark {
+  --ph-bg: #121212;
+  --ph-text: #f0f0f0;
+  --ph-faint: #8a8a8a;
+  --ph-border: #2c2c2c;
+  --ph-accent: #ff7bac;
+  --ph-accent-soft: #3c2230;
+}
+/* 状态栏（仿手机顶部） */
+.ph-status {
+  display: flex;
+  justify-content: space-between;
+  padding: 7px 16px 2px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--ph-text);
+  flex: none;
+}
+.ph-status-r {
+  color: var(--ph-faint);
+  font-weight: 400;
+  letter-spacing: 1px;
+}
+/* 导航行：返回 + 更多 */
+.ph-nav {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 4px 14px 2px;
+  font-size: 17px;
+  color: var(--ph-text);
+  flex: none;
+  line-height: 1;
+}
+/* 文章滚动区 */
+.ph-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px 14px 10px;
+}
+.ph-head {
+  margin-bottom: 8px;
+}
+.ph-title {
+  font-size: 15.5px;
+  font-weight: 700;
+  color: var(--ph-text);
+  line-height: 1.4;
+}
+.ph-meta {
+  margin-top: 5px;
+  font-size: 10.5px;
+  color: var(--ph-faint);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.ph-tag {
+  background: var(--ph-accent-soft);
+  color: var(--ph-accent);
+  border-radius: 3px;
+  padding: 0.5px 5px;
+  font-size: 10px;
+}
+.ph-canvas {
+  width: 100%;
+  display: block;
+  border-radius: 6px;
+}
+.ph-empty {
+  margin: 26px 0;
+  text-align: center;
+  font-size: 11.5px;
+  color: var(--ph-faint);
+  line-height: 1.9;
+}
+/* 底部作者栏 */
+.ph-footer {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--ph-border);
+}
+.ph-avatar {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: var(--ph-accent-soft);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  flex: none;
+}
+.ph-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ph-text);
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ph-stats {
+  font-size: 11px;
+  color: var(--ph-faint);
+  flex: none;
+}
+/* 预览配色切换小按钮 */
+.pt-toggle {
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  white-space: nowrap;
+  flex: none;
+}
+.pt-toggle.ic {
+  padding: 2px 7px;
+}
+.pt-toggle:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+.phone-cap {
+  font-size: 11px;
+  color: var(--text-faint);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px 8px;
+}
+.phone-cap .pc-title {
+  color: var(--text-dim);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.phone-cap .pc-dims {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.phone-cap .flex1 {
+  flex: 1;
+  min-width: 0;
+}
+.comic-params {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.p-card {
+  background: var(--bg-2);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+}
+.p-card h4 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+  font-weight: 600;
+}
+.p-row {
+  display: grid;
+  grid-template-columns: 76px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+.p-row:last-child {
+  margin-bottom: 0;
+}
+.p-row .lbl {
+  color: var(--text-dim);
+  flex: none;
+}
+.p-row input[type='range'] {
+  width: 100%;
+}
+.p-row input[type='color'] {
+  width: 40px;
+  height: 22px;
+  padding: 0 2px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+}
+.p-row select,
+.p-row input[type='number'],
+.p-row input[type='text'] {
+  font-size: 12px;
+  width: 100%;
+}
+.p-row .w-input {
+  width: 76px;
+}
+.p-row .val {
+  color: var(--text-faint);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.p-check {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+}
+.p-inline {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+.chip {
+  font-size: 11px;
+  padding: 2px 9px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: none;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.chip.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.btn.export {
+  justify-content: center;
+  padding: 10px;
+  font-size: 13px;
+  flex: none;
+}
+
+/* 裁切 / 旋转编辑器 */
+.crop-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 220;
+  background: rgba(8, 11, 18, 0.75);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.crop-modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  box-shadow: var(--shadow);
+  max-width: 94vw;
+}
+.crop-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  margin-bottom: 10px;
+}
+.crop-head h3 {
+  margin: 0;
+  font-size: 13.5px;
+  max-width: 560px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.crop-stage {
+  position: relative;
+  margin: 0 auto;
+  background: #000;
+  border-radius: 6px;
+  overflow: hidden;
+  touch-action: none;
+  flex: none;
+}
+.crop-stage canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.crop-rect {
+  position: absolute;
+  border: 1.5px solid var(--accent);
+  box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.55);
+  cursor: move;
+}
+.crop-dot {
+  position: absolute;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 2px solid #fff;
+}
+.crop-dot.nw {
+  left: -6px;
+  top: -6px;
+  cursor: nwse-resize;
+}
+.crop-dot.ne {
+  right: -6px;
+  top: -6px;
+  cursor: nesw-resize;
+}
+.crop-dot.sw {
+  left: -6px;
+  bottom: -6px;
+  cursor: nesw-resize;
+}
+.crop-dot.se {
+  right: -6px;
+  bottom: -6px;
+  cursor: nwse-resize;
+}
+.crop-tools {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  flex-wrap: wrap;
+}
+.crop-tools .lbl {
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.crop-tools .flex1 {
+  flex: 1;
+}
+.crop-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 12px;
+}
+.crop-foot .tip {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  margin-right: auto;
+}
+
+/* ===== 漫画工坊 · 四期（多选批量 / 网格视图 / 角标 / 参数美化） ===== */
+.comic-page .flex1 {
+  flex: 1;
+}
+
+/* 批量操作条 */
+.batch-bar {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 14px;
+  border-bottom: 1px solid var(--accent);
+  background: var(--accent-soft);
+  flex: none;
+  flex-wrap: wrap;
+}
+.bb-count {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent);
+  margin-right: 2px;
+}
+.bb-lbl {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-left: 4px;
+}
+
+/* 行视图：多选高亮 */
+.c-row.selected {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.c-row {
+  cursor: pointer;
+}
+.c-row .c-handle,
+.c-row .c-ops {
+  cursor: default;
+}
+
+/* 缩略图 + 角标 */
+.c-thumbwrap {
+  position: relative;
+  flex: none;
+  line-height: 0;
+}
+.c-badge {
+  position: absolute;
+  top: -5px;
+  right: -5px;
+  z-index: 1;
+  font-size: 9px;
+  line-height: 1;
+  padding: 2.5px 5px;
+  border-radius: 999px;
+  color: #fff;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  pointer-events: none;
+  white-space: nowrap;
+}
+.c-badge.crop {
+  background: #4a7dff;
+}
+.c-badge.rot {
+  background: #0aa57f;
+}
+.c-badge.dup {
+  background: #d9822b;
+}
+
+/* 网格视图 */
+.comic-list.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(122px, 1fr));
+  gap: 10px;
+  align-content: start;
+  align-items: start;
+}
+.c-row.grid {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 6px;
+  padding: 6px;
+}
+.c-row.grid.selected {
+  outline: 2px solid var(--accent);
+  outline-offset: -1px;
+}
+.c-gwrap {
+  position: relative;
+  width: 100%;
+  height: 92px;
+  border-radius: 6px;
+  overflow: hidden;
+  background: #000;
+  cursor: grab;
+}
+.c-gthumb {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  user-select: none;
+}
+.c-gwrap .c-badge {
+  top: 4px;
+  right: 4px;
+}
+.c-gidx {
+  position: absolute;
+  left: 4px;
+  top: 4px;
+  min-width: 17px;
+  height: 17px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+}
+.c-gops {
+  position: absolute;
+  right: 4px;
+  bottom: 4px;
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.c-gwrap:hover .c-gops {
+  opacity: 1;
+}
+.c-gops .btn {
+  padding: 2px 7px;
+  font-size: 11px;
+  background: rgba(0, 0, 0, 0.62);
+  color: #fff;
+  border: none;
+}
+.c-gname {
+  font-size: 11px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: center;
+}
+
+/* 分段选择器（框样式 / 格式） */
+.seg {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  width: 100%;
+}
+.seg button {
+  flex: 1;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  padding: 5px 4px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.seg button + button {
+  border-left: 1px solid var(--border);
+}
+.seg button.on {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+.seg button:hover:not(.on) {
+  background: var(--hover, #ffffff10);
+}
+
+/* 参数卡美化 */
+.p-card {
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.06);
+}
+.p-card h4 {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12.5px;
+  color: var(--text);
+  padding-bottom: 7px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.p-card h4::before {
+  content: '';
+  width: 3px;
+  height: 12px;
+  border-radius: 2px;
+  background: var(--accent);
+  flex: none;
+}
+.comic-right input[type='range'],
+.comic-right input[type='checkbox'] {
+  accent-color: var(--accent);
+}
+.comic-right input[type='color'] {
+  border-radius: 6px;
+}
+
+/* ===== 漫画工坊 · 五期（列宽拖拽 / 分隔线） ===== */
+.comic-preview-col,
+.comic-right {
+  position: relative;
+}
+/* 列间分隔线：细热区，悬停高亮 */
+.col-split {
+  position: absolute;
+  left: -5px;
+  top: 0;
+  bottom: 0;
+  width: 10px;
+  cursor: col-resize;
+  z-index: 5;
+}
+.col-split::after {
+  content: '';
+  position: absolute;
+  left: 4px;
+  top: 0;
+  bottom: 0;
+  width: 2px;
+  border-radius: 1px;
+  background: transparent;
+  transition: background 0.15s;
+}
+.col-split:hover::after,
+body.col-resizing .col-split::after {
+  background: var(--accent);
+}
+body.col-resizing {
+  cursor: col-resize;
+  user-select: none;
+}
+
+/* ===== 漫画工坊 · 六期（预设 chips / 编辑器调色工具） ===== */
+.preset-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.pchint {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.pchip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11.5px;
+  padding: 3.5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-1);
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: border-color 0.12s, color 0.12s, background 0.12s;
+  max-width: 100%;
+}
+.pchip:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.pchip.on {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+.pchip.add {
+  border-style: dashed;
+  color: var(--text-faint);
+}
+.pchip-x {
+  font-style: normal;
+  font-size: 10px;
+  opacity: 0.45;
+  padding: 1px 2px;
+  border-radius: 50%;
+}
+.pchip-x:hover {
+  opacity: 1;
+  background: rgba(220, 60, 60, 0.18);
+  color: #e05555;
+}
+.psave {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex: 1;
+  min-width: 160px;
+}
+.psave input {
+  flex: 1;
+  font-size: 11.5px;
+  min-width: 0;
+}
+
+/* 编辑器第二排：镜像 / 调色 / 填充 */
+.crop-tools .adj {
+  width: 92px;
+  flex: none;
+  accent-color: var(--accent);
+}
+.crop-tools .adj-lbl {
+  margin-left: 4px;
+}
+.crop-tools .adj-lbl:first-of-type {
+  margin-left: 10px;
+}
+.crop-tools .btn.chip-on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* ===== 漫画工坊 · 七期（折叠 / 行瘦身 / 拖拽浮起 / 预览增强） ===== */
+.p-card h4.foldable {
+  cursor: pointer;
+  user-select: none;
+}
+.p-card h4.foldable:hover {
+  color: var(--accent);
+}
+.p-card h4 .caret {
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-faint);
+}
+.p-body {
+  display: flex;
+  flex-direction: column;
+}
+.c-empty-ops {
+  display: flex;
+  gap: 8px;
+  justify-content: center;
+  margin-top: 10px;
+}
+.pt-toggle.on {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.pt-toggle-group {
+  display: inline-flex;
+  gap: 3px;
+}
+.ph-author {
+  outline: none;
+  border-radius: 3px;
+}
+.ph-author:focus,
+.ph-title:focus {
+  box-shadow: 0 0 0 1.5px var(--ph-accent, var(--accent));
+}
+/* 列表行瘦身 */
+.c-row {
+  padding: 6px 10px;
+}
+.c-thumb {
+  width: 56px;
+  height: 38px;
+}
+/* 网格拖拽：被拖格子浮起 */
+.comic-list.grid .c-row.lifting {
+  opacity: 0.45;
+  border-style: dashed;
+  transform: scale(0.96);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.3);
+  z-index: 2;
+}
+/* 漫画页统一细滚动条 */
+.comic-page ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.comic-page ::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+.comic-page ::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
 }

@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { onMounted, onUnmounted } from 'vue'
 import TopBar from './components/TopBar.vue'
+import TitleBar from './components/TitleBar.vue'
 import WorkflowPanel from './components/WorkflowPanel.vue'
 import ParamPanel from './components/ParamPanel.vue'
 import ResultPanel from './components/ResultPanel.vue'
@@ -11,6 +12,8 @@ import Toasts from './components/Toasts.vue'
 import AssetDrop from './components/AssetDrop.vue'
 import LocalAssets from './components/LocalAssets.vue'
 import LocalFiles from './components/LocalFiles.vue'
+import ComicStudio from './components/ComicStudio.vue'
+import { addComicFiles, addComicPaths } from './core/comic'
 import { disposeAll, dragGhost, imageDropTargets, init, notify, pasteSubmitField, refreshQueue, state } from './store'
 import { api, saveTempBlob } from './api/tauri'
 import type { FieldSchema } from './core/types'
@@ -89,6 +92,27 @@ function isEditableTarget(t: EventTarget | null): boolean {
 
 async function onDocPaste(e: ClipboardEvent) {
   if (isEditableTarget(e.target)) return // 文本输入框 / 下拉里的正常粘贴不受影响
+  // 漫画工坊页：粘贴的图片一律加入漫画列表（不碰出图字段）
+  if (ui.view === 'comic') {
+    const files = filesFromClipboardData(e.clipboardData)
+    if (files.length) {
+      e.preventDefault()
+      e.stopPropagation()
+      await addComicFiles(files)
+      return
+    }
+    try {
+      const imgs = (await api.clipboardFilePaths()).filter((p) => IMG_EXT_RE.test(p))
+      if (imgs.length) {
+        e.preventDefault()
+        e.stopPropagation()
+        addComicPaths(imgs)
+      }
+    } catch {
+      /* 忽略，漫画页没有别的粘贴语义 */
+    }
+    return
+  }
   const files = filesFromClipboardData(e.clipboardData)
   if (files.length) {
     e.preventDefault()
@@ -162,9 +186,13 @@ onUnmounted(() => {
 
 <template>
   <div class="app">
-    <TopBar />
+    <TitleBar />
+    <TopBar v-if="ui.view === 'workbench'" />
 
-    <div class="body">
+    <!-- 漫画工坊：与出图工作台完全独立（组件 / 状态 / 持久化互不干扰） -->
+    <ComicStudio v-if="ui.view === 'comic'" />
+
+    <div v-else class="body">
       <aside class="col left">
         <div class="left-main"><WorkflowPanel /></div>
         <LocalAssets />
@@ -200,6 +228,10 @@ onUnmounted(() => {
   flex-direction: column;
   height: 100%;
   overflow: hidden;
+}
+/* 自定义标题栏（decorations:false）：最大化时无框窗口内容溢出屏幕边缘，加内边距抵消 */
+:global(body.maximized .app) {
+  padding: 8px 8px 8px;
 }
 .body {
   flex: 1;
