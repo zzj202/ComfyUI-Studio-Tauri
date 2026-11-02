@@ -499,6 +499,7 @@ dependencies = [
  "clipboard-win",
  "dirs 5.0.1",
  "flate2",
+ "png 0.17.16",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

@@ -471,8 +471,9 @@ body.drag-active * {
 .comic-page {
   flex: 1;
   display: grid;
-  /* 左 = 图片列表 / 中 = 手机预览 / 右 = 预设+参数 */
-  grid-template-columns: minmax(0, 1fr) 302px 330px;
+  /* 左 = 图片列表 / 中 = 手机预览 / 右 = 预设+参数
+     列宽走 CSS 变量（--pw/--rw 由组件按拖拽结果写入），窄屏媒体查询才能覆盖 */
+  grid-template-columns: minmax(0, 1fr) var(--pw, 302px) var(--rw, 330px);
   min-height: 0;
   overflow: hidden;
 }
@@ -1392,4 +1393,359 @@ body.col-resizing {
 }
 .comic-page ::-webkit-scrollbar-thumb:hover {
   background: var(--text-faint);
+}
+
+/* ===== 漫画工坊 · 交互补强（工具栏分组 / 落点线 / 导航条 / 吸底导出 / 响应式） ===== */
+
+/* ---- 工具栏：分组 + 下拉菜单 ---- */
+.comic-toolbar {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+.tb-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.tb-sep {
+  width: 1px;
+  height: 15px;
+  background: var(--border-soft);
+  flex: none;
+  margin: 0 2px;
+}
+.menu-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.tb-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  left: 0;
+  min-width: 168px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: var(--shadow);
+  padding: 4px;
+  z-index: 90;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.tb-menu.right {
+  left: auto;
+  right: 0;
+}
+.tb-menu button {
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 12px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.tb-menu button:hover {
+  background: var(--bg-2);
+  color: var(--accent);
+}
+.tb-menu button.danger {
+  color: var(--red, #e05a5a);
+}
+.tb-menu button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* ---- 拖动排序落点横线 ---- */
+.comic-list {
+  position: relative;
+}
+.c-dropline {
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  pointer-events: none;
+  z-index: 3;
+  animation: dropline-in 0.12s ease;
+}
+@keyframes dropline-in {
+  from {
+    opacity: 0;
+    transform: scaleX(0.9);
+  }
+}
+.comic-list.grid .c-row.drop-target {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+/* 拖动时禁掉行内的 hover 抖动 */
+.comic-list.dragging .c-row:hover {
+  border-color: var(--border-soft);
+}
+
+/* ---- 手机预览：包裹层 + 长图导航条 ---- */
+.ph-wrap {
+  position: relative;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  /* 撑满预览列剩余高度，.phone 的 height:100% 才有参照（否则会被内容压扁） */
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  max-width: 100%;
+}
+/* 导航条在流里（不是绝对定位），不会顶出列宽；窄列时手机自动让出 14px */
+.ph-wrap .phone {
+  width: min(264px, calc(100% - 14px));
+}
+.ph-rail {
+  flex: none;
+  align-self: stretch;
+  width: 6px;
+  margin: 36px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  z-index: 5;
+}
+.ph-tick {
+  flex-basis: 0;
+  min-height: 5px;
+  width: 100%;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: var(--border);
+  cursor: pointer;
+  transition:
+    background 0.12s,
+    transform 0.12s;
+}
+.ph-tick:hover {
+  background: var(--text-faint);
+  transform: scaleX(1.6);
+}
+.ph-tick.on {
+  background: var(--accent);
+}
+.pc-idx {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-dim);
+  white-space: nowrap;
+}
+/* 列宽拖拽手柄是 absolute 定位，需要给个定位父级（偏移沿用基础 .col-split） */
+.comic-preview-col {
+  position: relative;
+}
+
+/* ---- 导出区吸底 ---- */
+.export-dock {
+  position: sticky;
+  bottom: -12px;
+  margin-top: auto;
+  padding: 10px 0 2px;
+  background: linear-gradient(180deg, transparent, var(--bg-1) 12px);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 4;
+}
+.export-row {
+  display: flex;
+  gap: 8px;
+}
+.export-row .btn.export {
+  flex: 1;
+  padding: 9px 6px;
+  font-size: 12px;
+}
+.prog {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.prog-bar {
+  flex: 1;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--bg-3, var(--bg-2));
+  overflow: hidden;
+  border: 1px solid var(--border-soft);
+}
+.prog-bar i {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  border-radius: 999px;
+  transition: width 0.15s linear;
+}
+.prog-txt {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ---- 参数抽屉（窄屏） ---- */
+.drawer-head {
+  display: none;
+}
+
+/* ---- 裁切编辑台：上一张 / 下一张 ---- */
+.crop-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: none;
+}
+.crop-count {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+  min-width: 46px;
+  text-align: center;
+}
+
+/* ---- 大图查看器 ---- */
+.viewer-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 225;
+  background: rgba(8, 11, 18, 0.88);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.viewer-img {
+  max-width: 92vw;
+  max-height: 84vh;
+  object-fit: contain;
+  border-radius: 8px;
+  box-shadow: 0 24px 70px rgba(0, 0, 0, 0.55);
+}
+.viewer-bar {
+  position: absolute;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  background: rgba(20, 24, 32, 0.86);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: 999px;
+}
+.viewer-count {
+  color: #e9e9e9;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 快捷键面板 ---- */
+.help-modal {
+  min-width: 380px;
+  max-width: 520px;
+}
+.help-grid {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 8px 16px;
+  align-items: center;
+  padding: 6px 2px 12px;
+  font-size: 12.5px;
+}
+.help-grid kbd {
+  font-family: inherit;
+  font-size: 11.5px;
+  color: var(--text);
+  background: var(--bg-2);
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 6px;
+  padding: 3px 8px;
+  white-space: nowrap;
+  justify-self: start;
+}
+.help-grid span {
+  color: var(--text-dim);
+}
+
+/* ---- 响应式：<1200 收预览列、<900 参数变抽屉 ---- */
+@media (max-width: 1200px) {
+  .comic-page {
+    grid-template-columns: minmax(0, 1fr) var(--rw, 330px);
+  }
+  .comic-preview-col {
+    display: none;
+  }
+  /* 按需浮层打开：整屏一块，手机居中 */
+  .comic-preview-col.float {
+    display: flex;
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+    background: var(--bg-1);
+    padding: 18px;
+    justify-content: center;
+    border-right: none;
+  }
+  .comic-preview-col.float .col-split {
+    display: none;
+  }
+}
+@media (max-width: 900px) {
+  .comic-page {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .comic-right {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(360px, 92vw);
+    z-index: 210;
+    background: var(--bg-1);
+    border-left: 1px solid var(--border);
+    box-shadow: -10px 0 34px rgba(0, 0, 0, 0.22);
+    transform: translateX(103%);
+    transition: transform 0.18s ease;
+    padding-top: 6px;
+  }
+  .comic-right.open {
+    transform: none;
+  }
+  .comic-right .col-split {
+    display: none;
+  }
+  .drawer-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-dim);
+    padding: 2px 2px 6px;
+  }
+  .drawer-mask {
+    position: fixed;
+    inset: 0;
+    z-index: 205;
+    background: rgba(8, 11, 18, 0.42);
+  }
+  .comic-toolbar {
+    padding: 8px 10px;
+  }
 }

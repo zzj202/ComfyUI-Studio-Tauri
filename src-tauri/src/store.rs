@@ -323,6 +323,126 @@ pub fn clipboard_file_paths() -> Result<Vec<String>, String> {
     }
 }
 
+/// 把一张 PNG（base64）写进系统剪贴板（漫画工坊「复制长图」）。
+///
+/// 同时写两种格式，兼顾两类粘贴目标：
+/// - CF_DIB（32bpp 无压缩、自下而上）：Windows 原生应用（Word / 微信 / 画图）都能粘；
+/// - 自定义 "PNG" 格式：Chromium 系（公众号编辑器 / 飞书 / 语雀）能拿到无损原图。
+/// PNG 解码放在 Rust 侧做——前端只传压缩后的字节，避免几十 MB 的 RGBA 走 IPC。
+#[command]
+pub fn clipboard_write_image(b64: String) -> Result<Value, String> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64.trim().as_bytes())
+        .map_err(|e| format!("base64 解码失败：{}", e))?;
+
+    // PNG → RGBA8（调色板 / 灰度 / 16bit 统一展开成 8bit）
+    let mut decoder = png::Decoder::new(std::io::Cursor::new(&bytes));
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
+    let mut reader = decoder
+        .read_info()
+        .map_err(|e| format!("PNG 解析失败：{}", e))?;
+    let mut buf = vec![0u8; reader.output_buffer_size()];
+    let info = reader
+        .next_frame(&mut buf)
+        .map_err(|e| format!("PNG 解码失败：{}", e))?;
+    let (w, h) = (info.width as usize, info.height as usize);
+    if w == 0 || h == 0 {
+        return Err("图片尺寸为空".into());
+    }
+    // CF_DIB 是未压缩位图，超大长图会占几百 MB 内存，提前拦掉
+    if w * h > 60_000_000 {
+        return Err(format!(
+            "图片太大（{}×{}），剪贴板放不下，请调小目标宽度或改用「分段导出」后逐段复制",
+            w, h
+        ));
+    }
+    let data = &buf[..info.buffer_size()];
+    let rgba: Vec<u8> = match info.color_type {
+        png::ColorType::Rgba => data.to_vec(),
+        png::ColorType::Rgb => data
+            .chunks_exact(3)
+            .flat_map(|p| [p[0], p[1], p[2], 255])
+            .collect(),
+        png::ColorType::Grayscale => data.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        png::ColorType::GrayscaleAlpha => data
+            .chunks_exact(2)
+            .flat_map(|p| [p[0], p[0], p[0], p[1]])
+            .collect(),
+        other => return Err(format!("不支持的 PNG 像素格式：{:?}", other)),
+    };
+
+    // 组 CF_DIB：BITMAPINFOHEADER（40 字节）+ 自下而上的 BGRA 行
+    let mut dib = Vec::with_capacity(40 + w * h * 4);
+    dib.extend_from_slice(&40u32.to_le_bytes()); // biSize
+    dib.extend_from_slice(&(w as i32).to_le_bytes()); // biWidth
+    dib.extend_from_slice(&(h as i32).to_le_bytes()); // biHeight（正数 = 自下而上）
+    dib.extend_from_slice(&1u16.to_le_bytes()); // biPlanes
+    dib.extend_from_slice(&32u16.to_le_bytes()); // biBitCount
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biCompression = BI_RGB
+    dib.extend_from_slice(&((w * h * 4) as u32).to_le_bytes()); // biSizeImage
+    dib.extend_from_slice(&2835i32.to_le_bytes()); // biXPelsPerMeter（72dpi）
+    dib.extend_from_slice(&2835i32.to_le_bytes()); // biYPelsPerMeter
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrUsed
+    dib.extend_from_slice(&0u32.to_le_bytes()); // biClrImportant
+    for y in (0..h).rev() {
+        for x in 0..w {
+            let i = (y * w + x) * 4;
+            dib.extend_from_slice(&[rgba[i + 2], rgba[i + 1], rgba[i], 255]);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use clipboard_win::{formats, raw};
+        // 剪贴板可能被别的程序短暂占用：重试几次
+        let mut opened = false;
+        for _ in 0..10 {
+            if raw::open().is_ok() {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        }
+        if !opened {
+            return Err("剪贴板被其他程序占用，请稍后重试".into());
+        }
+        let res = (|| -> Result<(), String> {
+            raw::empty().map_err(|e| format!("清空剪贴板失败（{:?}）", e))?;
+            raw::set(formats::CF_DIB, &dib).map_err(|e| format!("写入位图失败（{:?}）", e))?;
+            if let Some(fmt) = raw::register_format("PNG") {
+                // 失败不影响主流程（DIB 已经写进去了）
+                let _ = raw::set_without_clear(fmt.get(), &bytes);
+            }
+            Ok(())
+        })();
+        let _ = raw::close();
+        res?;
+        Ok(json!({ "ok": true, "width": w, "height": h }))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = dib;
+        Err("复制图片到剪贴板只在 Windows 下支持".into())
+    }
+}
+
+/// 批量取文件修改时间（毫秒时间戳，取不到返回 0）：漫画工坊「按修改时间排序」。
+#[command]
+pub fn path_mtimes(paths: Vec<String>) -> Result<Vec<i64>, String> {
+    Ok(paths
+        .iter()
+        .map(|p| {
+            fs::metadata(p)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        })
+        .collect())
+}
+
 /// 列出一个本地目录里的媒体内容（「📁 素材」面板用）：只保留图片/视频扩展名与子目录，
 /// 隐藏文件跳过。全部条目（含子目录）按修改时间倒序——最新的在最前。
 /// 返回规范化的绝对路径（dialog 可能给相对路径，canonicalize 统一转绝对并去掉 \\?\ 前缀）。

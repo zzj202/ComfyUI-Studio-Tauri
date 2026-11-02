@@ -31,6 +31,11 @@ export const api = {
     invoke<string>('save_temp_bytes', { name, b64 }),
   /** 读取剪贴板里的文件路径列表（资源管理器复制的文件，可多张；WebView clipboard API 看不到） */
   clipboardFilePaths: () => invoke<string[]>('clipboard_file_paths'),
+  /** 把一张 PNG(base64) 写进系统剪贴板（CF_DIB + PNG 双格式）：漫画工坊复制长图后直接粘到公众号 */
+  clipboardWriteImage: (b64: string) =>
+    invoke<{ ok: boolean; width: number; height: number }>('clipboard_write_image', { b64 }),
+  /** 批量取文件修改时间（ms，取不到为 0）：漫画工坊按修改时间排序 */
+  pathMtimes: (paths: string[]) => invoke<number[]>('path_mtimes', { paths }),
   /** 列出本地目录里的媒体内容（「📁 素材」面板）：按修改时间倒序，只含图片/视频/子目录；dir = 规范化绝对路径 */
   listLocalMedia: (path: string) =>
     invoke<{

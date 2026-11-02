@@ -13,6 +13,7 @@ import {
   clearComic,
   comic,
   comicHistory,
+  copyComicToClipboard,
   exportComic,
   exportSingleImages,
   loadBitmap,
@@ -23,16 +24,20 @@ import {
   removeComicItem,
   removeComicItems,
   renderComic,
+  reverseComic,
   savePresets,
+  sortComic,
   syncHistory,
   undoComic,
   DEFAULT_SETTINGS,
   type ComicItem,
   type ComicSettings,
+  type SortMode,
 } from '../core/comic'
 import { cycleTheme, isDarkNow, themeMode } from '../core/theme'
 import { ui } from '../ui'
 import ColorPick from './ColorPick.vue'
+import NumBox from './NumBox.vue'
 
 /**
  * 漫画工坊：图片按顺序合并成竖版长图（手机阅读向）。
@@ -69,12 +74,52 @@ onMounted(() => {
   imageDropTargets.set(DROP_KEY, (p) => addComicPaths([p]))
   assetDropTargets.set(DROP_KEY, (a) => void addComicAsset(a))
   window.addEventListener('keydown', onKeydown)
+  window.addEventListener('pointerdown', onDocPointerDown, true)
+  mqNarrow = window.matchMedia('(max-width: 1200px)')
+  mqTiny = window.matchMedia('(max-width: 900px)')
+  mqNarrow.addEventListener('change', syncLayout)
+  mqTiny.addEventListener('change', syncLayout)
+  syncLayout()
 })
 onUnmounted(() => {
   imageDropTargets.delete(DROP_KEY)
   assetDropTargets.delete(DROP_KEY)
   window.removeEventListener('keydown', onKeydown)
+  window.removeEventListener('pointerdown', onDocPointerDown, true)
+  mqNarrow?.removeEventListener('change', syncLayout)
+  mqTiny?.removeEventListener('change', syncLayout)
 })
+
+// ---------------------------------------------------------------- 窄屏布局
+// <1200px 收起预览列（按需浮层打开）；<900px 参数列变右侧抽屉。
+// 纯 CSS 做不到「列宽仍可拖」+「抽屉按需打开」，所以断点状态放 JS，样式用媒体查询兜底。
+
+// 初始值直接同步取一次，避免首帧先按三列渲染再塌陷（会闪一下）
+const narrow = ref(window.matchMedia('(max-width: 1200px)').matches)
+const tiny = ref(window.matchMedia('(max-width: 900px)').matches)
+const drawerOpen = ref(false)
+const previewOpen = ref(false)
+const sortOpen = ref(false)
+const moreOpen = ref(false)
+const helpOpen = ref(false)
+let mqNarrow: MediaQueryList | null = null
+let mqTiny: MediaQueryList | null = null
+
+function syncLayout() {
+  narrow.value = mqNarrow?.matches ?? false
+  tiny.value = mqTiny?.matches ?? false
+  if (!tiny.value) drawerOpen.value = false
+  if (!narrow.value) previewOpen.value = false
+}
+
+/** 点空白处收起下拉菜单 */
+function onDocPointerDown(e: PointerEvent) {
+  const el = e.target as HTMLElement | null
+  if (!el?.closest('.menu-wrap')) {
+    sortOpen.value = false
+    moreOpen.value = false
+  }
+}
 
 // ---------------------------------------------------------------- 撤销 / 重做
 
@@ -102,7 +147,45 @@ function onKeydown(e: KeyboardEvent) {
     }
     return
   }
+  // 编辑台打开时按键归编辑台：←/→ 应用并切图、Esc 关闭；
+  // 不能再落到列表快捷键上（否则 Delete / ↑↓ 会误删、误移后面的图）
+  if (editing.value !== null) {
+    if (inInput) return
+    if (k === 'escape') {
+      e.preventDefault()
+      closeEditor()
+    } else if (k === 'arrowleft' || k === 'arrowright') {
+      e.preventDefault()
+      switchEdit(k === 'arrowleft' ? -1 : 1)
+    }
+    return
+  }
+  // 大图查看器
+  if (viewing.value !== null) {
+    if (k === 'escape') {
+      e.preventDefault()
+      viewing.value = null
+    } else if (k === 'arrowleft' || k === 'arrowright') {
+      e.preventDefault()
+      viewerStep(k === 'arrowleft' ? -1 : 1)
+    }
+    return
+  }
   if (inInput) return
+  if (k === '?') {
+    e.preventDefault()
+    helpOpen.value = true
+    return
+  }
+  if (k === ' ' || k === 'spacebar') {
+    if (sel.size === 1) {
+      e.preventDefault()
+      const id = [...sel][0]
+      const i = comic.items.findIndex((it) => it.id === id)
+      if (i >= 0) viewing.value = i
+    }
+    return
+  }
   if (k === 'delete' || k === 'backspace') {
     if (sel.size) {
       e.preventDefault()
@@ -139,6 +222,25 @@ let dragLastX = 0
 let scrollRaf = 0
 /** 刚结束一次拖动（抑制随后的 click 误选中） */
 let justDragged = false
+/** 行视图的落点横线（相对 .comic-list 的 y）/ 网格视图高亮的目标格 */
+const dropLine = ref<number | null>(null)
+const dropTargetIdx = ref<number | null>(null)
+
+/** 按指针在目标行里的上/下半区，决定横线画在它上面还是下面 */
+function updateDropLine(target: number) {
+  dropTargetIdx.value = target
+  const list = listEl.value
+  if (!list || gridView.value) {
+    dropLine.value = null
+    return
+  }
+  const row = list.querySelector<HTMLElement>(`[data-cidx="${target}"]`)
+  if (!row) return
+  const rr = row.getBoundingClientRect()
+  const lr = list.getBoundingClientRect()
+  const after = dragLastY > rr.top + rr.height / 2
+  dropLine.value = rr.top - lr.top + list.scrollTop + (after ? rr.height : 0)
+}
 
 /** 按指针坐标计算目标位置并实时换位（行视图按行高算，网格按指针下的单元格算） */
 function updateDragTarget() {
@@ -162,6 +264,7 @@ function updateDragTarget() {
     comic.items.splice(target, 0, it)
     dragIdx.value = target
   }
+  updateDropLine(target)
 }
 
 /** 拖动期间 rAF 循环：指针靠近列表上下边缘时自动滚动并重算落点 */
@@ -220,6 +323,8 @@ function onRowDragUp() {
   dragIdx.value = null
   justDragged = dragActive
   dragActive = false
+  dropLine.value = null
+  dropTargetIdx.value = null
   cancelAnimationFrame(scrollRaf)
   syncHistory()
 }
@@ -298,6 +403,66 @@ function batchDelete() {
   if (n) notify(`已删除 ${n} 张（Ctrl+Z 可撤销）`, 'ok', 3000)
 }
 
+// ---------------------------------------------------------------- 大图查看（空格 / 缩略图）
+
+const viewing = ref<number | null>(null)
+
+function openViewer(i: number) {
+  viewing.value = i
+}
+
+function viewerStep(d: number) {
+  if (viewing.value === null) return
+  const n = viewing.value + d
+  if (n >= 0 && n < comic.items.length) viewing.value = n
+}
+
+/** 从查看器直接进编辑台（看完想改的常见路径） */
+function viewerEdit() {
+  if (viewing.value === null) return
+  const i = viewing.value
+  viewing.value = null
+  void openEditor(i)
+}
+
+// ---------------------------------------------------------------- 排序 / 复制 / 快捷键
+
+/** 排序下拉：选完立刻收起 */
+function doSort(mode: SortMode) {
+  sortOpen.value = false
+  void sortComic(mode)
+}
+
+function doReverse() {
+  sortOpen.value = false
+  reverseComic()
+}
+
+async function doCopy() {
+  await copyComicToClipboard()
+}
+
+/** 导出进度百分比（没有进度时 0） */
+const progressPct = computed(() => {
+  const p = comic.progress
+  if (!p || !p.total) return 0
+  return Math.max(0, Math.min(100, Math.round((p.done / p.total) * 100)))
+})
+
+const SHORTCUTS: [string, string][] = [
+  ['Ctrl + Z', '撤销'],
+  ['Ctrl + Y / Ctrl + Shift + Z', '重做'],
+  ['Ctrl + A', '全选列表'],
+  ['Delete / Backspace', '删除所选'],
+  ['↑ / ↓', '所选单张上移 / 下移'],
+  ['← / →', '编辑台：应用并切上一张 / 下一张'],
+  ['空格', '查看所选大图'],
+  ['Esc', '关闭编辑台 / 查看器 / 取消选择'],
+  ['?', '打开这个面板'],
+  ['Ctrl + V', '粘贴图片加入列表'],
+  ['拖文件进窗口', '直接加入列表'],
+]
+
 // ---------------------------------------------------------------- 网格视图 / 状态角标
 
 const GRID_KEY = 'comfyui-studio.comic.gridView:v1'
@@ -347,7 +512,9 @@ const previewW = ref(loadCol(COL_P_KEY, 302))
 const paramsW = ref(loadCol(COL_R_KEY, 330))
 
 const pageStyle = computed(() => ({
-  gridTemplateColumns: `minmax(0, 1fr) ${previewW.value}px ${paramsW.value}px`,
+  // 列宽交给 CSS 变量：媒体查询里窄屏要能覆盖掉（内联 grid-template-columns 会压过媒体查询）
+  '--pw': `${previewW.value}px`,
+  '--rw': `${paramsW.value}px`,
 }))
 
 /** 拖动列间分隔线调整预览/参数列宽（松手持久化） */
@@ -394,6 +561,16 @@ const folded = reactive<Record<string, boolean>>(
 
 function toggleFold(k: string) {
   folded[k] = !folded[k]
+  try {
+    localStorage.setItem(FOLD_KEY, JSON.stringify(folded))
+  } catch {
+    /* ignore */
+  }
+}
+
+/** 一键展开 / 折叠全部参数卡（窗口小的时候很省事） */
+function foldAll(v: boolean) {
+  for (const k of ['preset', 'canvas', 'frame', 'output']) folded[k] = v
   try {
     localStorage.setItem(FOLD_KEY, JSON.stringify(folded))
   } catch {
@@ -529,6 +706,10 @@ tickClock()
 
 const previewEl = ref<HTMLCanvasElement | null>(null)
 const outDims = ref<{ w: number; h: number } | null>(null)
+/** 预览里每张图顶部的 y（canvas 像素）与占高：给右侧导航条定位用 */
+const previewTops = ref<number[]>([])
+const previewHeights = ref<number[]>([])
+const curIdx = ref(0)
 const PREVIEW_W = 640
 let renderToken = 0
 let renderTimer: number | null = null
@@ -547,6 +728,8 @@ async function renderPreview() {
     c.height = 400
     outDims.value = null
     estSize.value = null
+    previewTops.value = []
+    previewHeights.value = []
     return
   }
   const dims = await renderInner(c)
@@ -554,7 +737,41 @@ async function renderPreview() {
   outDims.value = dims
     ? { w: comic.settings.width, h: Math.round(dims.height * (comic.settings.width / dims.width)) }
     : null
+  previewTops.value = dims?.tops ?? []
+  previewHeights.value = dims?.advs ?? []
   void estimateSize()
+}
+
+// ---- 长图导航条：滚到第几张、点一段跳过去 ----
+
+/** 每段按占高分配高度（最少 6px，不然细条点不中） */
+const railSegs = computed(() => previewHeights.value.map((h) => Math.max(6, Math.round(h))))
+
+function scrollToBlock(i: number) {
+  const c = previewEl.value
+  const el = phScrollEl.value
+  const top = previewTops.value[i]
+  if (!c || !el || top == null) return
+  const scale = (c.clientWidth || 1) / (c.width || 1)
+  const canvasTop = c.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop
+  el.scrollTo({ top: Math.max(0, canvasTop + top * scale - 4), behavior: 'smooth' })
+  curIdx.value = i
+}
+
+/** 滚动时更新「当前第几张」（按 canvas 顶边换算） */
+function onPhScroll() {
+  const c = previewEl.value
+  const el = phScrollEl.value
+  const tops = previewTops.value
+  if (!c || !el || !tops.length) return
+  const scale = (c.clientWidth || 1) / (c.width || 1)
+  const canvasTop = c.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop
+  const y = el.scrollTop - canvasTop
+  let idx = 0
+  for (let i = 0; i < tops.length; i++) {
+    if (y >= tops[i] * scale - 2) idx = i
+  }
+  curIdx.value = idx
 }
 
 /** 导出体积预估：预览图编码体积 × (目标宽/预览宽)² 面积比，粗估够用 */
@@ -823,10 +1040,42 @@ function resetEdit() {
   ratioLock.value = null
 }
 
+/** 编辑台里的值跟条目本身是否不同（决定切图/应用时要不要压一步撤销） */
+function editDirty(): boolean {
+  const it = editItem.value
+  if (!it) return false
+  const a = it.adjust ?? { bright: 100, contrast: 100, satur: 100 }
+  const fullR = rect.x <= 0.001 && rect.y <= 0.001 && rect.w >= 0.999 && rect.h >= 0.999
+  let cropSame: boolean
+  if (!it.crop) {
+    cropSame = fullR
+  } else if (fullR) {
+    cropSame = false
+  } else {
+    const c = it.crop
+    cropSame =
+      Math.abs(c.x - rect.x) < 1e-4 &&
+      Math.abs(c.y - rect.y) < 1e-4 &&
+      Math.abs(c.w - rect.w) < 1e-4 &&
+      Math.abs(c.h - rect.h) < 1e-4
+  }
+  return (
+    it.rotate % 4 !== editRotate.value % 4 ||
+    it.flipH !== editFlipH.value ||
+    it.flipV !== editFlipV.value ||
+    a.bright !== editAdj.bright ||
+    a.contrast !== editAdj.contrast ||
+    a.satur !== editAdj.satur ||
+    (it.fill ?? null) !== (editFillOn.value ? editFill.value : null) ||
+    !cropSame
+  )
+}
+
 function applyEditor() {
   const it = editItem.value
   if (!it || editing.value === null) return
-  pushHistory()
+  // 没动过就不压撤销栈：连着看 20 张不会把历史挤满
+  if (editDirty()) pushHistory()
   it.rotate = editRotate.value % 4
   it.flipH = editFlipH.value
   it.flipV = editFlipV.value
@@ -835,6 +1084,15 @@ function applyEditor() {
   const full = rect.x <= 0.001 && rect.y <= 0.001 && rect.w >= 0.999 && rect.h >= 0.999
   it.crop = full ? null : { x: rect.x, y: rect.y, w: rect.w, h: rect.h }
   editing.value = null
+}
+
+/** ← / →：当前这张先应用（没改动就跳过），紧接着打开相邻那张——连续修图不用关窗再双击 */
+function switchEdit(d: number) {
+  if (editing.value === null) return
+  const next = editing.value + d
+  if (next < 0 || next >= comic.items.length) return
+  applyEditor()
+  void openEditor(next)
 }
 
 // ---- 裁切框指针交互（整体移动 + 四角缩放，可锁比例） ----
@@ -943,47 +1201,87 @@ function doUniform() {
     <!-- 左列：图片列表 -->
     <div class="comic-mid">
       <div class="comic-toolbar">
-        <button class="btn sm" @click="pickImages">＋ 添加图片</button>
-        <button
-          class="btn sm"
-          title="分析所有图的宽高，按最常见比例统一居中裁切，画面更整齐"
-          @click="doUniform"
-        >
-          🎯 一键铺满
-        </button>
-        <button class="btn sm" :disabled="!comic.items.length" @click="doClear">清空</button>
-        <button
-          class="btn sm"
-          :disabled="!comicHistory.undo"
-          title="撤销上一步（Ctrl+Z）"
-          @click="undoComic()"
-        >
-          ↶ 撤销
-        </button>
-        <button
-          class="btn sm"
-          :disabled="!comicHistory.redo"
-          title="重做（Ctrl+Y）"
-          @click="redoComic()"
-        >
-          ↷ 重做
-        </button>
-        <button
-          class="btn sm"
-          :title="gridView ? '切换为行视图' : '切换为网格视图'"
-          @click="toggleGrid"
-        >
-          {{ gridView ? '📃 行视图' : '▦ 网格视图' }}
-        </button>
+        <div class="tb-group">
+          <button class="btn sm" @click="pickImages">＋ 添加图片</button>
+          <button
+            class="btn sm"
+            title="分析所有图的宽高，按最常见比例统一居中裁切，画面更整齐"
+            @click="doUniform"
+          >
+            🎯 一键铺满
+          </button>
+        </div>
+        <span class="tb-sep" />
+        <div class="tb-group">
+          <button
+            class="btn sm"
+            :disabled="!comicHistory.undo"
+            title="撤销上一步（Ctrl+Z）"
+            @click="undoComic()"
+          >
+            ↶
+          </button>
+          <button
+            class="btn sm"
+            :disabled="!comicHistory.redo"
+            title="重做（Ctrl+Y）"
+            @click="redoComic()"
+          >
+            ↷
+          </button>
+        </div>
+        <span class="tb-sep" />
+        <div class="tb-group">
+          <button
+            class="btn sm"
+            :title="gridView ? '切换为行视图' : '切换为网格视图'"
+            @click="toggleGrid"
+          >
+            {{ gridView ? '📃 列表' : '▦ 网格' }}
+          </button>
+          <div class="menu-wrap">
+            <button class="btn sm" title="排序 / 打乱顺序" @click.stop="sortOpen = !sortOpen">
+              ⇅ 排序 ▾
+            </button>
+            <div v-if="sortOpen" class="tb-menu" @click.stop>
+              <button @click="doSort('name')">按文件名（p2 在 p10 前）</button>
+              <button @click="doSort('time')">按文件修改时间</button>
+              <button @click="doSort('random')">随机打乱</button>
+              <button @click="doReverse">反转当前顺序</button>
+            </div>
+          </div>
+        </div>
         <span class="flex1" />
-        <button
-          class="btn sm"
-          :title="`本页主题：${THEME_UI[themeMode].label}（点击切换 跟随系统/深色/亮色）`"
-          @click="cycleTheme"
-        >
-          {{ THEME_UI[themeMode].icon }}
-        </button>
-        <span class="hint">拖图进窗口 · Ctrl+V 粘贴 · 拖动排序 · Ctrl/Shift 多选</span>
+        <div class="tb-group">
+          <button v-if="narrow" class="btn sm" title="打开手机预览" @click="previewOpen = true">
+            📱 预览
+          </button>
+          <button v-if="tiny" class="btn sm" title="打开参数面板" @click="drawerOpen = true">
+            ⚙ 参数
+          </button>
+          <button
+            class="btn sm"
+            :title="`本页主题：${THEME_UI[themeMode].label}（点击切换 跟随系统/深色/亮色）`"
+            @click="cycleTheme"
+          >
+            {{ THEME_UI[themeMode].icon }}
+          </button>
+          <div class="menu-wrap">
+            <button class="btn sm" title="更多" @click.stop="moreOpen = !moreOpen">⋯</button>
+            <div v-if="moreOpen" class="tb-menu right" @click.stop>
+              <button @click="moreOpen = false; helpOpen = true">⌨ 快捷键 / 帮助</button>
+              <button @click="moreOpen = false; foldAll(false)">展开全部参数卡</button>
+              <button @click="moreOpen = false; foldAll(true)">折叠全部参数卡</button>
+              <button
+                class="danger"
+                :disabled="!comic.items.length"
+                @click="moreOpen = false; doClear()"
+              >
+                清空列表
+              </button>
+            </div>
+          </div>
+        </div>
       </div>
 
       <!-- 批量操作条 -->
@@ -1008,14 +1306,19 @@ function doUniform() {
       <div
         ref="listEl"
         class="comic-list"
-        :class="{ grid: gridView }"
+        :class="{ grid: gridView, dragging: dragIdx !== null }"
         :data-image-key="DROP_KEY"
       >
         <div
           v-for="(it, i) in comic.items"
           :key="it.id"
           class="c-row"
-          :class="{ lifting: dragIdx === i, selected: sel.has(it.id), grid: gridView }"
+          :class="{
+            lifting: dragIdx === i,
+            selected: sel.has(it.id),
+            grid: gridView,
+            'drop-target': gridView && dropTargetIdx === i,
+          }"
           :data-cidx="i"
           :title="gridView ? '点选（Ctrl 多选 / Shift 范围）· 双击编辑 · 拖动换位' : ''"
           @click="rowClick(i, $event)"
@@ -1047,7 +1350,8 @@ function doUniform() {
               </div>
             </div>
             <div class="c-ops">
-              <button class="btn sm" title="裁切 / 旋转" @click.stop="openEditor(i)">✎</button>
+              <button class="btn sm" title="查看大图（空格）" @click.stop="openViewer(i)">👁</button>
+              <button class="btn sm" title="裁切 / 旋转（双击）" @click.stop="openEditor(i)">✎</button>
               <button class="btn sm" title="上移" :disabled="i === 0" @click.stop="moveComic(i, -1)">
                 ↑
               </button>
@@ -1073,7 +1377,8 @@ function doUniform() {
                 b.t
               }}</span>
               <div class="c-gops">
-                <button class="btn sm" title="裁切 / 旋转" @click.stop="openEditor(i)">✎</button>
+                <button class="btn sm" title="查看大图（空格）" @click.stop="openViewer(i)">👁</button>
+                <button class="btn sm" title="裁切 / 旋转（双击）" @click.stop="openEditor(i)">✎</button>
                 <button class="btn sm danger" title="移除" @click.stop="removeComicItem(it.id)">
                   ✕
                 </button>
@@ -1082,6 +1387,8 @@ function doUniform() {
             <div class="c-gname" :title="it.name">{{ it.name }}</div>
           </template>
         </div>
+        <!-- 拖动排序的落点横线：松手前就知道会插到哪两行之间 -->
+        <div v-if="dropLine !== null" class="c-dropline" :style="{ top: dropLine + 'px' }" />
         <div v-if="!comic.items.length" class="c-empty">
           还没有图片<br />
           <span>点「＋ 添加图片」选择文件，或把图片拖进窗口 / Ctrl+V 粘贴</span>
@@ -1096,8 +1403,9 @@ function doUniform() {
     </div>
 
     <!-- 中列：手机预览（仿公众号文章页样式，独立配色） -->
-    <div class="comic-preview-col">
+    <div class="comic-preview-col" :class="{ float: previewOpen }">
       <div class="col-split" title="拖动调整列宽" @pointerdown="startColResize('preview', $event)" />
+      <div class="ph-wrap">
       <div class="phone" :class="phoneCls" :style="{ zoom: previewZoom }">
         <div class="ph-status">
           <span>{{ clockText }}</span>
@@ -1107,7 +1415,7 @@ function doUniform() {
           <span class="ph-back">‹</span>
           <span class="ph-more">⋯</span>
         </div>
-        <div ref="phScrollEl" class="ph-scroll">
+        <div ref="phScrollEl" class="ph-scroll" @scroll.passive="onPhScroll">
           <div class="ph-head">
             <div
               class="ph-title"
@@ -1143,9 +1451,27 @@ function doUniform() {
           <span class="ph-stats">♡ 44&emsp;💬 3</span>
         </div>
       </div>
+        <!-- 长图导航条：每段高度按图占高分配，点一下跳到那张 -->
+        <div
+          v-if="comic.items.length > 1 && previewTops.length"
+          class="ph-rail"
+          title="长图导航：点一段跳到对应图片"
+        >
+          <button
+            v-for="(h, i) in railSegs"
+            :key="i"
+            class="ph-tick"
+            :class="{ on: curIdx === i }"
+            :style="{ flexGrow: h }"
+            :title="`第 ${i + 1} 张`"
+            @click="scrollToBlock(i)"
+          />
+        </div>
+      </div>
       <div class="phone-cap">
         <span class="pc-title">手机预览</span>
         <span v-if="outDims" class="pc-dims">{{ outDims.w }}×{{ outDims.h }}</span>
+        <span v-if="comic.items.length > 1" class="pc-idx">{{ curIdx + 1 }}/{{ comic.items.length }}</span>
         <span class="flex1" />
         <button
           class="pt-toggle ic"
@@ -1167,11 +1493,19 @@ function doUniform() {
           </button>
         </span>
         <button class="pt-toggle ic" title="回到长图顶部" @click="previewTop">↑</button>
+        <button v-if="previewOpen" class="pt-toggle ic" title="关闭预览" @click="previewOpen = false">
+          ✕
+        </button>
       </div>
     </div>
 
-    <!-- 右列：预设 + 合成参数 -->
-    <div class="comic-right">
+    <!-- 右列：预设 + 合成参数（<900px 时变右侧抽屉） -->
+    <div v-if="tiny && drawerOpen" class="drawer-mask" @click="drawerOpen = false" />
+    <div class="comic-right" :class="{ open: drawerOpen }">
+      <div class="drawer-head">
+        <span>合成参数</span>
+        <button class="btn ghost sm" title="收起" @click="drawerOpen = false">✕</button>
+      </div>
       <div class="col-split" title="拖动调整列宽" @pointerdown="startColResize('params', $event)" />
       <div class="p-card">
         <h4 class="foldable" @click="toggleFold('preset')">
@@ -1237,12 +1571,12 @@ function doUniform() {
         <div class="p-row">
           <span class="lbl">图间距</span>
           <input v-model.number="comic.settings.gap" type="range" min="0" max="60" />
-          <span class="val">{{ comic.settings.gap }}px</span>
+          <NumBox v-model="comic.settings.gap" :min="0" :max="60" unit="px" :dflt="0" />
         </div>
         <div class="p-row">
           <span class="lbl">四周留白</span>
           <input v-model.number="comic.settings.outerMargin" type="range" min="0" max="80" />
-          <span class="val">{{ comic.settings.outerMargin }}px</span>
+          <NumBox v-model="comic.settings.outerMargin" :min="0" :max="80" unit="px" :dflt="0" />
         </div>
         <div class="p-row">
           <span class="lbl">背景色</span>
@@ -1251,7 +1585,7 @@ function doUniform() {
         <div class="p-row">
           <span class="lbl">图片圆角</span>
           <input v-model.number="comic.settings.radius" type="range" min="0" max="48" />
-          <span class="val">{{ comic.settings.radius }}px</span>
+          <NumBox v-model="comic.settings.radius" :min="0" :max="48" unit="px" :dflt="0" />
         </div>
         </div>
       </div>
@@ -1283,7 +1617,14 @@ function doUniform() {
         <div class="p-row">
           <span class="lbl">框宽</span>
           <input v-model.number="comic.settings.borderWidth" type="range" min="0" max="10" step="0.5" />
-          <span class="val">{{ comic.settings.borderWidth }}px</span>
+          <NumBox
+            v-model="comic.settings.borderWidth"
+            :min="0"
+            :max="10"
+            :step="0.5"
+            unit="px"
+            :dflt="2"
+          />
         </div>
         <div class="p-row">
           <span class="lbl">框色</span>
@@ -1319,7 +1660,7 @@ function doUniform() {
         <div class="p-row" v-if="comic.settings.format === 'jpg'">
           <span class="lbl">质量</span>
           <input v-model.number="comic.settings.quality" type="range" min="50" max="100" />
-          <span class="val">{{ comic.settings.quality }}</span>
+          <NumBox v-model="comic.settings.quality" :min="50" :max="100" :dflt="92" />
         </div>
         <div class="p-row">
           <span class="lbl">分段导出</span>
@@ -1373,40 +1714,74 @@ function doUniform() {
           <div class="p-row">
             <span class="lbl">不透明度</span>
             <input v-model.number="comic.settings.wmOpacity" type="range" min="5" max="60" />
-            <span class="val">{{ comic.settings.wmOpacity }}%</span>
+            <NumBox v-model="comic.settings.wmOpacity" :min="5" :max="60" unit="%" :dflt="25" />
           </div>
           <div class="p-row">
             <span class="lbl">字号</span>
             <input v-model.number="comic.settings.wmSize" type="range" min="2" max="12" step="0.5" />
-            <span class="val">宽度的 {{ comic.settings.wmSize }}%</span>
+            <NumBox
+              v-model="comic.settings.wmSize"
+              :min="2"
+              :max="12"
+              :step="0.5"
+              unit="%"
+              :dflt="5"
+            />
           </div>
         </template>
         </div>
       </div>
 
-      <button
-        class="btn primary export"
-        :disabled="!comic.items.length || comic.busy"
-        @click="doExport"
-      >
-        {{ comic.busy ? '正在合成…' : estSize ? `合并并导出长图（约 ${fmtSize(estSize)}）` : '合并并导出长图' }}
-      </button>
-      <button
-        class="btn export"
-        :disabled="!comic.items.length || comic.busy"
-        title="每张图按当前设置（宽度/细框/圆角/背景/水印）单独导出成文件"
-        @click="doExportSingles"
-      >
-        🖼 {{ comic.items.length }} 张单图分别导出
-      </button>
-      <button
-        v-if="lastExport"
-        class="btn export"
-        title="在资源管理器中定位到导出的长图"
-        @click="openExportDir"
-      >
-        📂 打开所在文件夹
-      </button>
+      <!-- 导出区吸底：参数卡再多也不用往下翻找按钮 -->
+      <div class="export-dock">
+        <div v-if="comic.progress" class="prog">
+          <div class="prog-bar"><i :style="{ width: progressPct + '%' }" /></div>
+          <span class="prog-txt">
+            {{ comic.progress.label }} {{ comic.progress.done }}/{{ comic.progress.total }}
+          </span>
+        </div>
+        <button
+          class="btn primary export"
+          :disabled="!comic.items.length || comic.busy"
+          @click="doExport"
+        >
+          {{
+            comic.busy
+              ? comic.progress
+                ? `正在合成 ${comic.progress.done}/${comic.progress.total}…`
+                : '正在合成…'
+              : estSize
+                ? `合并并导出长图（约 ${fmtSize(estSize)}）`
+                : '合并并导出长图'
+          }}
+        </button>
+        <div class="export-row">
+          <button
+            class="btn export"
+            :disabled="!comic.items.length || comic.busy"
+            title="把整张长图复制到剪贴板，直接粘进公众号编辑器（PNG 无损，不受导出格式影响）"
+            @click="doCopy"
+          >
+            📋 复制长图
+          </button>
+          <button
+            class="btn export"
+            :disabled="!comic.items.length || comic.busy"
+            title="每张图按当前设置（宽度/细框/圆角/背景/水印）单独导出成文件"
+            @click="doExportSingles"
+          >
+            🖼 单图 ×{{ comic.items.length }}
+          </button>
+        </div>
+        <button
+          v-if="lastExport"
+          class="btn export"
+          title="在资源管理器中定位到导出的长图"
+          @click="openExportDir"
+        >
+          📂 打开所在文件夹
+        </button>
+      </div>
     </div>
 
     <!-- 裁切 / 旋转编辑器 -->
@@ -1414,7 +1789,26 @@ function doUniform() {
       <div class="crop-modal">
         <div class="crop-head">
           <h3>编辑 · {{ editItem?.name }}</h3>
-          <button class="btn ghost sm" @click="closeEditor">✕</button>
+          <span class="crop-nav">
+            <button
+              class="btn ghost sm"
+              :disabled="editing === 0"
+              title="上一张（←），当前改动会先应用"
+              @click="switchEdit(-1)"
+            >
+              ‹
+            </button>
+            <span class="crop-count">{{ (editing ?? 0) + 1 }} / {{ comic.items.length }}</span>
+            <button
+              class="btn ghost sm"
+              :disabled="editing === comic.items.length - 1"
+              title="下一张（→），当前改动会先应用"
+              @click="switchEdit(1)"
+            >
+              ›
+            </button>
+            <button class="btn ghost sm" title="关闭（Esc）" @click="closeEditor">✕</button>
+          </span>
         </div>
         <div
           ref="stageEl"
@@ -1474,9 +1868,55 @@ function doUniform() {
           <ColorPick v-if="editFillOn" v-model="editFill" />
         </div>
         <div class="crop-foot">
-          <span class="tip">拖动边角或整体调整裁切框；选比例后拖角会锁定比例</span>
+          <span class="tip">拖动边角或整体调整裁切框；选比例后拖角会锁定比例 · ←/→ 应用并切换上一张/下一张</span>
           <button class="btn" @click="closeEditor">取消</button>
           <button class="btn primary" @click="applyEditor">应用</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 大图查看器（空格 / 列表里的 👁） -->
+    <div v-if="viewing !== null && comic.items[viewing]" class="viewer-mask" @click.self="viewing = null">
+      <img class="viewer-img" :src="thumbOf(comic.items[viewing])" :alt="comic.items[viewing].name" />
+      <div class="viewer-bar">
+        <button
+          class="btn sm"
+          :disabled="viewing === 0"
+          title="上一张（←）"
+          @click="viewerStep(-1)"
+        >
+          ‹
+        </button>
+        <span class="viewer-count">{{ viewing + 1 }} / {{ comic.items.length }}</span>
+        <button
+          class="btn sm"
+          :disabled="viewing === comic.items.length - 1"
+          title="下一张（→）"
+          @click="viewerStep(1)"
+        >
+          ›
+        </button>
+        <button class="btn sm" title="去裁切 / 调色" @click="viewerEdit">✎ 编辑</button>
+        <button class="btn sm" title="关闭（Esc）" @click="viewing = null">✕</button>
+      </div>
+    </div>
+
+    <!-- 快捷键面板（? 或工具栏 ⋯） -->
+    <div v-if="helpOpen" class="crop-mask" @click.self="helpOpen = false">
+      <div class="crop-modal help-modal">
+        <div class="crop-head">
+          <h3>键盘快捷键</h3>
+          <button class="btn ghost sm" @click="helpOpen = false">✕</button>
+        </div>
+        <div class="help-grid">
+          <template v-for="[key, desc] in SHORTCUTS" :key="key">
+            <kbd>{{ key }}</kbd>
+            <span>{{ desc }}</span>
+          </template>
+        </div>
+        <div class="crop-foot">
+          <span class="tip">数值框里 ↑/↓ 微调一格，按住 Shift 一次走 10 格</span>
+          <button class="btn primary" @click="helpOpen = false">知道了</button>
         </div>
       </div>
     </div>

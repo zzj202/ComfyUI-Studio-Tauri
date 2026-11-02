@@ -38,9 +38,12 @@ base64 = "0.22"
 trash = "5"
 tauri-plugin-single-instance = "2.4.5"
 
-# 读取剪贴板里的文件列表（资源管理器复制的图片文件直接粘贴上传）
+# 读取剪贴板里的文件列表（资源管理器复制的图片文件直接粘贴上传）+ 写位图（漫画工坊复制长图）
 [target.'cfg(windows)'.dependencies]
 clipboard-win = "5"
+
+# 复制长图到剪贴板：Rust 侧把 PNG 解码成 CF_DIB（前端只传压缩字节，不搬几十 MB 的 RGBA）
+png = "0.17"
 
 [profile.release]
 codegen-units = 1

@@ -121,10 +121,13 @@ export const comic = reactive<{
   items: ComicItem[]
   settings: ComicSettings
   busy: boolean
+  /** 导出/复制的进度（null = 空闲）；导出按钮与进度条都用它 */
+  progress: { done: number; total: number; label: string } | null
 }>({
   items: loadJson<ComicItem[]>(ITEMS_KEY, []).map((it) => ({ ...it })),
   settings: loadJson(SET_KEY, { ...DEFAULT_SETTINGS }),
   busy: false,
+  progress: null,
 })
 
 // ---- 持久化（400ms 防抖）----
@@ -327,6 +330,82 @@ export function clearComic(): void {
   prepCache.clear()
 }
 
+// ---------------------------------------------------------------- 排序工具
+
+/**
+ * 自然序比较：把字符串切成「数字段 / 非数字段」逐段比。
+ * 这样 p2 < p10（而不是字典序的 p10 < p2），也兼容「1-2.png」「第3张」等命名。
+ * 非数字段用 localeCompare（中文按拼音），保证中文名排序稳定可读。
+ */
+export function naturalCompare(a: string, b: string): number {
+  const ax = a.match(/\d+|\D+/g) ?? [a]
+  const bx = b.match(/\d+|\D+/g) ?? [b]
+  const n = Math.min(ax.length, bx.length)
+  for (let i = 0; i < n; i++) {
+    const x = ax[i]
+    const y = bx[i]
+    const xd = /^\d+$/.test(x)
+    const yd = /^\d+$/.test(y)
+    if (xd && yd) {
+      const d = Number(x) - Number(y)
+      if (d) return d
+    } else {
+      const d = x.localeCompare(y, 'zh-Hans-CN', { sensitivity: 'base' })
+      if (d) return d
+    }
+  }
+  return ax.length - bx.length
+}
+
+export type SortMode = 'name' | 'time' | 'random'
+
+/** 重排整个列表（name = 文件名自然序 / time = 文件修改时间正序 / random = 随机）。
+ *  只动顺序、不动每张图的编辑参数；整次重排算一步撤销。 */
+export async function sortComic(mode: SortMode): Promise<void> {
+  const items = comic.items
+  if (items.length < 2) return
+
+  if (mode === 'random') {
+    pushHistory()
+    for (let i = items.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1))
+      ;[items[i], items[j]] = [items[j], items[i]]
+    }
+    notify('已随机打乱顺序（Ctrl+Z 可撤销）', 'ok', 3000)
+    return
+  }
+
+  if (mode === 'time') {
+    let times: number[] = []
+    try {
+      times = await api.pathMtimes(items.map((it) => it.path))
+    } catch (e) {
+      notify(`读取修改时间失败：${e}`, 'error', 6000)
+      return
+    }
+    pushHistory()
+    const order = items.map((it, i) => ({ it, t: times[i] || 0, i }))
+    // 时间相同（或都取不到）时保持原有相对顺序
+    order.sort((a, b) => a.t - b.t || a.i - b.i)
+    items.splice(0, items.length, ...order.map((o) => o.it))
+    notify('已按文件修改时间排序（旧的在前）', 'ok', 3000)
+    return
+  }
+
+  pushHistory()
+  const sorted = [...items].sort((a, b) => naturalCompare(a.name, b.name))
+  items.splice(0, items.length, ...sorted)
+  notify('已按文件名自然排序（p2 在 p10 前）', 'ok', 3000)
+}
+
+/** 反转当前顺序（倒着看/倒着排都用得上），算一步撤销 */
+export function reverseComic(): void {
+  if (comic.items.length < 2) return
+  pushHistory()
+  comic.items.reverse()
+  notify('已反转顺序', 'ok', 2500)
+}
+
 // ---------------------------------------------------------------- 一键铺满
 
 /** 旋转后的可用宽高 */
@@ -502,7 +581,9 @@ export async function renderComic(
   canvas: HTMLCanvasElement,
   items: ComicItem[],
   o: ComicSettings,
-  targetWidth: number
+  targetWidth: number,
+  /** 进度回调（已读张数 / 总数）：导出大图时给 UI 报「读取图片 3/12」 */
+  onStep?: (done: number, total: number) => void
 ): Promise<{
   width: number
   height: number
@@ -519,6 +600,7 @@ export async function renderComic(
         it.h = bmp.height
       }
       bmps.push(bmp)
+      onStep?.(bmps.length, items.length)
     } catch (e) {
       notify(`读取图片失败：${it.name}（${e}）`, 'error', 7000)
       return null
@@ -650,7 +732,16 @@ export async function exportComic(): Promise<string | null> {
   comic.busy = true
   try {
     const full = document.createElement('canvas')
-    const dims = await renderComic(full, comic.items, comic.settings, comic.settings.width)
+    comic.progress = { done: 0, total: comic.items.length, label: '读取图片' }
+    const dims = await renderComic(
+      full,
+      comic.items,
+      comic.settings,
+      comic.settings.width,
+      (done, total) => {
+        comic.progress = { done, total, label: '读取图片' }
+      }
+    )
     if (!dims) return null
     const mime = comic.settings.format === 'png' ? 'image/png' : 'image/jpeg'
 
@@ -691,6 +782,7 @@ export async function exportComic(): Promise<string | null> {
     const paths: string[] = []
     for (let k = 0; k < segs.length; k++) {
       const { a, b } = segs[k]
+      comic.progress = { done: k, total: segs.length, label: '编码保存' }
       const c = document.createElement('canvas')
       c.width = dims.width
       c.height = b - a
@@ -719,6 +811,7 @@ export async function exportComic(): Promise<string | null> {
     return null
   } finally {
     comic.busy = false
+    comic.progress = null
   }
 }
 
@@ -731,6 +824,7 @@ export async function exportSingleImages(): Promise<string | null> {
   }
   if (comic.busy) return null
   comic.busy = true
+  comic.progress = { done: 0, total: comic.items.length, label: '单图导出' }
   try {
     const o = comic.settings
     const bw = Math.max(0, o.borderWidth)
@@ -752,6 +846,9 @@ export async function exportSingleImages(): Promise<string | null> {
     let okCount = 0
     for (let i = 0; i < comic.items.length; i++) {
       const it = comic.items[i]
+      comic.progress = { done: i, total: comic.items.length, label: '单图导出' }
+      // 让出一帧，进度条才会真的动（不然整轮跑完界面才更新）
+      await new Promise((r) => setTimeout(r, 0))
       let prep: HTMLCanvasElement
       try {
         const bmp = await loadBitmap(it.path)
@@ -839,6 +936,48 @@ export async function exportSingleImages(): Promise<string | null> {
     return null
   } finally {
     comic.busy = false
+    comic.progress = null
+  }
+}
+
+/** 合成整张长图并复制进系统剪贴板（直接粘到公众号编辑器）。
+ *  格式固定用 PNG（无损），不受导出格式设置影响；超大长图会在 Rust 侧被拦下。 */
+export async function copyComicToClipboard(): Promise<boolean> {
+  if (!comic.items.length) {
+    notify('先添加图片再复制', 'warn', 2500)
+    return false
+  }
+  if (comic.busy) return false
+  comic.busy = true
+  comic.progress = { done: 0, total: comic.items.length, label: '读取图片' }
+  try {
+    const full = document.createElement('canvas')
+    const dims = await renderComic(
+      full,
+      comic.items,
+      comic.settings,
+      comic.settings.width,
+      (done, total) => {
+        comic.progress = { done, total, label: '读取图片' }
+      }
+    )
+    if (!dims) return false
+    comic.progress = { done: 1, total: 1, label: '编码 PNG' }
+    const blob = await new Promise<Blob | null>((res) => full.toBlob(res, 'image/png'))
+    if (!blob) throw new Error('图片编码失败')
+    const r = await api.clipboardWriteImage(await blobToB64(blob))
+    notify(
+      `已复制 ${r.width}×${r.height} 长图到剪贴板，去公众号编辑器 Ctrl+V 粘贴即可`,
+      'ok',
+      8000
+    )
+    return true
+  } catch (e) {
+    notify(`复制到剪贴板失败：${e}`, 'error', 9000)
+    return false
+  } finally {
+    comic.busy = false
+    comic.progress = null
   }
 }
 

@@ -181,6 +181,8 @@ pub fn run() {
             store::app_data_dir,
             store::save_temp_bytes,
             store::clipboard_file_paths,
+            store::clipboard_write_image,
+            store::path_mtimes,
             store::list_local_media,
             store::read_local_file,
             store::save_local_bytes,
