@@ -3,8 +3,10 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api, saveTempBlob, viewUrl } from '../api/tauri'
 import { downloadDir } from '@tauri-apps/api/path'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
+import { ui } from '../ui'
 import type { Asset, Job } from '../core/types'
 import { IMG_EXT_RE } from '../core/clipboard'
+import { extractPromptTitle } from '../core/batchText'
 import {
   addManualAsset,
   applyAssetParams,
@@ -488,6 +490,7 @@ async function downloadOne(a: Asset) {
     const dir = (configured || String(await downloadDir())).replace(/[\\/]+$/, '')
     const dest = `${dir}/${safeAssetFilename(a)}`
     const r = await api.saveOutput(a.base ?? primaryBase(), a.filename, a.subfolder, a.type, dest)
+    ui.fsChangeTick++ // 下载落盘 → 素材面板立即刷新（不等 5s 轮询）
     notify(`已保存：${r.path}`, 'ok', 4000)
   } catch (e) {
     notify(`保存失败：${e}`, 'error', 8000)
@@ -506,9 +509,22 @@ async function openOutputDir() {
 const editingKey = ref<string | null>(null)
 const editName = ref('')
 
+/** 从资产参数快照的提示词里识别批量稿标题（【第 N 条｜标题】等），作为重命名建议 */
+function titleSuggestion(a: Asset): string | null {
+  const p = a.params
+  if (!p) return null
+  for (const v of Object.values(p)) {
+    if (typeof v !== 'string' || !v.trim() || IMG_EXT_RE.test(v.trim())) continue
+    const t = extractPromptTitle(v)
+    if (t) return t
+  }
+  return null
+}
+
 function startRename(a: Asset) {
   editingKey.value = a.key
-  editName.value = a.alias ?? ''
+  // 已有别名沿用别名；否则自动识别提示词里的批量稿标题（【第 31 条｜携手拜年：…】→「31 携手拜年：…」）
+  editName.value = a.alias ?? titleSuggestion(a) ?? ''
   nextTick(() => {
     const el = document.getElementById('asset-rename') as HTMLInputElement | null
     el?.focus()
@@ -596,7 +612,8 @@ const lbEditName = ref('')
 function startLbRename() {
   const a = lbAsset.value
   if (!a) return
-  lbEditName.value = a.alias ?? ''
+  // 已有别名沿用别名；否则自动识别提示词里的批量稿标题
+  lbEditName.value = a.alias ?? titleSuggestion(a) ?? ''
   lbEditing.value = true
   nextTick(() => {
     const el = document.getElementById('lb-rename') as HTMLInputElement | null
@@ -1334,6 +1351,7 @@ onUnmounted(() => {
                 id="asset-rename"
                 v-model="editName"
                 class="rename-input"
+                :placeholder="titleSuggestion(a) ?? '输入名称，回车确认'"
                 @click.stop
                 @keydown.enter.prevent="confirmRename(a)"
                 @keydown.esc.prevent="cancelRename"
@@ -1421,7 +1439,7 @@ onUnmounted(() => {
             id="lb-rename"
             v-model="lbEditName"
             class="lb-rename"
-            placeholder="输入名称，回车确认"
+            :placeholder="lbAsset ? (titleSuggestion(lbAsset) ?? '输入名称，回车确认') : '输入名称，回车确认'"
             @keydown.enter.prevent="confirmLbRename"
             @keydown.esc.prevent="lbEditing = false"
             @blur="confirmLbRename"

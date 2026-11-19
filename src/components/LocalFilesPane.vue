@@ -97,6 +97,15 @@ watch(
   { immediate: true }
 )
 
+/** 全局文件系统变更信号（下载/截帧保存落盘后 ui.fsChangeTick++）→ 立即静默刷新，
+ *  不等 5s 轮询；两个窗格实例各自响应，只刷自己浏览的目录 */
+watch(
+  () => ui.fsChangeTick,
+  () => {
+    if (ui.localFilesOpen && dir.value) void silentRefresh()
+  }
+)
+
 async function load() {
   if (!dir.value) return
   loading.value = true
@@ -273,6 +282,7 @@ async function saveFrame(it: MediaItem) {
     }
     const saved = await api.saveLocalBytes(dir, `p${max + 1}.png`, await blobToB64(png))
     notify(`已保存：${saved}`, 'ok', 5000)
+    ui.fsChangeTick++ // 全局信号：另一个窗格（若浏览同一目录）也立即刷新
     void silentRefresh()
   } catch (e) {
     notify(`截帧保存失败：${e}`, 'error', 8000)
@@ -289,7 +299,19 @@ async function copyImage(it: MediaItem) {
   }
 }
 
-/** 预览浮层的键盘：Q/E 逐帧、空格播放/暂停、R 截帧、Ctrl+C 复制图片、Del 删除（回收站）。
+/** 预览翻页：在当前目录的媒体项里循环切换（跳过文件夹，顺序 = 列表 mtime 倒序）。
+ *  图片/视频通用——与结果区灯箱的 A/D 行为一致。 */
+function stepPvItem(d: number) {
+  const list = items.value.filter((it) => !it.isDir)
+  if (list.length < 2) return
+  const idx = list.findIndex((it) => it.path === preview.value?.path)
+  if (idx < 0) return
+  const next = list[(idx + d + list.length) % list.length]
+  if (next) preview.value = next
+}
+
+/** 预览浮层的键盘：A/D 或 ←/→ 翻上一张/下一张（图片视频通用）、Q/E 逐帧、
+ *  空格播放/暂停、R 截帧、S 保存截帧、Ctrl+C 复制图片、Del 删除（回收站）。
  *  两个窗格各有一份监听，但同一时刻最多一个 preview 非空，不会双触发。 */
 function onPvKey(e: KeyboardEvent) {
   if (!preview.value) return
@@ -304,6 +326,17 @@ function onPvKey(e: KeyboardEvent) {
     return
   }
   if (e.ctrlKey || e.metaKey || e.altKey) return
+  // A/D 与 ←/→ 翻页放 video 判断之前：图片预览同样可翻
+  if (k === 'a' || k === 'A' || k === 'ArrowLeft') {
+    e.preventDefault()
+    stepPvItem(-1)
+    return
+  }
+  if (k === 'd' || k === 'D' || k === 'ArrowRight') {
+    e.preventDefault()
+    stepPvItem(1)
+    return
+  }
   if (k === 'Delete') {
     e.preventDefault()
     void deleteItem(preview.value)
@@ -533,6 +566,7 @@ onUnmounted(() => {
                 />
                 <span v-else class="lf-ph">{{ it.kind === 'video' ? '🎬' : '🖼' }}</span>
                 <span v-if="it.kind === 'video'" class="lf-kind">▶</span>
+                <span class="lf-fname" :title="it.name">{{ it.name }}</span>
               </template>
             </div>
           </div>
@@ -571,6 +605,9 @@ onUnmounted(() => {
         <img v-else :src="thumbUrl(preview)" :alt="preview.name" />
       </div>
       <div class="lf-pv-cap">
+        <button class="btn sm ghost" title="上一张（← / A）" @click="stepPvItem(-1)">‹</button>
+        <button class="btn sm ghost" title="下一张（→ / D）" @click="stepPvItem(1)">›</button>
+        <span class="spacer" style="width: 6px" />
         <template v-if="preview.kind === 'video'">
           <button class="btn sm ghost" title="上一帧（Q）" @click="stepPv(-1)">⏮</button>
           <button class="btn sm ghost" :title="pvPlaying ? '暂停（空格）' : '播放（空格）'" @click="togglePv">
@@ -777,7 +814,7 @@ onUnmounted(() => {
 .lf-kind {
   position: absolute;
   right: 3px;
-  bottom: 3px;
+  top: 3px;
   padding: 1px 5px;
   border-radius: 999px;
   background: rgba(13, 16, 23, 0.62);
@@ -785,6 +822,23 @@ onUnmounted(() => {
   color: #e7ecf5;
   font-size: 9px;
   line-height: 1.3;
+  pointer-events: none;
+}
+/* 文件名条：卡片底部半透明 overlay，单行截断（视频 ▶ 已移到右上避让） */
+.lf-fname {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 2px 4px;
+  background: rgba(13, 16, 23, 0.62);
+  color: #e7ecf5;
+  font-size: 9px;
+  line-height: 1.35;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   pointer-events: none;
 }
 /* 行内重命名输入框：铺满整卡 */

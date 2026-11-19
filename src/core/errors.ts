@@ -38,6 +38,7 @@ export function extractSubmitError(res: any, graph: any): string | null {
   if (!res) return '提交失败：无响应'
 
   if (res._ok === false) {
+    // HTTP 非 2xx：ComfyUI 校验失败不执行（400 + node_errors / error，无 prompt_id）
     const httpStatus = res._http_status
     const ne = res.node_errors && Object.keys(res.node_errors).length ? res.node_errors : null
     if (ne) return `HTTP ${httpStatus}\n${formatNodeErrors(ne, graph)}`
@@ -48,12 +49,22 @@ export function extractSubmitError(res: any, graph: any): string | null {
     return `HTTP ${httpStatus}\n${res._text || res._raw || '未知错误'}`
   }
 
-  // 200 但带 node_errors：这是最阴的一种
-  if (res.node_errors && Object.keys(res.node_errors).length) {
-    return formatNodeErrors(res.node_errors, graph)
-  }
+  // 200 + prompt_id = 校验已通过、任务已入队，必执行。
+  // 注意：新版 ComfyUI 把「警告级」提示也塞在 node_errors 字段里随 200 返回
+  // （任务照常执行）——这里绝不能因为 node_errors 非空就判失败：
+  // 误判 → 节点被冷却 → 单机用户三轮重试全灭「已无可用节点」，
+  // 而任务在服务器上正常跑，表现就是「工作台报错但 ComfyUI 后台正常执行」。
+  // 真正的执行期错误由 WS 的 execution_error → onError 兜底标 error。
+  // node_errors 的警告文案由调用方（dispatchOne）在成功路径上以 warn 展示。
   if (!res.prompt_id) return '提交失败：响应里没有 prompt_id'
   return null
+}
+
+/** 200 + prompt_id + node_errors 时的警告文案（任务已入队执行，仅供提示，不判失败） */
+export function extractSubmitWarnings(res: any, graph: any): string | null {
+  const ne = res?.node_errors && Object.keys(res.node_errors).length ? res.node_errors : null
+  if (!ne) return null
+  return formatNodeErrors(ne, graph)
 }
 
 /** 把 history 的 outputs 规范化成统一列表 */

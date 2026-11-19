@@ -7,7 +7,7 @@ import {
   parseGraph,
   randomSeed,
 } from './core/parseWorkflow'
-import { extractSubmitError, normalizeOutputs } from './core/errors'
+import { extractSubmitError, extractSubmitWarnings, normalizeOutputs } from './core/errors'
 import { BATCH_TEXT_MAX, splitBatchLines } from './core/batchText'
 import { cooldownWorker, selectWorker } from './core/scheduler'
 import { ensureAudio, playChime } from './core/chime'
@@ -1749,7 +1749,8 @@ export const batchTextPending = ref<{
 export function confirmBatchText(
   action: 'split' | 'whole' | 'cancel',
   remember: boolean,
-  count = submitBatch.value
+  count = submitBatch.value,
+  selectedLines?: string[]
 ) {
   const p = batchTextPending.value
   if (!p) return
@@ -1759,7 +1760,8 @@ export function confirmBatchText(
   const f = state.fields.find((x) => x.key === p.fieldKey)
   if (f) f.value = p.raw
   if (action === 'split') {
-    submitBatchText(p.lines, p.fieldKey, p.fieldLabel, count)
+    // 选择框：只提交勾选的条目（未传则全量）
+    submitBatchText(selectedLines ?? p.lines, p.fieldKey, p.fieldLabel, count)
   } else {
     submit()
     notify(`已粘贴并提交到「${p.fieldLabel}」`, 'ok', 2000)
@@ -1955,6 +1957,10 @@ async function dispatchOne(
       const res = await api.submit(target.base, graph, workflow ?? undefined, paramsJson)
       const err = extractSubmitError(res, graph)
       if (err) throw new Error(err)
+      // 200 + prompt_id 已入队；node_errors 此刻只是警告（新版 ComfyUI 把 warning
+      // 也塞在该字段里），展示但不冷却不改派——判死会造成「工作台报错但后台正常跑」
+      const warn = extractSubmitWarnings(res, graph)
+      if (warn) notify(`节点校验警告（任务已正常入队）：\n${warn}`, 'warn', 9000)
       // graph 一并带回：排队任务「改派」要用原图重新提交（store.requeueJob）
       return { promptId: String(res.prompt_id), base: target.base, workerId: target.id, graph }
     } catch (e) {

@@ -8,21 +8,41 @@ use tauri::Manager;
 /// 显示并聚焦主窗口（托盘单击 / 托盘菜单 / 全局热键共用）
 fn show_main(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
-        let _ = w.unminimize();
-        let _ = w.show();
-        let _ = w.set_focus();
+        focus_front(&w);
     }
 }
 
-/// Alt+2 专用：隐藏或最小化 → 呼出；可见 → 最小化（呼出/最小化切换）
+/// 把窗口带到桌面最上方并激活。
+/// Windows 对后台进程直接 SetForegroundWindow 有前台锁限制（热键触发时本进程
+/// 必然在后台，调用会被系统静默拒绝），用「短暂置顶 → 聚焦 → 取消置顶」的
+/// 常规手法绕过：置顶瞬间把窗口抬到 Z 序顶端，取消后仍保持在其他窗口之上。
+fn focus_front(w: &tauri::WebviewWindow) {
+    let _ = w.unminimize();
+    let _ = w.show();
+    #[cfg(windows)]
+    {
+        let _ = w.set_always_on_top(true);
+        let _ = w.set_focus();
+        let _ = w.set_always_on_top(false);
+    }
+    #[cfg(not(windows))]
+    let _ = w.set_focus();
+}
+
+/// Alt+2 三态切换：
+/// 1. 最小化 / 隐藏到托盘 → 恢复并激活到桌面最上方
+/// 2. 可见但不在最前（用户在别的窗口里） → 激活到桌面最上方
+/// 3. 已在最前（当前聚焦的就是本窗口） → 最小化
 fn toggle_main(app: &tauri::AppHandle) {
     if let Some(w) = app.get_webview_window("main") {
         let minimized = w.is_minimized().unwrap_or(false);
         let visible = w.is_visible().unwrap_or(false);
         if minimized || !visible {
-            show_main(app);
-        } else {
+            focus_front(&w);
+        } else if w.is_focused().unwrap_or(false) {
             let _ = w.minimize();
+        } else {
+            focus_front(&w);
         }
     }
 }

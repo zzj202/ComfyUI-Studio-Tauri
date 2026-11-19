@@ -23,4 +23,7 @@ export const ui = reactive({
   assetPick: false,
   /** 置为本地路径即请求打开「资产工作流」查看器（由 AssetDrop 消费后复位） */
   assetInspect: null as string | null,
+  /** 本地文件系统变更信号（下载/截帧保存落盘后 ++）：素材窗格 watch 到即立即刷新，
+   *  不等 5s 静默轮询。任何写本地文件夹的功能完成后都应该 bump 一下。 */
+  fsChangeTick: 0,
 })

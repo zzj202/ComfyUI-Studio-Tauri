@@ -1,10 +1,11 @@
 <script setup lang="ts">
 /**
  * 批量拆行确认弹窗（方案 A）：粘贴/拆行按钮识别到多行提示词时弹出。
- * 「逐条提交」= 每行一个独立任务（走 runChain，改派/ETA/看板全兼容）；
+ * 「逐条提交」= 每行一个独立任务（走 runChain，改派/ETA/看板全兼容），
+ *   列表每条带勾选框（默认全选），只提交勾选的条目；
  * 「整段提交」= 按普通单任务提交；可勾选记住选择（设置里可改回）。
  */
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { BATCH_TEXT_MAX } from '../core/batchText'
 import { batchTextPending, confirmBatchText, submitBatch } from '../store'
 
@@ -17,7 +18,30 @@ const p = computed(() => batchTextPending.value)
 const lines = computed(() => (p.value ? p.value.lines.slice(0, BATCH_TEXT_MAX) : []))
 const total = computed(() => p.value?.lines.length ?? 0)
 const truncated = computed(() => total.value > BATCH_TEXT_MAX)
-const jobCount = computed(() => lines.value.length * perLine.value)
+
+/** 勾选状态（按 lines 索引）：新文本弹窗时默认全选 */
+const checked = ref<Set<number>>(new Set())
+watch(
+  () => p.value?.raw,
+  () => {
+    checked.value = new Set(lines.value.map((_, i) => i))
+  },
+  { immediate: true }
+)
+
+function toggle(i: number) {
+  const s = new Set(checked.value)
+  if (s.has(i)) s.delete(i)
+  else s.add(i)
+  checked.value = s
+}
+const allChecked = computed(() => lines.value.length > 0 && checked.value.size === lines.value.length)
+function toggleAll() {
+  checked.value = allChecked.value ? new Set() : new Set(lines.value.map((_, i) => i))
+}
+const selLines = computed(() => lines.value.filter((_, i) => checked.value.has(i)))
+const selCount = computed(() => selLines.value.length)
+const jobCount = computed(() => selCount.value * perLine.value)
 </script>
 
 <template>
@@ -29,7 +53,7 @@ const jobCount = computed(() => lines.value.length * perLine.value)
       </div>
       <div class="modal-body">
         <div class="hint">
-          按换行/编号/字段块拆分「{{ p.fieldLabel }}」：每条独立成任务，第 1 个沿用当前种子、其余自动换新不重样。编号块（1️⃣/1./【1】/[Shot 1]…）与字段块（integrated_multimodal_description: 等同一字段标签开头）会整块保留（描述+音效+配乐），自动去除 plaintext 等代码栏残留。
+          按换行/编号/字段块拆分「{{ p.fieldLabel }}」：每条独立成任务，第 1 个沿用当前种子、其余自动换新不重样。编号块（1️⃣/1./【1】/[Shot 1]…）与字段块（integrated_multimodal_description: 等同一字段标签开头）会整块保留（描述+音效+配乐），自动去除 plaintext 等代码栏残留。勾选要提交的条目（默认全选）。
         </div>
         <div class="bt-count">
           <span>每条生成</span>
@@ -41,21 +65,37 @@ const jobCount = computed(() => lines.value.length * perLine.value)
             class="input bt-num"
             title="每行提示词生成的张数（1–10）"
           />
-          <span>张 · 共 <b>{{ jobCount }}</b> 个任务</span>
+          <span>张 · 勾选 <b>{{ selCount }}</b>/{{ lines.length }} 条 · 共 <b>{{ jobCount }}</b> 个任务</span>
+          <span class="spacer" />
+          <button class="btn ghost sm bt-all" @click="toggleAll">
+            {{ allChecked ? '全不选' : '全选' }}
+          </button>
         </div>
         <div v-if="truncated" class="bt-warn">超过 {{ BATCH_TEXT_MAX }} 条，将只提交前 {{ BATCH_TEXT_MAX }} 条</div>
         <div class="bt-list">
-          <div v-for="(l, i) in lines" :key="i" class="bt-line" :title="l">
+          <label
+            v-for="(l, i) in lines"
+            :key="i"
+            class="bt-line"
+            :class="{ off: !checked.has(i) }"
+            :title="l"
+          >
+            <input type="checkbox" class="bt-chk" :checked="checked.has(i)" @change="toggle(i)" />
             <span class="bt-idx">{{ i + 1 }}</span>
             <span class="bt-txt">{{ l }}</span>
-          </div>
+          </label>
         </div>
         <label class="bt-remember" title="逐条：之后粘贴多行不再询问，自动拆分提交；整段：之后多行也按一条提交">
           <input v-model="remember" type="checkbox" />
           记住选择，之后粘贴多行不再询问
         </label>
         <div class="bt-btns">
-          <button class="btn" @click="confirmBatchText('split', remember, perLine)">
+          <button
+            class="btn"
+            :disabled="selCount === 0"
+            :title="selCount === 0 ? '至少勾选一条' : ''"
+            @click="confirmBatchText('split', remember, perLine, selLines)"
+          >
             ⚡ 逐条提交 {{ jobCount }} 个任务
           </button>
           <button class="btn" @click="confirmBatchText('whole', remember, perLine)">整段提交 1 个</button>
@@ -84,6 +124,9 @@ const jobCount = computed(() => lines.value.length * perLine.value)
   font-size: 12.5px;
   color: var(--text-dim);
 }
+.bt-count .spacer {
+  flex: 1;
+}
 .bt-num {
   width: 64px;
   padding: 4px 8px;
@@ -103,9 +146,24 @@ const jobCount = computed(() => lines.value.length * perLine.value)
   gap: 8px;
   padding: 6px 10px;
   border-bottom: 1px solid var(--border-soft);
+  cursor: pointer;
+  user-select: none;
 }
 .bt-line:last-child {
   border-bottom: none;
+}
+.bt-line.off .bt-txt,
+.bt-line.off .bt-idx {
+  opacity: 0.38;
+}
+.bt-chk {
+  flex: none;
+  align-self: center;
+  accent-color: var(--accent, #4f7cff);
+  cursor: pointer;
+}
+.bt-all {
+  flex: none;
 }
 .bt-idx {
   flex: none;
