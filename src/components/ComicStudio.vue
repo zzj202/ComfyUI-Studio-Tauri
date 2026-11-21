@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
-import { ask, open } from '@tauri-apps/plugin-dialog'
+import { open } from '@tauri-apps/plugin-dialog'
+import { appConfirm } from '../core/confirm'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { assetDropTargets, imageDropTargets, notify } from '../store'
@@ -59,9 +60,10 @@ async function pickImages() {
 
 async function doClear() {
   if (!comic.items.length) return
-  const yes = await ask(`清空全部 ${comic.items.length} 张图片？（可 Ctrl+Z 撤销）`, {
-    title: '漫画工坊',
-    kind: 'warning',
+  const yes = await appConfirm({
+    title: '清空漫画',
+    message: `清空全部 ${comic.items.length} 张图片？\n可 Ctrl+Z 撤销。`,
+    danger: true,
     okLabel: '清空',
     cancelLabel: '先不了',
   })

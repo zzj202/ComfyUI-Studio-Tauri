@@ -4,11 +4,14 @@
  * 两种模式（自动识别，无需选择）：
  * 1. 编号块模式——分镜/步骤类文本：每块以编号起始行开头（跨多行），整块 = 一条提示词。
  *    识别的编号形式：`1️⃣ 标题`、`1. / 1、/ 1) / 1） / 1: / 1： / 01｜标题`、`01【分类】标题`、`【1】`、
- *    `【图1｜下班进门 · 有字版】标题`（前缀词+数字+竖线，四格漫画格子批量稿）、`【1】`、
+ *    `【1. 标题】`（【】包裹编号+点号，2026-11-21；编号分隔符后不跟数字——0.0-1.2s 这类
+ *    时间轴行不是编号，防止把整稿的编号序列打断回落按行拆）、`【图1｜下班进门 · 有字版】标题`（前缀词+数字+竖线，四格漫画格子批量稿）、`【1】`、
  *    `【第 1 条｜标题】`/`【新第 61 条｜标题（短语）】`（「新」前缀可选）、`提示词 1：标题`（含 `提示词 1-1：` 子编号）、`【提示词 1-1】标题`、`[1]`、`[Shot 1]`、`#1`、
  *    `【玩球 · 动作一】标题正文`（前缀词+中文数字，一~九十九，前缀可含 ref-0 这类
  *    阿拉伯数字片段、最长 20 字符）、`标题：xxx`（无数字独立标题行，按出现顺序赋号），以及无数字的
  *    `【纯中文标题】`（整行仅标题、≥4 字符，按出现顺序赋号）。
+ *    `## 1. 坐下`（Markdown 标题编号，2026-11-21）：≥2 个 `##` 开头编号标题 = 条目边界，
+ *    此时块内行首的 `[Shot N]` 视为条目内部结构不再切块（英文稿 detailed_description 分镜行）。
  *    触发条件：全文 ≥2 个编号起始行且编号严格递增（连续性校验防误伤普通文本）。
  *    块内清洗：丢弃空行、孤立的代码栏标记行（``` / plaintext / json）与
  *    纯分隔线行（======== / -------- 等 ≥6 个同一分隔字符）。
@@ -29,8 +32,9 @@ export const BATCH_TEXT_MAX = 100
 /** 孤立的代码栏标记行（从 markdown 复制分镜时残留的 ``` / plaintext 等） */
 const FENCE_LINE_RE = /^\s*(?:`{3,}|~{3,}|'''|"'''|plaintext|text|json)\s*$/i
 
-/** 纯分隔线行（======== / -------- / ******** 等 ≥6 个同一分隔字符） */
-const SEPARATOR_LINE_RE = /^\s*([-=_*~#×]{6,})\s*$/
+/** 纯分隔线行（======== / -------- / ******** 等 ≥3 个同一分隔字符；
+ *  2026-11-21 从 {6,} 放宽到 {3,}——英文批量稿块间常用 Markdown 的 --- 分隔） */
+const SEPARATOR_LINE_RE = /^\s*([-=_*~#×])\1{2,}\s*$/
 
 /** 行首字段标签（如 integrated_multimodal_description: / overall_soundscape:）。
  *  要求标签 ≥3 字符且纯 ASCII 标识符，避免把普通句子冒号误当字段。 */
@@ -38,10 +42,13 @@ const FIELD_LABEL_RE = /^\s*([A-Za-z_][A-Za-z0-9_]{2,})\s*:/
 
 /** 行首编号判定结果：n = 编号值；strong = 强模式（行首有【】包裹/「第 N 条」/「提示词 N」/
  *  keycap/[Shot]/#/「数字｜」等强特征，多系列编号各自从 03 重置也不做递增校验）。
- *  弱模式（裸数字 1. / 1、/ 1) / 1：等）仍需严格递增防误伤普通文本。 */
+ *  弱模式（裸数字 1. / 1、/ 1) / 1：等）仍需严格递增防误伤普通文本。
+ *  kind：mdhead = Markdown 标题编号（## 1. 标题）；shot = 行首 [Shot N]。
+ *  两者同时出现时 mdhead 是条目边界、[Shot N] 是条目内部结构（见 splitBatchLines）。 */
 export interface BlockStart {
   n: number
   strong: boolean
+  kind?: 'mdhead' | 'shot'
 }
 
 /** 中文数字 → 阿拉伯数字（一~九十九；批量稿的动作编号常用中文数字） */
@@ -74,6 +81,8 @@ function blockStartNum(line: string): BlockStart | null {
   if (m) return { n: Number(m[1]), strong: true }
   m = line.match(/^\s*[【\[]\s*提示词\s*(\d{1,3})(?:-\d{1,3})?\s*[】\]]/) // 【提示词 1-1】标题（【】包裹的提示词编号，视频字段块批量稿常用）
   if (m) return { n: Number(m[1]), strong: true }
+  m = line.match(/^\s*\[\s*shot\s*(\d{1,3})\s*\]/i) // [Shot 1]（行首英文 Shot 编号，打 shot 标记——与 Markdown 标题编号同现时降级为内部结构）
+  if (m) return { n: Number(m[1]), strong: true, kind: 'shot' }
   m = line.match(/^\s*[【\[]\s*[^\d】\]]{0,10}?(\d{1,3})\s*[】\]]/) // [Shot 1] / 【镜头01】（前缀词+编号）
   if (m) return { n: Number(m[1]), strong: true }
   m = line.match(/^\s*[【\[]\s*[^】\]]{0,20}?([一二三四五六七八九十]{1,3})\s*[】\]]/) // 【玩球 · 动作一】标题（前缀词+中文数字；{0,20} 容纳「床 · ref-0 · 动作」这类带 ref 编号的较长前缀）
@@ -85,10 +94,15 @@ function blockStartNum(line: string): BlockStart | null {
   if (m) return { n: Number(m[1]), strong: true }
   m = line.match(/^\s*[-=_*]{3,}\s*(\d{1,3})\s*[｜|]\s*\S/) // ========== 01 | 标题 ==========（分隔线行内包裹编号式，英文批量稿常用）
   if (m) return { n: Number(m[1]), strong: true }
-  m = line.match(/^\s*(\d{1,3})\s*([.、)）：:｜])\s*\S/) // 1. / 1、 / 1) / 1） / 1: / 1： / 01｜标题（数字+全角竖线编号式）
+  m = line.match(/^\s*(\d{1,3})\s*([.、)）：:｜])\s*(?!\d)\S/) // 1. / 1、 / 1) / 1） / 1: / 1： / 01｜标题（数字+全角竖线编号式）
   if (m) return { n: Number(m[1]), strong: m[2] === '｜' } // ｜ 竖线特征强可免递增校验；裸数字仍需递增
-  m = line.match(/^\s*#{1,4}\s*(\d+)\b/) // #1 / ##1
-  if (m) return { n: Number(m[1]), strong: true }
+  // 编号分隔符后 (?!\d)：时间轴行 0.0-1.2s（1.2秒）： / 0:30s 不是编号（编号后不会紧跟数字），
+  m = line.match(/^\s*#{1,4}\s*(\d+)\b/) // #1 / ##1 / ## 1. 标题（Markdown 标题编号）
+  if (m) {
+    // ≥2 个 # 且编号后跟标题文字 → Markdown 标题编号（条目边界，级别高于块内 [Shot N]）
+    const mdhead = /^\s*#{2,4}\s*\d+\b\s*[.、．]?\s*\S/.test(line)
+    return { n: Number(m[1]), strong: true, kind: mdhead ? 'mdhead' : undefined }
+  }
   return null
 }
 
@@ -105,16 +119,21 @@ export function splitBatchLines(text: string): string[] {
   const starts = lines
     .map((l, i) => {
       const s = blockStartNum(l)
-      if (s) return { i, n: s.n, strong: s.strong }
+      if (s) return { i, n: s.n, strong: s.strong, kind: s.kind }
       const m = l.match(/^\s*【([^】\d]{4,})】\s*$/)
-      if (m) return { i, n: ++titleSeq, strong: true }
+      if (m) return { i, n: ++titleSeq, strong: true, kind: undefined }
       // 标题：双人举小旗挥舞（批量稿的独立标题行，无数字编号，按出现顺序赋号；
       // 中文标签不会撞 FIELD_LABEL_RE 的 ASCII 字段块锚点，两类模式互不干扰）
       const t = l.match(/^\s*标题\s*[：:]\s*(\S.*)$/)
-      if (t) return { i, n: ++titleSeq, strong: true }
-      return { i, n: null, strong: false }
+      if (t) return { i, n: ++titleSeq, strong: true, kind: undefined }
+      return { i, n: null, strong: false, kind: undefined }
     })
-    .filter((x): x is { i: number; n: number; strong: boolean } => x.n != null)
+    .filter((x): x is { i: number; n: number; strong: boolean; kind?: 'mdhead' | 'shot' } => x.n != null)
+  // Markdown 标题编号（## 1. 坐下）与行首 [Shot N] 同现：标题是条目边界，
+  // [Shot N] 是条目内部结构（英文稿 detailed_description 里的分镜行），不切块
+  if (starts.filter((s) => s.kind === 'mdhead').length >= 2) {
+    for (let i = starts.length - 1; i >= 0; i--) if (starts[i].kind === 'shot') starts.splice(i, 1)
+  }
   if (starts.length >= 2) {
     const nums = starts.map((s) => s.n)
     const allStrong = starts.every((s) => s.strong)
@@ -215,6 +234,7 @@ function sanitizeFileName(s: string): string {
  *  识别 splitBatchLines 同款的块首标题语法（整行匹配，行内 anywhere 也兜底）：
  *  - 【第 31 条｜携手拜年：《春节拜年词表》】 → 「31 携手拜年：《春节拜年词表》」
  *  - 【01｜双人互动】 / 01｜标题            → 「01 双人互动」
+ *  - ## 1. 坐下（Markdown 标题编号）        → 「1 坐下」
  *  - 提示词 3：标题                          → 「3 标题」
  *  - 【纯标题至少四字】（无数字整行包裹）    → 「纯标题」
  *  返回已清洗的文件名建议（编号前缀 + 标题）；识别不出返回 null。 */
@@ -233,6 +253,10 @@ export function extractPromptTitle(text: string): string | null {
       return sanitizeFileName(tag ? `${m[1]} ${tag[2]}` : `${m[1]} ${m[2]}`)
     }
     m = line.match(/^[【\[]\s*(\d{1,3})\s*[｜|]\s*(.+?)[】\]]\s*$/) // 【01｜标题】
+    if (m) return sanitizeFileName(`${m[1]} ${m[2]}`)
+    m = line.match(/^[【\[]\s*(\d{1,3})\s*[.、．]\s*(.+?)[】\]]\s*$/) // 【91. 踩水洼嬉戏】（【】包裹编号+点号+标题）
+    if (m) return sanitizeFileName(`${m[1]} ${m[2]}`)
+    m = line.match(/^#{1,4}\s*(\d{1,3})\s*[.、．]?\s*(\S.+)$/) // ## 1. 坐下（Markdown 标题编号，标题在编号后同行）
     if (m) return sanitizeFileName(`${m[1]} ${m[2]}`)
     m = line.match(/^[【\[]\s*([^\d】\]]{1,10})\s*(\d{1,3})\s*[｜|]\s*(.+?)[】\]]\s*$/) // 【图1｜下班进门 · 有字版】标题（前缀词+数字+竖线）
     if (m) return sanitizeFileName(`${m[1]}${m[2]} ${m[3]}`)

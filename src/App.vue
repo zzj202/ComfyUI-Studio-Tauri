@@ -10,8 +10,10 @@ import TemplateEditor from './components/TemplateEditor.vue'
 import LogPanel from './components/LogPanel.vue'
 import Toasts from './components/Toasts.vue'
 import AssetDrop from './components/AssetDrop.vue'
+import ConfirmDialog from './components/ConfirmDialog.vue'
 import LocalAssets from './components/LocalAssets.vue'
 import LocalFiles from './components/LocalFiles.vue'
+import Storyboard from './components/Storyboard.vue'
 import ComicStudio from './components/ComicStudio.vue'
 import { addComicFiles, addComicPaths } from './core/comic'
 import { disposeAll, dragGhost, imageDropTargets, init, notify, pasteSubmitField, refreshQueue, state } from './store'
@@ -199,7 +201,9 @@ onUnmounted(() => {
       </aside>
       <main class="col center"><ParamPanel /></main>
       <aside class="col right"><ResultPanel /></aside>
-      <!-- 「📁 素材」：本地文件夹浏览列（组件自身 v-if 控制显隐；第 4 列 auto，关闭时宽 0） -->
+      <!-- 「🎞 连续插画」：序号帧板（组件自身 v-if 控制显隐；第 4 列 auto，关闭时宽 0） -->
+      <Storyboard />
+      <!-- 「📁 素材」：本地文件夹浏览列（组件自身 v-if 控制显隐；第 5 列 auto，关闭时宽 0） -->
       <LocalFiles />
     </div>
 
@@ -215,6 +219,7 @@ onUnmounted(() => {
     </div>
 
     <AssetDrop />
+    <ConfirmDialog />
     <LogPanel v-if="ui.logsOpen" />
     <SettingsDialog v-if="ui.settingsOpen" />
     <TemplateEditor v-if="ui.templateOpen && state.currentWorkflow" />
@@ -236,8 +241,8 @@ onUnmounted(() => {
 .body {
   flex: 1;
   display: grid;
-  /* 第 4 列 = 素材列（auto）：LocalFiles 关闭时不渲染、该列宽 0；开启时由组件自身宽度撑起 */
-  grid-template-columns: 232px minmax(0, 1fr) 340px auto;
+  /* 第 4/5 列 = 连续插画 + 素材列（auto）：关闭时不渲染、该列宽 0；开启时由组件自身宽度撑起 */
+  grid-template-columns: 232px minmax(0, 1fr) 340px auto auto;
   min-height: 0;
 }
 .col {

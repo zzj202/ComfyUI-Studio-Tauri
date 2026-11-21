@@ -89,6 +89,8 @@ export interface DragItem {
   path?: string
   label: string
   thumb?: string
+  /** 连续插画板帧的 id：拖的是插画板里的帧 → 落点为另一帧/追加位时调整顺序而非复制 */
+  sbFrameId?: string
 }
 
 export const dragGhost = reactive<{ x: number; y: number; item: DragItem | null }>({
@@ -115,7 +117,8 @@ export function beginDrag(e: PointerEvent, item: DragItem) {
 function onDragMove(e: PointerEvent) {
   if (!dragItem || !dragStart) return
   if (!dragGhost.item) {
-    if (Math.hypot(e.clientX - dragStart.x, e.clientY - dragStart.y) < 5) return
+    // 3px 即起拖：阈值再高会显得「拖不动」（用户反馈）
+    if (Math.hypot(e.clientX - dragStart.x, e.clientY - dragStart.y) < 3) return
     dragGhost.item = dragItem
     // 锁住原生文本选择：拖动时 mousemove 会框选沿途文字（参数区一片反蓝）
     document.body.classList.add('drag-active')

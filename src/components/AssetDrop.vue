@@ -5,6 +5,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { api, type AssetInfo } from '../api/tauri'
 import { groupFields, parseGraph } from '../core/parseWorkflow'
 import { addComicPaths } from '../core/comic'
+import { SB_MAX_FRAMES, activeBoard, insertStoryboardPaths, sbExtHover, type SbFrame } from '../core/storyboard'
 import { IMG_EXT_RE } from '../core/clipboard'
 import { loadWorkflows, imageDropTargets, notify, selectWorkflow, state } from '../store'
 import { ui } from '../ui'
@@ -29,10 +30,13 @@ onMounted(async () => {
     const e = event.payload
     if (e.type === 'enter' || e.type === 'over') {
       hovering.value = true
+      sbExtHover.value = sbZoneAt(e.position)
     } else if (e.type === 'leave') {
       hovering.value = false
+      sbExtHover.value = null
     } else if (e.type === 'drop') {
       hovering.value = false
+      sbExtHover.value = null
       droppedCount.value = e.paths.length
       await routeDrop(e.paths, e.position)
     }
@@ -112,6 +116,26 @@ async function routeDrop(paths: string[], position: { x: number; y: number }) {
     }
   }
 
+  // ⓪½ 连续插画栏：外部图片拖入 —— 落在具体帧上 = 精确放入该帧（后续图顺延插到它后面），
+  // 落在追加条 / 面板其他位置 = 追加到末尾
+  if (ui.view === 'workbench' && ui.storyboardOpen) {
+    const zone = sbZoneAt(position)
+    if (zone) {
+      const imgs = paths.filter((p) => IMG_EXT_RE.test(p))
+      if (imgs.length) {
+        let target: SbFrame | null = null
+        if (zone.startsWith('sb:frame:')) {
+          const id = zone.slice('sb:frame:'.length)
+          target = activeBoard()?.frames.find((f) => f.id === id) ?? null
+        }
+        const n = insertStoryboardPaths(imgs, target)
+        if (n > 0) notify(target ? `已放入 ${n} 张到第 ${frameNum(target.id)} 帧` : `已追加 ${n} 帧到连续插画板`, 'ok', 4000)
+        if (n < imgs.length) notify(`画板已满（上限 ${SB_MAX_FRAMES} 帧），只加了 ${n} 张`, 'warn', 5000)
+        return
+      }
+    }
+  }
+
   // ① 工作流 JSON → 直接导入
   if (/\.json$/i.test(path)) {
     try {
@@ -146,6 +170,24 @@ function hitImageKey(position: { x: number; y: number }): string | null {
   } catch {
     return null
   }
+}
+
+/** 物理坐标 → 逻辑坐标，取落点下的插画板落点（sb:frame:<id> / sb:append）；
+ *  在面板上但不在具体落点上（页签区/空白）时按追加处理 */
+function sbZoneAt(position: { x: number; y: number }): string | null {
+  try {
+    const el = document.elementFromPoint(position.x / window.devicePixelRatio, position.y / window.devicePixelRatio)
+    const zone = el?.closest('[data-drop-zone]')?.getAttribute('data-drop-zone') ?? null
+    if (zone?.startsWith('sb:')) return zone
+    return el?.closest('.sb') ? 'sb:append' : null
+  } catch {
+    return null
+  }
+}
+
+/** 帧序号（通知文案用） */
+function frameNum(frameId: string): number {
+  return (activeBoard()?.frames.findIndex((f) => f.id === frameId) ?? -2) + 1
 }
 
 async function pickFile() {
@@ -195,6 +237,9 @@ function fmt(v: any): string {
       <div class="icon">⬇</div>
       <div class="title">松开鼠标</div>
       <div class="sub" v-if="ui.view === 'comic'">全部图片按拖入顺序加入漫画列表</div>
+      <div class="sub" v-else-if="ui.storyboardOpen">
+        图片拖到「🎞 连续插画」栏的帧上 = 放入该帧 · 拖到其他位置 = 追加 · JSON → 导入工作流
+      </div>
       <div class="sub" v-else>
         工作流 JSON → 直接导入 · 图片拖到参数卡 → 设为参考图 · ComfyUI 产出 → 反查工作流
       </div>

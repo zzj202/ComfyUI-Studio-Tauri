@@ -16,18 +16,20 @@ import WorkerBoard from './WorkerBoard.vue'
 
 const LF_OPEN_KEY = 'comfyui-studio.localFilesOpen:v1'
 const LA_OPEN_KEY = 'comfyui-studio.localAssetsOpen:v1'
+const SB_OPEN_KEY = 'comfyui-studio.storyboardOpen:v1'
 
 onMounted(() => {
   try {
     if (localStorage.getItem(LF_OPEN_KEY) === '1') ui.localFilesOpen = true
     if (localStorage.getItem(LA_OPEN_KEY) === '0') ui.localAssetsOpen = false
+    if (localStorage.getItem(SB_OPEN_KEY) === '0') ui.storyboardOpen = false
   } catch {
     /* ignore */
   }
 })
 
 /** 开关型按钮通用切换 + 持久化 */
-function toggleUi(key: 'localFilesOpen' | 'localAssetsOpen', storeKey: string) {
+function toggleUi(key: 'localFilesOpen' | 'localAssetsOpen' | 'storyboardOpen', storeKey: string) {
   ui[key] = !ui[key]
   try {
     localStorage.setItem(storeKey, ui[key] ? '1' : '0')
@@ -39,6 +41,11 @@ function toggleUi(key: 'localFilesOpen' | 'localAssetsOpen', storeKey: string) {
 /** 「📁 本地素材」列开关（状态持久化，重启恢复） */
 function toggleLocalFiles() {
   toggleUi('localFilesOpen', LF_OPEN_KEY)
+}
+
+/** 「🎞 连续插画」栏开关（状态持久化，重启恢复） */
+function toggleStoryboard() {
+  toggleUi('storyboardOpen', SB_OPEN_KEY)
 }
 
 /** 三态主题的按钮外观：跟随系统 → 深色 → 亮色 循环 */
@@ -142,6 +149,14 @@ function healthInfo(base: string): { cls: string; text: string } {
       @click="toggleLocalFiles"
     >
       📁 本地素材
+    </button>
+    <button
+      class="btn sm"
+      :class="{ active: ui.storyboardOpen }"
+      title="连续插画栏：按序号摆图片框，结果区拖图入框，连续翻页/自动播放检查动作衔接"
+      @click="toggleStoryboard"
+    >
+      🎞 连续插画
     </button>
     <button
       class="btn sm"

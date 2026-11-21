@@ -17,6 +17,8 @@ export const ui = reactive({
   workerBoardOpen: false,
   /** 右侧「📁 素材」本地文件夹浏览列（TopBar 按钮开关，状态持久化） */
   localFilesOpen: false,
+  /** 「🎞 连续插画」栏（结果区与素材列之间，TopBar 按钮开关，状态持久化） */
+  storyboardOpen: true,
   /** 左下角「收藏」条（TopBar 按钮开关，状态持久化）：上传到系统的精选素材 */
   localAssetsOpen: true,
   /** 置 true 即请求打开「选择资产文件」对话框（由 AssetDrop 消费后复位） */

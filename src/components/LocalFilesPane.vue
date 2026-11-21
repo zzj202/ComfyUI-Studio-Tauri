@@ -10,7 +10,8 @@
  */
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { convertFileSrc } from '@tauri-apps/api/core'
-import { ask, open } from '@tauri-apps/plugin-dialog'
+import { open } from '@tauri-apps/plugin-dialog'
+import { appConfirm } from '../core/confirm'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { api } from '../api/tauri'
 import { blobToB64, captureLocalFrame, copyLocalImageToClipboard, writePngToClipboard } from '../core/localMedia'
@@ -317,8 +318,9 @@ function onPvKey(e: KeyboardEvent) {
   if (!preview.value) return
   const t = e.target as HTMLElement | null
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return
-  // 结果区灯箱开着时让位：两边 onKey 都挂在 window 上，Delete/Enter 会同时命中
+  // 结果区灯箱 / 连续插画预览开着时让位：两边 onKey 都挂在 window 上，Delete/Enter 会同时命中
   if (document.querySelector('.lightbox')) return
+  if (document.querySelector('.sb-lightbox')) return
   const k = e.key
   if ((e.ctrlKey || e.metaKey) && (k === 'c' || k === 'C')) {
     e.preventDefault()
@@ -388,11 +390,11 @@ async function deleteItem(it: MediaItem) {
   if (deleting.value) return
   deleting.value = true
   try {
-    const ok = await ask(`把「${it.name}」移入系统回收站？`, {
+    const ok = await appConfirm({
       title: '删除文件',
-      kind: 'warning',
+      message: `把「${it.name}」移入系统回收站？`,
+      danger: true,
       okLabel: '移入回收站',
-      cancelLabel: '取消',
     })
     if (!ok) return
     await api.trashLocalFile(it.path)
