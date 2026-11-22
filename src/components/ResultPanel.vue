@@ -7,6 +7,8 @@ import { ui } from '../ui'
 import type { Asset, Job } from '../core/types'
 import { IMG_EXT_RE } from '../core/clipboard'
 import { extractPromptTitle } from '../core/batchText'
+import { appConfirm } from '../core/confirm'
+import { activeBoard, importAssetsToBoard, SB_MAX_FRAMES } from '../core/storyboard'
 import {
   addManualAsset,
   applyAssetParams,
@@ -406,6 +408,40 @@ const assets = computed(() => {
     )
     .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.createdAt - a.createdAt)
 })
+
+/** 一键导入插画板：当前筛选出的图片按生成顺序（旧→新）追加为帧，弹窗确认 */
+async function importToStoryboard() {
+  const b = activeBoard()
+  if (!b) return
+  const imgs = [...assets.value].filter((a) => a.kind === 'image').reverse() // createdAt 升序 = 生成顺序
+  if (!imgs.length) {
+    notify('当前筛选下没有可导入的图片', 'warn', 4000)
+    return
+  }
+  const room = SB_MAX_FRAMES - b.frames.length
+  if (room <= 0) {
+    notify(`插画板「${b.name}」已满（上限 ${SB_MAX_FRAMES} 帧）`, 'warn', 5000)
+    return
+  }
+  const willImport = Math.min(imgs.length, room)
+  const clipped = willImport < imgs.length ? `（画板剩余空位有限，只导前 ${willImport} 张）` : ''
+  const ok = await appConfirm({
+    title: '导入连续插画板',
+    message: `把结果区 ${willImport} 张图片按生成顺序追加为「${b.name}」的帧${clipped}。导入后每帧仍保留来源参数，可右键「载入参数 / 再来一次」。`,
+    okLabel: '导入',
+  })
+  if (!ok) return
+  const n = await importAssetsToBoard(b, imgs.slice(0, willImport))
+  if (n > 0) {
+    notify(`已导入 ${n} 张到插画板「${b.name}」`, 'ok', 5000)
+    ui.storyboardOpen = true // 栏没开就自动展开，让用户立刻看到结果
+    try {
+      localStorage.setItem('comfyui-studio.storyboardOpen:v1', '1')
+    } catch {
+      /* ignore */
+    }
+  }
+}
 
 /** 队列头部悬停提示：各节点待处理明细 */
 const queueDetailTitle = computed(() => {
@@ -1267,6 +1303,15 @@ onUnmounted(() => {
           全部标为已读（{{ unreadCount }}）
         </button>
         <span class="spacer" />
+        <button
+          v-if="ui.view === 'workbench'"
+          class="btn sm"
+          :disabled="!assets.length"
+          title="把当前筛选出的图片按生成顺序导入连续插画板（弹窗确认）"
+          @click="importToStoryboard"
+        >
+          🎞 导入插画板
+        </button>
         <button class="btn sm" :disabled="!assets.length" title="只清掉已看过的；未读和 📌 固定的保留" @click="clearAssets">
           清空资产
         </button>

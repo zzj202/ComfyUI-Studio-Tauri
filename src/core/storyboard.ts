@@ -1,6 +1,6 @@
 import { reactive, ref, watch } from 'vue'
 import { api } from '../api/tauri'
-import { notify, primaryBase } from '../store'
+import { notify, primaryBase, rerunAsset, state } from '../store'
 import { blobToB64 } from './localMedia'
 import { IMG_EXT_RE } from './clipboard'
 import type { Asset } from './types'
@@ -21,10 +21,21 @@ export interface SbFrame {
   id: string
   /** 帧图本地路径；空 = 空框 */
   path: string
-  /** 来源结果资产的 key（key 形如 `base|type/sub/file`），有则可载入参数/打开工作流 */
+  /** 来源结果资产的 key（key 形如 `base|type/sub/file`），有则可载入参数/打开工作流/再来一次 */
   assetKey?: string
   /** 备注行：一般写该镜提示词摘要 */
   caption: string
+  /** 重跑替换标记（同结果区「未读」）：新图已换入还没点开看过 */
+  fresh?: boolean
+  /** 重跑替换前的历史图路径（旧→新顺序追加，上限 5 份；文件都在 storyboard 目录，持久可回看） */
+  history?: string[]
+  /**
+   * 来源资产快照（填帧时整份存下，随画板持久化）。
+   * 结果区资产列表是有上限的（500 条）且「清空资产」会删条目、localStorage 超限放弃持久化——
+   * 只记 assetKey 的话，刷新/清空后「载入参数/再来一次/打开工作流/提示词」全部失效。
+   * 有了快照，这些功能不依赖结果区列表是否还有这条资产；assetKey 命中时优先用活的（含最新别名）。
+   */
+  src?: Asset
 }
 
 export interface SbBoard {
@@ -40,6 +51,8 @@ export const storyboard = reactive({
   interval: 0.8,
   /** 往返播放：到末尾后倒着放 */
   pingpong: false,
+  /** 帧网格列数：1 = 单列大图，2 = 双列（全局偏好，所有画板共用） */
+  cols: 2 as 1 | 2,
 })
 
 const KEY = 'comfyui-studio.storyboard:v1'
@@ -78,6 +91,15 @@ function load() {
             path: typeof f.path === 'string' ? f.path : '',
             assetKey: typeof f.assetKey === 'string' ? f.assetKey : undefined,
             caption: typeof f.caption === 'string' ? f.caption : '',
+            fresh: !!f.fresh,
+            history: Array.isArray(f.history)
+              ? (f.history as unknown[]).filter((x): x is string => typeof x === 'string').slice(-5)
+              : undefined,
+            // 来源资产快照：形状像 Asset 就收（旧数据没有 → undefined，功能退回 assetKey 命中制）
+            src:
+              f.src && typeof f.src === 'object' && typeof f.src.key === 'string' && typeof f.src.filename === 'string'
+                ? (f.src as Asset)
+                : undefined,
           })),
       })
     }
@@ -87,6 +109,7 @@ function load() {
     }
     if (typeof data.interval === 'number' && data.interval > 0.05) storyboard.interval = data.interval
     storyboard.pingpong = !!data.pingpong
+    storyboard.cols = data.cols === 1 ? 1 : 2
   } catch {
     /* ignore：坏数据当没有 */
   }
@@ -103,6 +126,7 @@ function persist() {
         activeId: storyboard.activeId,
         interval: storyboard.interval,
         pingpong: storyboard.pingpong,
+        cols: storyboard.cols,
       })
     )
   } catch {
@@ -228,6 +252,8 @@ export function clearFrame(b: SbBoard, frameId: string): void {
     revokePreview(f.id)
     f.path = ''
     delete f.assetKey
+    delete f.src
+    delete f.fresh
   }
 }
 
@@ -334,6 +360,32 @@ export async function sbDir(): Promise<string> {
 }
 
 /**
+ * 结果区一键导入：优先**填进已有空框**（从第 1 个空框开始），空框用完再追加新帧。
+ * 全部图片并行转存落盘（逐张串行太慢）。非图片跳过；上限即停。返回成功张数。
+ */
+export async function importAssetsToBoard(b: SbBoard, list: Asset[]): Promise<number> {
+  const imgs = list.filter((a) => a.kind === 'image')
+  if (!imgs.length) return 0
+  // 目标帧位：已有空框在前（保持板内顺序），不够再追加
+  const targets: SbFrame[] = b.frames.filter((f) => !f.path)
+  const appended: SbFrame[] = []
+  while (targets.length < imgs.length) {
+    const f = appendFrame(b)
+    if (!f) break // 上限即停
+    targets.push(f)
+    appended.push(f)
+  }
+  const pairs = imgs.slice(0, targets.length).map((a, i) => ({ a, f: targets[i] }))
+  // 并行填帧：每张独立转存，单张失败不影响其他
+  const results = await Promise.all(pairs.map(({ a, f }) => fillFrameFromAsset(b, f, a)))
+  // 失败清理：追加出来的空帧移除（不留残框）；本来就有的空框保留原样
+  pairs.forEach(({ f }, i) => {
+    if (!results[i] && appended.includes(f)) removeFrame(b, f.id)
+  })
+  return results.filter(Boolean).length
+}
+
+/**
  * 结果资产拖入帧：转存进 storyboard 目录（save_output 会自动建目录 + 同名避让），
  * 成功后写路径与来源 key。返回是否成功。
  */
@@ -351,6 +403,8 @@ export async function fillFrameFromAsset(b: SbBoard, frame: SbFrame, a: Asset): 
     revokePreview(frame.id)
     frame.path = r.path
     frame.assetKey = a.key
+    frame.src = { ...a, params: a.params ? { ...a.params } : undefined } // 整份快照，结果区清掉也能用
+    delete frame.fresh // 换了新内容，旧的重跑标记作废
     return true
   } catch (e) {
     notify(`加入插画板失败：${e}`, 'error', 8000)
@@ -359,11 +413,12 @@ export async function fillFrameFromAsset(b: SbBoard, frame: SbFrame, a: Asset): 
 }
 
 /** 本地文件拖入帧：直接引用原路径（文件归素材目录管，不复制） */
-export function fillFrameFromPath(frame: SbFrame, path: string): void {
-  pendingPaste.delete(frame.id) // 外部填帧 = 粘贴落盘结果不再挂到这帧
+export function fillFrameFromPath(frame: SbFrame, path: string): void {  pendingPaste.delete(frame.id) // 外部填帧 = 粘贴落盘结果不再挂到这帧
   if (frame.path && frame.path !== path) revokePreview(frame.id)
   frame.path = path
   delete frame.assetKey
+  delete frame.src
+  delete frame.fresh // 换了新内容，旧的重跑标记作废
 }
 
 /** 清空画板内容并回到 6 个空框（与新建画板一致） */
@@ -446,6 +501,78 @@ async function persistPasteBlob(b: SbBoard, f: SbFrame, blob: Blob): Promise<boo
     removeFrame(b, f.id) // 落盘失败不留空帧（连带释放预览）
     notify(`粘贴图片入板失败：${e}`, 'error', 8000)
     return false
+  }
+}
+
+// ---------------------------------------------------------------- 帧重跑（再来一次）
+
+/** 正在重跑的帧 id 集合（内存态，不持久化——重启后任务队列本就不在） */
+export const rerolling = reactive(new Set<string>())
+
+/**
+ * 帧「🎲 再来一次」：按帧来源资产的参数换新种子重提交 1 张，
+ * 生成完成后**自动替换该帧**（caption 保留），帧上打 fresh 标记（同结果区未读，
+ * 点开看过即清）。期间帧格显示「生成中」浮层。完成/失败/超时都会清掉重跑态。
+ */
+export async function rerunFrame(b: SbBoard, frame: SbFrame): Promise<void> {
+  // 优先结果区活资产；结果区里没了就用帧上快照（同 assetOf 的回落语义）
+  const live = frame.assetKey ? state.assets.find((x) => x.key === frame.assetKey) : undefined
+  const a = live ?? frame.src
+  if (live && !frame.src) frame.src = { ...live, params: live.params ? { ...live.params } : undefined }
+  if (!a) {
+    notify('该帧没有来源资产（本地文件拖入），无法重跑', 'warn', 6000)
+    return
+  }
+  if (!a.params) {
+    notify('来源资产没有参数快照（旧版本产出的），无法重跑', 'warn', 6000)
+    return
+  }
+  if (rerolling.has(frame.id)) return
+  // 提交前的任务快照：重跑产生的新任务 = 不在快照里且 workflow 相同者中最先提交的那个
+  // （取最早而不是最新：期间用户自己又提交了同工作流任务时，先提交的才是本次重跑）
+  const before = new Set(state.jobs.map((j) => j.promptId))
+  rerolling.add(frame.id)
+  try {
+    await rerunAsset(a) // 切工作流 + 回填参数 + 换种子 + submit(1)；失败时它内部会 notify
+    // submit() 是 void runChain(...) 异步发射：任务要等 runChain 内部 dispatchOne
+    // （网络提交）完成后才进 state.jobs，这里必须轮询等它出现，不能立刻找
+    let fresh: (typeof state.jobs)[number] | undefined
+    for (let i = 0; i < 80; i++) {
+      fresh = state.jobs
+        .filter((j) => !before.has(j.promptId) && j.workflow === a.workflow)
+        .sort((x, y) => x.startedAt - y.startedAt)[0]
+      if (fresh) break
+      await new Promise((r) => setTimeout(r, 100))
+    }
+    if (!fresh) return // rerunAsset / submit 早退（切换失败/参数不匹配/校验不过），已自行提示
+    notify('已按该帧参数换新种子重新提交，完成后自动替换此帧', 'ok', 4000)
+    const deadline = Date.now() + 10 * 60_000
+    while (Date.now() < deadline) {
+      const j = state.jobs.find((x) => x.promptId === fresh.promptId)
+      if (!j) break // 任务记录被用户移除：放弃
+      if (j.status === 'error') {
+        notify(`重跑失败：${j.error ?? '未知错误'}`, 'error', 8000)
+        break
+      }
+      if (j.status === 'done') {
+        const out = state.assets.find((x) => x.promptId === fresh.promptId && x.kind === 'image')
+        if (out && b.frames.includes(frame)) {
+          const prev = frame.path
+          await fillFrameFromAsset(b, frame, out) // 自动替换该帧（caption 保留）
+          if (prev && frame.path && frame.path !== prev) {
+            // 原图进历史（旧→新），灯箱里可回看；上限 5 份防 localStorage 膨胀
+            const h = frame.history ?? (frame.history = [])
+            h.push(prev)
+            if (h.length > 5) h.splice(0, h.length - 5)
+          }
+          frame.fresh = true // 替换标记：点开看过即清
+        }
+        break
+      }
+      await new Promise((r) => setTimeout(r, 600))
+    }
+  } finally {
+    rerolling.delete(frame.id)
   }
 }
 

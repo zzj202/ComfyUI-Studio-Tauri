@@ -47,6 +47,8 @@ import {
   reorderFrame,
   renameBoard,
   resetBoard,
+  rerolling,
+  rerunFrame,
   sbExtHover,
   startFrameWatch,
   stopFrameWatch,
@@ -309,6 +311,14 @@ function ctxOpenWorkflow(f: SbFrame) {
   const a = assetOf(f)
   if (a) void openAssetWorkflow(a)
 }
+/** 帧能否「再来一次」：有来源资产且带参数快照 */
+function canReroll(f: SbFrame): boolean {
+  return !!assetOf(f)?.params
+}
+function ctxReroll(f: SbFrame) {
+  const b = board.value
+  if (b) void rerunFrame(b, f)
+}
 function ctxReveal(f: SbFrame) {
   revealItemInDir(f.path).catch((e) => notify(`打开失败：${e}`, 'error', 6000))
 }
@@ -321,9 +331,18 @@ async function ctxCopyImg(f: SbFrame) {
   }
 }
 
-/** 来源资产（有 key 且结果区里还存在才能操作） */
+/** 来源资产：优先结果区活资产（别名/未读等最新），结果区里没了（清空/超限淘汰/刷新丢）
+ *  就用填帧时存下的快照——载入参数/再来一次/打开工作流/提示词不依赖结果区列表 */
 function assetOf(f: SbFrame) {
-  return f.assetKey ? state.assets.find((a) => a.key === f.assetKey) ?? null : null
+  if (f.assetKey) {
+    const a = state.assets.find((a) => a.key === f.assetKey)
+    if (a) {
+      // 惰性回填：老帧还没快照就趁资产还在时补一份（以后清空/刷新也不怕）
+      if (!f.src) f.src = { ...a, params: a.params ? { ...a.params } : undefined }
+      return a
+    }
+  }
+  return f.src ?? null
 }
 
 // ---------------------------------------------------------------- 画板页签
@@ -364,6 +383,60 @@ let playTimer: number | null = null
 
 const lbFrame = computed(() => filled.value.find((f) => f.id === lightboxId.value) ?? null)
 const lbIndex = computed(() => filled.value.findIndex((f) => f.id === lightboxId.value))
+/** 灯箱正在看的图：null = 当前帧图；历史版本 = 替换前原图的磁盘路径 */
+const lbView = ref<string | null>(null)
+const lbSrc = computed(() => (lbView.value ? convertFileSrc(lbView.value) : lbFrame.value ? thumbOf(lbFrame.value) : ''))
+/** 看历史时舞台上的角标文案（"当前"不显示，历史显示第几版） */
+const lbViewTag = computed(() => {
+  if (!lbView.value || !lbFrame.value?.history) return ''
+  const i = lbFrame.value.history.indexOf(lbView.value)
+  return i >= 0 ? `替换前版本 ${i + 1}` : ''
+})
+// 切帧（翻页/重开灯箱）回到当前图，避免历史视图串帧
+watch(
+  () => lbFrame.value?.id,
+  () => {
+    lbView.value = null
+  }
+)
+
+// ---- 灯箱提示词面板（对齐结果区灯箱）：展示来源资产参数快照里的文本项，点击复制 ----
+const lbPromptsOpen = ref(false)
+const lbPromptEntries = computed(() => {
+  const p = lbFrame.value ? assetOf(lbFrame.value)?.params : undefined
+  if (!p) return []
+  // key 形如 nodeId::inputName：当前表单有同名字段就用它的可读标签，没有就取 inputName
+  const labels = new Map(state.fields.map((f) => [f.key, f.label] as const))
+  const out: { key: string; label: string; text: string }[] = []
+  for (const [k, v] of Object.entries(p)) {
+    if (typeof v !== 'string' || !v.trim()) continue
+    if (IMG_EXT_RE.test(v.trim())) continue // 图片引用不算提示词
+    out.push({ key: k, label: labels.get(k) ?? (k.split('::').pop() ?? k), text: v })
+  }
+  return out
+})
+
+async function copyLbPrompt(text: string) {
+  try {
+    await navigator.clipboard.writeText(text)
+    notify('已复制提示词', 'ok', 2000)
+  } catch {
+    notify('复制失败（剪贴板被其他程序占用？）', 'warn')
+  }
+}
+
+/** 回看历史时「✓ 使用此版本」：该历史图与本帧当前图互换位置（当前图进入历史，可随时换回） */
+function useHistory() {
+  const f = lbFrame.value
+  if (!f || !lbView.value || !f.history) return
+  const i = f.history.indexOf(lbView.value)
+  if (i < 0) return
+  const cur = f.path
+  f.path = f.history[i]
+  f.history[i] = cur
+  lbView.value = null // 已成为当前图，回到「当前」视图
+  notify('已换用此历史版本（原图保留在历史里，可随时换回）', 'ok', 4000)
+}
 /** 当前帧在整板里的编号（与格子角标一致，方便对照分镜稿；空框跳过但编号不重排） */
 const lbBoardNum = computed(() => {
   const f = lbFrame.value
@@ -376,7 +449,9 @@ const lbBoardNum = computed(() => {
 function openLb(f: SbFrame) {
   if (isDragClick()) return
   if (!f.path || broken.has(f.id)) return
+  f.fresh = false // 点开看过：清掉重跑替换标记（同结果区已读）
   lightboxId.value = f.id
+  lbPromptsOpen.value = true // 打开灯箱默认展开提示词面板（无提示词条目时浮层自身隐藏）
 }
 
 function closeLb() {
@@ -395,6 +470,15 @@ function stepLb(d: number) {
     return
   }
   lightboxId.value = list[(i + d + list.length) % list.length].id
+}
+
+/** 跳到指定序号的帧（灯箱底栏 ⏮/⏭ 用） */
+function jumpLb(i: number) {
+  if (playing.value) stopPlay()
+  const list = filled.value
+  if (!list.length) return
+  const idx = Math.max(0, Math.min(list.length - 1, i))
+  lightboxId.value = list[idx].id
 }
 
 function stopTimer() {
@@ -469,12 +553,19 @@ function onKey(e: KeyboardEvent) {
   if (k === 'Escape') {
     e.preventDefault()
     closeLb()
+  } else if ((e.ctrlKey || e.metaKey) && (k === 'c' || k === 'C')) {
+    // Ctrl+C：复制当前帧图到剪贴板（对齐结果区灯箱）
+    e.preventDefault()
+    if (lightboxId.value) void ctxCopyImg(lbFrame.value!)
   } else if (k === 'a' || k === 'A' || k === 'ArrowLeft') {
     e.preventDefault()
     stepLb(-1)
   } else if (k === 'd' || k === 'D' || k === 'ArrowRight') {
     e.preventDefault()
     stepLb(1)
+  } else if (k === 'w' || k === 'W') {
+    e.preventDefault()
+    jumpLb(0) // 跳到第一帧
   } else if (k === ' ') {
     e.preventDefault()
     togglePlay()
@@ -516,6 +607,13 @@ async function doExport() {
       <span class="sb-title">🎞 连续插画</span>
       <span class="spacer" />
       <span class="faint">{{ board?.frames.filter((f) => f.path).length ?? 0 }}/{{ board?.frames.length ?? 0 }} 帧</span>
+      <button
+        class="sb-cols"
+        :title="storyboard.cols === 2 ? '当前双列展示，点击切换为单列大图' : '当前单列展示，点击切换为双列'"
+        @click="storyboard.cols = storyboard.cols === 2 ? 1 : 2"
+      >
+        {{ storyboard.cols === 2 ? '▦' : '▤' }}
+      </button>
     </header>
 
     <!-- 画板页签：点击切换 / 双击重命名；激活页签可删 -->
@@ -558,7 +656,7 @@ async function doExport() {
         把结果区的图拖到这里就会自动加框<br />
         <button class="btn sm" @click="addFrame">＋ 加框</button>
       </div>
-      <div v-else class="sb-grid">
+      <div v-else class="sb-grid" :class="{ one: storyboard.cols === 1 }">
         <div
           v-for="(f, i) in board.frames"
           :key="f.id"
@@ -576,6 +674,13 @@ async function doExport() {
           @contextmenu="openCtx($event, f)"
         >
           <span class="sb-num">{{ i + 1 }}</span>
+          <span
+            v-if="f.fresh && f.path && !broken.has(f.id)"
+            class="sb-fresh"
+            title="此帧刚被「再来一次」替换，点开看过即消失"
+          >
+            新
+          </span>
           <template v-if="f.path && !broken.has(f.id)">
             <img :src="thumbOf(f)" :alt="frameTitle(f)" loading="lazy" @error="onImgError(f)" />
             <button
@@ -597,6 +702,11 @@ async function doExport() {
             <span class="sb-ph">{{ f.path && broken.has(f.id) ? '🖼 文件缺失' : '＋' }}</span>
             <span v-if="!f.path" class="sb-ph-hint">拖图到这里</span>
           </template>
+          <!-- 重跑中浮层：换种子重新生成的等待期 -->
+          <div v-if="rerolling.has(f.id)" class="sb-reroll" title="正在按此帧参数换种子重新生成…">
+            <span class="sb-reroll-spin" />
+            <span>生成中</span>
+          </div>
         </div>
       </div>
       <!-- 追加条（空板也在）：拖图到这 = 追加一帧；点击 = 加框 -->
@@ -665,6 +775,14 @@ async function doExport() {
       <template v-if="assetOf(ctx.frame)">
         <span class="sb-ctx-sep" />
         <button class="sb-ctx-item" @click="ctxRun(ctxApplyParams)">⤴ 载入参数</button>
+        <button
+          v-if="canReroll(ctx.frame)"
+          class="sb-ctx-item"
+          title="按此帧参数换新种子重新生成，完成后自动替换此帧"
+          @click="ctxRun(ctxReroll)"
+        >
+          🎲 再来一次
+        </button>
         <button class="sb-ctx-item" @click="ctxRun(ctxOpenWorkflow)">📂 打开工作流</button>
       </template>
       <template v-if="ctx.frame.path">
@@ -674,24 +792,87 @@ async function doExport() {
       </template>
     </div>
 
-    <!-- 放大预览：A/D 只在本板帧序列内翻页；空格播放 / Esc 关 -->
+    <!-- 放大预览：布局对齐结果区灯箱——两侧大翻页钮 + 底部信息条；A/D、←/→ 翻页，空格播放，Esc 关 -->
     <div v-if="lbFrame" class="sb-lightbox" @click.self="closeLb" @contextmenu.prevent>
+      <button class="sb-lb-nav prev" title="上一帧（← / A）" @click="stepLb(-1)">‹</button>
       <div class="sb-lb-body">
-        <img :key="lbFrame.id" :src="thumbOf(lbFrame)" :alt="frameTitle(lbFrame)" />
+        <img :key="lbView ?? lbFrame.id" :src="lbSrc" :alt="frameTitle(lbFrame)" />
         <!-- 大字帧号角标：与格子编号一致，播放时对照分镜稿用 -->
         <span v-if="lbBoardNum" class="sb-lb-num">{{ lbBoardNum }}</span>
-        <span v-if="lbFrame.caption" class="sb-lb-sub">{{ lbFrame.caption }}</span>
+        <span
+          v-if="lbFrame.fresh && !lbView"
+          class="sb-fresh sb-lb-fresh"
+          title="此帧刚被「再来一次」替换，看过即消失"
+        >
+          新
+        </span>
+        <span v-if="lbViewTag" class="sb-lb-hist-tag">{{ lbViewTag }}</span>
+        <span v-if="lbFrame.caption && !lbView" class="sb-lb-sub">{{ lbFrame.caption }}</span>
+        <!-- 提示词浮层：主区域的 flex 兄弟节点，天然紧贴图片右缘（gap 14px），点击条目复制 -->
+        <div v-if="lbPromptsOpen && lbPromptEntries.length" class="sb-lb-prompts" @click.stop>
+          <div
+            v-for="e in lbPromptEntries"
+            :key="e.key"
+            class="sb-lb-prompt"
+            title="点击复制"
+            @click="copyLbPrompt(e.text)"
+          >
+            <span class="sb-lp-label">{{ e.label }}</span>
+            <span class="sb-lp-text">{{ e.text }}</span>
+          </div>
+        </div>
+      </div>
+      <button class="sb-lb-nav next" title="下一帧（→ / D）" @click="stepLb(1)">›</button>
+      <!-- 重跑历史版本条：替换前的原图点一下即可回看；最后一格 = 当前图 -->
+      <div v-if="lbFrame.history?.length" class="sb-lb-hist" @click.stop>
+        <span class="sb-lb-hist-label">历史</span>
+        <button
+          v-for="(p, hi) in lbFrame.history"
+          :key="p"
+          class="sb-hist-thumb"
+          :class="{ on: lbView === p }"
+          :title="`替换前版本 ${hi + 1}（点击查看）`"
+          @click="lbView = p"
+        >
+          <img :src="convertFileSrc(p)" :alt="`替换前版本 ${hi + 1}`" loading="lazy" />
+        </button>
+        <button class="sb-hist-thumb now" :class="{ on: !lbView }" title="当前图（点击返回）" @click="lbView = null">
+          <img :src="thumbOf(lbFrame)" alt="当前" />
+        </button>
+        <!-- 正在回看历史时出现：把这一版换成此帧的当前图（被换下的自动进历史，可随时换回） -->
+        <button v-if="lbView" class="btn sm sb-hist-use" @click="useHistory">✓ 使用此版本</button>
       </div>
       <div class="sb-lb-cap">
-        <button class="btn sm ghost" title="上一帧（← / A）" @click="stepLb(-1)">‹</button>
-        <button class="btn sm ghost" title="下一帧（→ / D）" @click="stepLb(1)">›</button>
+        <button class="btn sm ghost" title="跳到第一帧" @click="jumpLb(0)">⏮</button>
         <span class="mono faint">{{ lbIndex + 1 }}/{{ filled.length }}</span>
+        <button class="btn sm ghost" title="跳到最后一帧" @click="jumpLb(filled.length - 1)">⏭</button>
         <button class="btn sm" :class="{ active: playing }" :title="playing ? '暂停（空格）' : '播放（空格）'" @click="togglePlay">
           {{ playing ? '⏸' : '▶' }}
         </button>
         <span class="spacer" />
         <span class="sb-lb-name" :title="lbFrame.path">{{ lbFrame.caption || fileName(lbFrame.path) }}</span>
         <span class="spacer" />
+        <button
+          v-if="lbPromptEntries.length"
+          class="btn sm"
+          :class="{ active: lbPromptsOpen }"
+          title="查看这张图提交时的提示词（点击条目复制）"
+          @click="lbPromptsOpen = !lbPromptsOpen"
+        >
+          📝 提示词
+        </button>
+        <button class="btn sm" title="复制当前图到剪贴板，可直接粘贴给聊天窗口（Ctrl+C 也行）" @click="ctxCopyImg(lbFrame)">
+          📋
+        </button>
+        <button class="btn sm" title="在资源管理器中定位当前图文件" @click="ctxReveal(lbFrame)">🗂</button>
+        <button
+          v-if="canReroll(lbFrame)"
+          class="btn sm"
+          :title="rerolling.has(lbFrame.id) ? '正在重跑此帧…' : '按此帧参数换新种子重新生成，完成后自动替换此帧'"
+          @click="ctxReroll(lbFrame)"
+        >
+          {{ rerolling.has(lbFrame.id) ? '⏳ 重跑中' : '🎲 再来一次' }}
+        </button>
         <button class="btn sm ghost" @click="closeLb">✕</button>
       </div>
     </div>
@@ -719,6 +900,24 @@ async function doExport() {
 .sb-title {
   font-size: 12.5px;
   font-weight: 600;
+}
+/* 列数切换按钮（单列/双列） */
+.sb-cols {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border: 1px solid var(--border-soft);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.12s, border-color 0.12s;
+}
+.sb-cols:hover {
+  color: var(--accent);
+  border-color: var(--accent);
 }
 .spacer {
   flex: 1;
@@ -820,6 +1019,13 @@ async function doExport() {
   grid-template-columns: 1fr 1fr;
   gap: 6px;
 }
+/* 单列展示：一行一帧大图，横图比例更贴合视频帧 */
+.sb-grid.one {
+  grid-template-columns: 1fr;
+}
+.sb-grid.one .sb-cell {
+  aspect-ratio: 16 / 9;
+}
 .sb-cell {
   position: relative;
   aspect-ratio: 1;
@@ -896,6 +1102,70 @@ async function doExport() {
   text-align: center;
   box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
   pointer-events: none;
+}
+/* 「新」标记：帧刚被重跑替换，点开看过即消失（同结果区未读语义） */
+.sb-fresh {
+  position: absolute;
+  left: 5px;
+  top: 28px;
+  z-index: 3;
+  padding: 1px 6px;
+  border-radius: 999px;
+  background: linear-gradient(135deg, #34c77b, #1fa864);
+  color: #fff;
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  box-shadow: 0 2px 8px rgba(31, 168, 100, 0.5);
+  pointer-events: none;
+  animation: sb-fresh-in 0.25s ease;
+}
+@keyframes sb-fresh-in {
+  from {
+    transform: scale(0.4);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+/* 重跑中浮层：半透明遮罩 + 旋转圈，盖在帧图上 */
+.sb-reroll {
+  position: absolute;
+  inset: 0;
+  z-index: 4;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  background: color-mix(in srgb, var(--bg-1, #14161d) 55%, transparent);
+  backdrop-filter: blur(2px);
+  color: #fff;
+  font-size: 11px;
+  pointer-events: none;
+}
+.sb-reroll-spin {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(255, 255, 255, 0.35);
+  border-top-color: var(--accent, #7c9cff);
+  border-radius: 50%;
+  animation: sb-spin 0.8s linear infinite;
+}
+@keyframes sb-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+/* 灯箱里的「新」标记放大一号 */
+.sb-lb-fresh {
+  position: absolute;
+  left: 16px;
+  top: 16px;
+  font-size: 12px;
+  padding: 3px 10px;
 }
 /* 删除按钮：24px 大热区 + 毛玻璃底，悬停放大变红 */
 .sb-x {
@@ -1070,13 +1340,110 @@ async function doExport() {
   gap: 10px;
   padding: 40px;
 }
+/* 两侧大翻页钮（对齐结果区灯箱 .nav 的样式） */
+.sb-lb-nav {
+  position: absolute;
+  top: 50%;
+  transform: translateY(-50%);
+  z-index: 3;
+  width: 44px;
+  height: 64px;
+  border: none;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.08);
+  color: #fff;
+  font-size: 30px;
+  line-height: 1;
+  cursor: pointer;
+}
+.sb-lb-nav:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+.sb-lb-nav.prev {
+  left: 14px;
+}
+.sb-lb-nav.next {
+  right: 14px;
+}
+/* 重跑历史版本条：替换前的原图缩略图（旧→新），点击回看 */
+.sb-lb-hist {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 80%;
+  padding: 6px 8px;
+  border-radius: 12px;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(6px);
+}
+.sb-lb-hist-label {
+  flex: none;
+  font-size: 11px;
+  color: rgba(231, 236, 245, 0.75);
+  padding: 0 2px;
+}
+.sb-hist-thumb {
+  flex: none;
+  width: 52px;
+  height: 36px;
+  padding: 0;
+  border: 2px solid transparent;
+  border-radius: 6px;
+  overflow: hidden;
+  cursor: pointer;
+  opacity: 0.65;
+  background: transparent;
+  transition:
+    opacity 0.12s,
+    border-color 0.12s,
+    transform 0.12s;
+}
+.sb-hist-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.sb-hist-thumb:hover {
+  opacity: 1;
+  transform: translateY(-3px); /* 可点切换的暗示：悬停浮起 */
+}
+.sb-hist-thumb.on {
+  border-color: var(--accent);
+  opacity: 1;
+}
+.sb-hist-thumb.now {
+  border-style: dashed;
+}
+/* 「✓ 使用此版本」：回看历史时出现在历史条末尾 */
+.sb-hist-use {
+  margin-left: 4px;
+  background: var(--accent);
+  color: #fff;
+  border: none;
+}
+/* 舞台上「替换前版本 N」角标（回看历史时显示） */
+.sb-lb-hist-tag {
+  position: absolute;
+  top: 14px;
+  right: 18px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.55);
+  color: #e7ecf5;
+  font-size: 12px;
+  pointer-events: none;
+}
 .sb-lb-body {
   position: relative;
   flex: 1;
   min-height: 0;
+  min-width: 0;
   display: flex;
   align-items: center;
   justify-content: center;
+  gap: 14px; /* 提示词浮层与图片的贴合间隙 */
 }
 .sb-lb-body img {
   max-width: 100%;
@@ -1131,5 +1498,100 @@ async function doExport() {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+/* 提示词浮层：主区域 flex 兄弟节点，紧贴图片右缘（gap 14px），条目点击复制 */
+.sb-lb-prompts {
+  position: relative;
+  flex: none;
+  align-self: center;
+  width: min(336px, 28vw);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 10px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--panel, rgb(16, 20, 28)) 82%, transparent);
+  backdrop-filter: blur(14px) saturate(1.15);
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
+  border: 1px solid var(--border);
+  box-shadow:
+    0 20px 56px rgba(0, 0, 0, 0.55),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  animation: sb-prompts-in 0.18s ease-out;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+@keyframes sb-prompts-in {
+  from {
+    opacity: 0;
+    transform: translateX(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.sb-lb-prompt {
+  position: relative;
+  display: flex;
+  flex-direction: column; /* 窄版式：标签在上、正文整行铺开 */
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.6;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid transparent;
+  transition:
+    background 0.12s,
+    border-color 0.12s;
+}
+.sb-lb-prompt:hover {
+  background: var(--accent-soft, rgba(255, 255, 255, 0.08));
+  border-color: var(--accent);
+}
+/* 悬停时右上角浮现「复制」角标 */
+.sb-lb-prompt::after {
+  content: '📋 复制';
+  position: absolute;
+  right: 8px;
+  top: 7px;
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  opacity: 0;
+  transform: translateY(-3px);
+  transition:
+    opacity 0.12s,
+    transform 0.12s;
+  pointer-events: none;
+}
+.sb-lb-prompt:hover::after {
+  opacity: 1;
+  transform: none;
+}
+.sb-lp-label {
+  flex: none;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft, rgba(255, 255, 255, 0.1));
+  color: var(--accent, #9db8ff);
+  font-size: 10.5px;
+  white-space: nowrap;
+  align-self: flex-start;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.sb-lp-text {
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
+  color: var(--text-1, #e7ecf5);
 }
 </style>
