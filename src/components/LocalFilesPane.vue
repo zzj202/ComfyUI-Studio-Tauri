@@ -76,6 +76,10 @@ async function silentRefresh() {
     const data = await api.listLocalMedia(dir.value)
     lastLoaded = data.dir
     items.value = data.items
+    // 预览浮层持有的是旧 item 对象（mtime 已过期）：按 path 换成最新条目，改图后预览同步更新
+    if (preview.value) {
+      preview.value = data.items.find((x) => x.path === preview.value!.path) ?? null
+    }
     if (data.dir !== dir.value) dir.value = data.dir
   } catch {
     /* 节点离线/目录暂不可访问：轮询失败静默跳过 */
@@ -115,6 +119,7 @@ async function load() {
     const data = await api.listLocalMedia(dir.value)
     lastLoaded = data.dir
     items.value = data.items
+    if (preview.value) preview.value = data.items.find((x) => x.path === preview.value!.path) ?? null
     // Rust 侧 canonicalize 后的规范绝对路径（dialog 可能给相对路径），回写保证面包屑/持久化正确；
     // 回写会再触发 watch(dir)，但 dir === lastLoaded 直接跳过，不会二次加载
     dir.value = data.dir
@@ -169,7 +174,9 @@ function fileName(p: string) {
 }
 
 function thumbUrl(it: MediaItem) {
-  return convertFileSrc(it.path)
+  // mtime 作缓存版本号：文件被外部同名覆盖后，重扫拿到新 mtime → URL 变化 → 强制重载，
+  // 不再显示 WebView 缓存的旧图（新增文件本来就会在轮询中出现，这里解决的是「修改」）
+  return `${convertFileSrc(it.path)}?v=${it.mtime}`
 }
 
 // ---- 时间分组（今天/昨天/本周早些时候/本月早些时候/更早），两组共享折叠状态 ----

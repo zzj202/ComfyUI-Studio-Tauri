@@ -38,6 +38,8 @@ import {
   exportBoardFrames,
   fillFrameFromAsset,
   fillFrameFromPath,
+  framePreview,
+  frameRev,
   insertFrameAfter,
   insertFrameBefore,
   removeBoard,
@@ -46,6 +48,8 @@ import {
   renameBoard,
   resetBoard,
   sbExtHover,
+  startFrameWatch,
+  stopFrameWatch,
   storyboard,
   swapFrames,
   type SbBoard,
@@ -61,8 +65,17 @@ function fileName(p: string) {
   return p.split(/[\\/]/).pop() ?? p
 }
 function thumbOf(f: SbFrame) {
-  return convertFileSrc(f.path)
+  // 粘贴即时预览优先（内存 blob URL 就是最新内容，且不能追加 query 参数）
+  const pv = framePreview(f.id)
+  if (pv) return pv
+  // 磁盘路径 + mtime 版本号破缓存：文件被外部改过即强制重载
+  const base = convertFileSrc(f.path)
+  const rev = frameRev.value[f.id]
+  return rev ? `${base}?v=${rev}` : base
 }
+
+// 帧图 mtime 巡检：外部修改源文件后自动重载缩略图（灯箱同步生效）
+startFrameWatch()
 
 // ---------------------------------------------------------------- 拖拽落点注册
 // 每帧一个 dropZone（sb:frame:<id>）+ 一个追加位（sb:append），取到完整 DragItem
@@ -149,6 +162,7 @@ onUnmounted(() => {
   for (const k of registered) dropZones.delete(k)
   registered.clear()
   stopPlay()
+  stopFrameWatch()
   window.removeEventListener('keydown', onKey)
   window.removeEventListener('click', onDocClick)
 })
@@ -205,6 +219,11 @@ watch(
 // ---------------------------------------------------------------- 帧交互
 
 const broken = reactive(new Set<string>())
+
+// 文件被外部修改（mtime 变化）bump 版本重载时，顺带清掉旧的「文件缺失」标记
+watch(frameRev, (rec) => {
+  for (const id of Object.keys(rec)) broken.delete(id)
+})
 
 function onImgError(f: SbFrame) {
   broken.add(f.id)

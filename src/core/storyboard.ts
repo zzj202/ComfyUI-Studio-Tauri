@@ -1,6 +1,7 @@
 import { reactive, ref, watch } from 'vue'
 import { api } from '../api/tauri'
 import { notify, primaryBase } from '../store'
+import { blobToB64 } from './localMedia'
 import { IMG_EXT_RE } from './clipboard'
 import type { Asset } from './types'
 
@@ -124,7 +125,7 @@ function newBoard(name?: string): SbBoard {
   return {
     id: uid(),
     name: name || `画板 ${storyboard.boards.length + 1}`,
-    frames: [emptyFrame(), emptyFrame(), emptyFrame(), emptyFrame()],
+    frames: [emptyFrame(), emptyFrame(), emptyFrame(), emptyFrame(), emptyFrame(), emptyFrame()],
   }
 }
 
@@ -153,6 +154,10 @@ export function addBoard(): SbBoard {
 export function removeBoard(id: string): void {
   const i = storyboard.boards.findIndex((b) => b.id === id)
   if (i < 0) return
+  for (const f of storyboard.boards[i].frames) {
+    pendingPaste.delete(f.id)
+    revokePreview(f.id)
+  }
   storyboard.boards.splice(i, 1)
   if (storyboard.boards.length) {
     if (storyboard.activeId === id) storyboard.activeId = storyboard.boards[Math.max(0, i - 1)].id
@@ -208,13 +213,19 @@ export function insertFrameAfter(b: SbBoard, frameId: string): SbFrame | null {
 /** 删除整帧（含框） */
 export function removeFrame(b: SbBoard, frameId: string): void {
   const i = b.frames.findIndex((f) => f.id === frameId)
-  if (i >= 0) b.frames.splice(i, 1)
+  if (i >= 0) {
+    pendingPaste.delete(frameId)
+    revokePreview(frameId)
+    b.frames.splice(i, 1)
+  }
 }
 
 /** 清空帧内容（保留空框） */
 export function clearFrame(b: SbBoard, frameId: string): void {
   const f = b.frames.find((x) => x.id === frameId)
   if (f) {
+    pendingPaste.delete(f.id)
+    revokePreview(f.id)
     f.path = ''
     delete f.assetKey
   }
@@ -239,6 +250,76 @@ export function reorderFrame(b: SbBoard, frameId: string, toIndex: number): bool
 }
 
 // ---------------------------------------------------------------- 填帧（落盘）
+
+// --- 即时预览（粘贴加速）---
+// Ctrl+V 粘贴：先用 blob objectURL 立即显示（0 等待），落盘在后台进行，
+// 落盘完成后继续用 objectURL 显示（避免从磁盘重读造成闪烁）。
+const previewUrls = new Map<string, string>()
+/** 等待后台落盘的帧：期间用户清空/替换该帧 = 取消挂载落盘结果 */
+const pendingPaste = new Set<string>()
+
+/** 帧的即时预览 URL（有则优先于磁盘路径显示） */
+export function framePreview(id: string): string | undefined {
+  return previewUrls.get(id)
+}
+
+function revokePreview(id: string): void {
+  const u = previewUrls.get(id)
+  if (u) {
+    URL.revokeObjectURL(u)
+    previewUrls.delete(id)
+  }
+}
+
+// --- 外部修改检测（mtime 巡检）---
+// 帧引用的本地文件被外部覆盖（同名修改）时，convertFileSrc 的 URL 不变会被 WebView
+// 缓存住显示旧图；定期比对 mtime，变了就 bump 帧的缓存版本强制重载。
+export const frameRev = ref<Record<string, number>>({})
+const pathMtime = new Map<string, number>()
+
+let mtimeTimer: number | undefined
+
+/** 启动 mtime 巡检（组件挂载时调用；栏收起组件卸载时 stopFrameWatch） */
+export function startFrameWatch(): void {
+  if (mtimeTimer !== undefined) return
+  void refreshFrameMtimes()
+  mtimeTimer = window.setInterval(() => void refreshFrameMtimes(), 5000)
+}
+
+export function stopFrameWatch(): void {
+  if (mtimeTimer !== undefined) {
+    window.clearInterval(mtimeTimer)
+    mtimeTimer = undefined
+  }
+}
+
+/** 对当前板全部帧路径做一次 mtime 比对；文件缺失时 Rust 返回 0，同样可检测「被删了」以外的变化 */
+export async function refreshFrameMtimes(): Promise<void> {
+  const b = activeBoard()
+  if (!b || mtimeTimer === undefined) return
+  const paths = [...new Set(b.frames.filter((f) => f.path).map((f) => f.path))]
+  if (!paths.length) return
+  let arr: number[]
+  try {
+    arr = await api.pathMtimes(paths)
+  } catch {
+    return
+  }
+  paths.forEach((p, i) => {
+    const m = arr[i] ?? 0
+    const old = pathMtime.get(p)
+    if (old === undefined) {
+      pathMtime.set(p, m) // 首次只记录，不触发刷新
+      return
+    }
+    if (old !== m) {
+      pathMtime.set(p, m)
+      for (const f of b.frames) {
+        if (f.path === p) frameRev.value[f.id] = (frameRev.value[f.id] ?? 0) + 1
+      }
+    }
+  })
+}
 
 let sbDirCache = ''
 /** 帧图保存目录：appDataDir/storyboard（首次调用时缓存；\\?\ 前缀去掉） */
@@ -266,6 +347,8 @@ export async function fillFrameFromAsset(b: SbBoard, frame: SbFrame, a: Asset): 
     const stamp = Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
     const dest = `${dir}/sb-${stamp}-${a.filename}`
     const r = await api.saveOutput(a.base ?? primaryBase(), a.filename, a.subfolder, a.type, dest)
+    pendingPaste.delete(frame.id)
+    revokePreview(frame.id)
     frame.path = r.path
     frame.assetKey = a.key
     return true
@@ -277,13 +360,19 @@ export async function fillFrameFromAsset(b: SbBoard, frame: SbFrame, a: Asset): 
 
 /** 本地文件拖入帧：直接引用原路径（文件归素材目录管，不复制） */
 export function fillFrameFromPath(frame: SbFrame, path: string): void {
+  pendingPaste.delete(frame.id) // 外部填帧 = 粘贴落盘结果不再挂到这帧
+  if (frame.path && frame.path !== path) revokePreview(frame.id)
   frame.path = path
   delete frame.assetKey
 }
 
-/** 清空画板内容并回到 4 个空框（与新建画板一致） */
+/** 清空画板内容并回到 6 个空框（与新建画板一致） */
 export function resetBoard(b: SbBoard): void {
-  b.frames = [emptyFrame(), emptyFrame(), emptyFrame(), emptyFrame()]
+  for (const f of b.frames) {
+    pendingPaste.delete(f.id)
+    revokePreview(f.id)
+  }
+  b.frames = [emptyFrame(), emptyFrame(), emptyFrame(), emptyFrame(), emptyFrame(), emptyFrame()]
 }
 
 /** 批量按顺序把本地图片插入插画板：target 给定时第一张精确放入该帧（后续图顺延插到它后面），
@@ -310,6 +399,54 @@ export function insertStoryboardPaths(paths: string[], target?: SbFrame | null):
     n++
   }
   return n
+}
+
+/**
+ * 剪贴板粘贴图片追加为帧（Ctrl+V 入口）：**即时显示**——帧一建好就用 blob objectURL
+ * 上屏（0 等待），随后并行落盘 appDataDir/storyboard 完成持久化。返回追加的张数。
+ */
+export function addStoryboardBlobs(blobs: Blob[]): number {
+  const b = activeBoard()
+  if (!b || !blobs.length) return 0
+  let n = 0
+  const saves: Promise<boolean>[] = []
+  for (const blob of blobs) {
+    const f = appendFrame(b)
+    if (!f) {
+      notify(`画板已满（上限 ${SB_MAX_FRAMES} 帧），只加了 ${n} 张`, 'warn', 5000)
+      break
+    }
+    previewUrls.set(f.id, URL.createObjectURL(blob)) // 立即上屏，不等落盘
+    pendingPaste.add(f.id)
+    saves.push(persistPasteBlob(b, f, blob))
+    n++
+  }
+  void Promise.all(saves) // 后台并行落盘，不阻塞显示
+  return n
+}
+
+/** 粘贴帧的后台落盘：成功写 frame.path（继续用 objectURL 显示，不重读磁盘） */
+async function persistPasteBlob(b: SbBoard, f: SbFrame, blob: Blob): Promise<boolean> {
+  try {
+    const dir = await sbDir()
+    const ext = blob.type === 'image/jpeg' ? 'jpg' : blob.type === 'image/webp' ? 'webp' : blob.type === 'image/gif' ? 'gif' : 'png'
+    const stamp = Date.now().toString(36) + Math.random().toString(36).slice(2, 6)
+    const path = await api.saveLocalBytes(dir, `sb-paste-${stamp}.${ext}`, await blobToB64(blob))
+    if (!path) throw new Error('写入失败')
+    if (!pendingPaste.has(f.id)) {
+      // 落盘期间用户已清空/替换该帧：文件留档，但不再挂到帧上
+      pendingPaste.delete(f.id)
+      return false
+    }
+    pendingPaste.delete(f.id)
+    f.path = path // 直接写路径，保留 objectURL 显示（避免重读闪烁）
+    return true
+  } catch (e) {
+    pendingPaste.delete(f.id)
+    removeFrame(b, f.id) // 落盘失败不留空帧（连带释放预览）
+    notify(`粘贴图片入板失败：${e}`, 'error', 8000)
+    return false
+  }
 }
 
 // ---------------------------------------------------------------- 导出

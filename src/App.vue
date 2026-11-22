@@ -16,6 +16,7 @@ import LocalFiles from './components/LocalFiles.vue'
 import Storyboard from './components/Storyboard.vue'
 import ComicStudio from './components/ComicStudio.vue'
 import { addComicFiles, addComicPaths } from './core/comic'
+import { addStoryboardBlobs, insertStoryboardPaths } from './core/storyboard'
 import { disposeAll, dragGhost, imageDropTargets, init, notify, pasteSubmitField, refreshQueue, state } from './store'
 import { api, saveTempBlob } from './api/tauri'
 import type { FieldSchema } from './core/types'
@@ -114,6 +115,32 @@ async function onDocPaste(e: ClipboardEvent) {
       /* 忽略，漫画页没有别的粘贴语义 */
     }
     return
+  }
+  // 连续插画栏开着：粘贴的图片一律追加成帧（位图截图 / 复制的图片文件都行）。
+  // 想把图贴给参考图字段的话，先点一下字段卡片再 Ctrl+V（FieldControl 自己接管）。
+  if (ui.view === 'workbench' && ui.storyboardOpen) {
+    const sbFiles = filesFromClipboardData(e.clipboardData)
+    if (sbFiles.length) {
+      e.preventDefault()
+      e.stopPropagation()
+      const n = await addStoryboardBlobs(sbFiles)
+      if (n) notify(`已追加 ${n} 帧到连续插画板`, 'ok', 3000)
+      return
+    }
+    // 位图 / files 都看不到（资源管理器复制的图片文件）：Rust 读剪贴板兜底
+    try {
+      const imgs = (await api.clipboardFilePaths()).filter((p) => IMG_EXT_RE.test(p))
+      if (imgs.length) {
+        e.preventDefault()
+        e.stopPropagation()
+        const n = insertStoryboardPaths(imgs)
+        if (n) notify(`已追加 ${n} 帧到连续插画板`, 'ok', 3000)
+        return
+      }
+    } catch {
+      /* 兜底失败继续往下走 */
+    }
+    return // 栏开着但剪贴板没有图片：不抢出图字段的粘贴语义
   }
   const files = filesFromClipboardData(e.clipboardData)
   if (files.length) {

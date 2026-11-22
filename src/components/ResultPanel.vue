@@ -1477,6 +1477,14 @@ onUnmounted(() => {
         <button v-if="lbAsset.params" class="btn sm" title="把这张图提交时的参数回填到左侧表单" @click="applyAssetParams(lbAsset)">
           ⤴ 载入参数
         </button>
+        <button
+          v-if="lbAsset.params"
+          class="btn sm"
+          title="按这张图的参数换一个随机种子再生成一张（会覆盖当前表单里未提交的修改）"
+          @click="rerunAsset(lbAsset)"
+        >
+          🎲 再来一次
+        </button>
         <button v-if="lbAsset.kind === 'image'" class="btn sm" @click="openAssetWorkflow(lbAsset)">
           打开工作流
         </button>
@@ -1517,6 +1525,13 @@ onUnmounted(() => {
     >
       <button class="ctx-item" @click="ctxRun(openLb)">🔍 打开预览</button>
       <button class="ctx-item" @click="ctxRun(applyAssetParams)" title="把提交这张图时的参数回填到表单">⤴ 载入参数</button>
+      <button
+        class="ctx-item"
+        @click="ctxRun(rerunAsset)"
+        title="按这张图的参数换一个随机种子再生成一张（会覆盖当前表单里未提交的修改）"
+      >
+        🎲 再来一次
+      </button>
       <button class="ctx-item" @click="ctxRun(openAssetWorkflow)">📂 打开工作流</button>
       <button class="ctx-item" @click="ctxRun(downloadOne)">⬇ 下载到本地</button>
       <button v-if="ctxMenu.asset.kind === 'image'" class="ctx-item" @click="ctxRun(copyAssetToClipboard)">⧉ 复制图片</button>
