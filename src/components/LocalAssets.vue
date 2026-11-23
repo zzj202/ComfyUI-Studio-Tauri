@@ -5,6 +5,7 @@ import { open } from '@tauri-apps/plugin-dialog'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { api } from '../api/tauri'
 import { captureLocalFrame, copyLocalImageToClipboard, writePngToClipboard } from '../core/localMedia'
+import { openCtxMenu } from '../core/ctxMenu'
 import { beginDrag, imageDropTargets, notify, state } from '../store'
 import { ui } from '../ui'
 
@@ -174,16 +175,12 @@ function onPvKey(e: KeyboardEvent) {
 }
 window.addEventListener('keydown', onPvKey)
 
-// ---- 右键菜单 ----
-const ctx = ref<{ x: number; y: number; path: string } | null>(null)
+// ---- 右键菜单（两段式定位，见 core/ctxMenu.ts） ----
+const ctx = ref<{ x: number; y: number; path: string; placed: boolean } | null>(null)
+const ctxEl = ref<HTMLElement | null>(null)
 
 function openCtx(e: MouseEvent, p: string) {
-  e.preventDefault()
-  ctx.value = {
-    x: Math.min(e.clientX, window.innerWidth - 190),
-    y: Math.min(e.clientY, window.innerHeight - 160),
-    path: p,
-  }
+  openCtxMenu(e, ctx, ctxEl, { path: p })
 }
 
 function ctxRun(fn: (p: string) => void) {
@@ -249,8 +246,9 @@ window.addEventListener('click', onDocClick)
     <!-- 右键菜单 -->
     <div
       v-if="ctx"
+      ref="ctxEl"
       class="fav-ctx"
-      :style="{ left: ctx.x + 'px', top: ctx.y + 'px' }"
+      :style="{ left: ctx.x + 'px', top: ctx.y + 'px', visibility: ctx.placed ? 'visible' : 'hidden' }"
       @click.stop
       @contextmenu.prevent
     >

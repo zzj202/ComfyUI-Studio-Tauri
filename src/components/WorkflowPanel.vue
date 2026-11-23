@@ -20,6 +20,7 @@ import {
 } from '../store'
 import type { DragItem } from '../store'
 import type { WorkflowMeta } from '../core/types'
+import { openCtxMenu } from '../core/ctxMenu'
 import { ui } from '../ui'
 
 // 拖拽落点区：结果资产 / 本地资产拖到「面板空白处」→ 打开它内嵌的工作流
@@ -190,26 +191,16 @@ function onWfClick(w: WorkflowMeta) {
 }
 
 // ---- 右键菜单：聚合工作流/分组的常用操作 ----
-const wctx = ref<{ x: number; y: number; kind: 'wf' | 'group'; name: string } | null>(null)
+// 定位走 ctxMenu 两段式：wf 菜单的分组列表长度随分组数变化，固定估值会被截断
+const wctx = ref<{ x: number; y: number; kind: 'wf' | 'group'; name: string; placed: boolean } | null>(null)
+const wctxEl = ref<HTMLElement | null>(null)
 
 function openWfCtx(e: MouseEvent, w: WorkflowMeta) {
-  e.preventDefault()
-  wctx.value = {
-    x: Math.min(e.clientX, window.innerWidth - 190),
-    y: Math.min(e.clientY, window.innerHeight - 240),
-    kind: 'wf',
-    name: w.name,
-  }
+  openCtxMenu(e, wctx, wctxEl, { kind: 'wf' as const, name: w.name })
 }
 
 function openGroupCtx(e: MouseEvent, name: string) {
-  e.preventDefault()
-  wctx.value = {
-    x: Math.min(e.clientX, window.innerWidth - 190),
-    y: Math.min(e.clientY, window.innerHeight - 110),
-    kind: 'group',
-    name,
-  }
+  openCtxMenu(e, wctx, wctxEl, { kind: 'group' as const, name })
 }
 
 function wctxRun(fn: (name: string) => void) {
@@ -540,8 +531,9 @@ async function openDir() {
       <!-- 右键菜单：工作流（载入/固定/改名/副本/归组/删除）· 分组（改名/删除） -->
       <div
         v-if="wctx"
+        ref="wctxEl"
         class="wctx"
-        :style="{ left: wctx.x + 'px', top: wctx.y + 'px' }"
+        :style="{ left: wctx.x + 'px', top: wctx.y + 'px', visibility: wctx.placed ? 'visible' : 'hidden' }"
         @click.stop
         @contextmenu.prevent
       >

@@ -15,6 +15,7 @@ import { computed, nextTick, onUnmounted, reactive, ref, watch, watchEffect } fr
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { appConfirm } from '../core/confirm'
+import { openCtxMenu } from '../core/ctxMenu'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import type { DragItem } from '../store'
 import { copyLocalImageToClipboard } from '../core/localMedia'
@@ -259,16 +260,12 @@ function frameTitle(f: SbFrame) {
   return f.caption || fileName(f.path)
 }
 
-// 右键菜单
-const ctx = ref<{ x: number; y: number; frame: SbFrame } | null>(null)
+// 右键菜单（两段式定位，见 core/ctxMenu.ts：菜单项随帧状态增减，固定估值会被截断）
+const ctx = ref<{ x: number; y: number; frame: SbFrame; placed: boolean } | null>(null)
+const ctxEl = ref<HTMLElement | null>(null)
 
 function openCtx(e: MouseEvent, f: SbFrame) {
-  e.preventDefault()
-  ctx.value = {
-    x: Math.min(e.clientX, window.innerWidth - 190),
-    y: Math.min(e.clientY, window.innerHeight - 260),
-    frame: f,
-  }
+  openCtxMenu(e, ctx, ctxEl, { frame: f })
 }
 
 function ctxRun(fn: (f: SbFrame) => void) {
@@ -760,8 +757,13 @@ async function doExport() {
     <!-- 右键菜单 -->
     <div
       v-if="ctx"
+      ref="ctxEl"
       class="sb-ctx"
-      :style="{ left: ctx.x + 'px', top: ctx.y + 'px' }"
+      :style="{
+        left: ctx.x + 'px',
+        top: ctx.y + 'px',
+        visibility: ctx.placed ? 'visible' : 'hidden',
+      }"
       @click.stop
       @contextmenu.prevent
     >

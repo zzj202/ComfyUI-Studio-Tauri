@@ -8,6 +8,7 @@ import type { Asset, Job } from '../core/types'
 import { IMG_EXT_RE } from '../core/clipboard'
 import { extractPromptTitle } from '../core/batchText'
 import { appConfirm } from '../core/confirm'
+import { openCtxMenu } from '../core/ctxMenu'
 import { activeBoard, importAssetsToBoard, SB_MAX_FRAMES } from '../core/storyboard'
 import {
   addManualAsset,
@@ -956,17 +957,13 @@ function onCardPointerDown(e: PointerEvent, a: Asset) {
   beginDrag(e, { asset: a, label: displayName(a), thumb: assetUrl(a) })
 }
 
-const ctxMenu = ref<{ x: number; y: number; asset: Asset } | null>(null)
+// 菜单定位走 ctxMenu 两段式（任务菜单高度随节点数变化，固定估值会被截断）
+const ctxMenu = ref<{ x: number; y: number; asset: Asset; placed: boolean } | null>(null)
+const ctxMenuEl = ref<HTMLElement | null>(null)
 
 function openCtx(e: MouseEvent, a: Asset) {
-  e.preventDefault()
   jobCtxMenu.value = null // 与任务菜单互斥
-  // 粗略防溢出（菜单约 168×252）
-  ctxMenu.value = {
-    x: Math.min(e.clientX, window.innerWidth - 176),
-    y: Math.min(e.clientY, window.innerHeight - 262),
-    asset: a,
-  }
+  openCtxMenu(e, ctxMenu, ctxMenuEl, { asset: a })
 }
 
 function closeCtx() {
@@ -990,16 +987,12 @@ function ctxRun(fn: (a: Asset) => void) {
 }
 
 // ---- 任务右键菜单：指定节点执行（绕过自动调度） ----
-const jobCtxMenu = ref<{ x: number; y: number; job: Job } | null>(null)
+const jobCtxMenu = ref<{ x: number; y: number; job: Job; placed: boolean } | null>(null)
+const jobCtxMenuEl = ref<HTMLElement | null>(null)
 
 function openJobCtx(e: MouseEvent, job: Job) {
-  e.preventDefault()
   ctxMenu.value = null // 与资产菜单互斥
-  jobCtxMenu.value = {
-    x: Math.min(e.clientX, window.innerWidth - 200),
-    y: Math.min(e.clientY, window.innerHeight - 280),
-    job,
-  }
+  openCtxMenu(e, jobCtxMenu, jobCtxMenuEl, { job })
 }
 
 function jobCtxRun(fn: (j: Job) => void) {
@@ -1563,8 +1556,9 @@ onUnmounted(() => {
     <!-- 右键菜单 -->
     <div
       v-if="ctxMenu"
+      ref="ctxMenuEl"
       class="ctx-menu"
-      :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }"
+      :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px', visibility: ctxMenu.placed ? 'visible' : 'hidden' }"
       @click.stop
       @contextmenu.prevent
     >
@@ -1594,8 +1588,9 @@ onUnmounted(() => {
     <!-- 任务右键菜单：指定节点执行（绕过自动调度） -->
     <div
       v-if="jobCtxMenu"
+      ref="jobCtxMenuEl"
       class="ctx-menu"
-      :style="{ left: jobCtxMenu.x + 'px', top: jobCtxMenu.y + 'px' }"
+      :style="{ left: jobCtxMenu.x + 'px', top: jobCtxMenu.y + 'px', visibility: jobCtxMenu.placed ? 'visible' : 'hidden' }"
       @click.stop
       @contextmenu.prevent
     >

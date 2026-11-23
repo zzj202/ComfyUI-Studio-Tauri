@@ -12,6 +12,7 @@ import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import { convertFileSrc } from '@tauri-apps/api/core'
 import { open } from '@tauri-apps/plugin-dialog'
 import { appConfirm } from '../core/confirm'
+import { openCtxMenu } from '../core/ctxMenu'
 import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { api } from '../api/tauri'
 import { blobToB64, captureLocalFrame, copyLocalImageToClipboard, writePngToClipboard } from '../core/localMedia'
@@ -439,17 +440,13 @@ async function confirmRename() {
   }
 }
 
-// ---- 右键菜单 ----
-const ctx = ref<{ x: number; y: number; item: MediaItem } | null>(null)
+// ---- 右键菜单（两段式定位，见 core/ctxMenu.ts） ----
+const ctx = ref<{ x: number; y: number; item: MediaItem; placed: boolean } | null>(null)
+const ctxEl = ref<HTMLElement | null>(null)
 
 function openCtx(e: MouseEvent, it: MediaItem) {
-  e.preventDefault()
   if (it.isDir) return
-  ctx.value = {
-    x: Math.min(e.clientX, window.innerWidth - 190),
-    y: Math.min(e.clientY, window.innerHeight - 130),
-    item: it,
-  }
+  openCtxMenu(e, ctx, ctxEl, { item: it })
 }
 
 function ctxRun(fn: (it: MediaItem) => void) {
@@ -586,8 +583,9 @@ onUnmounted(() => {
     <!-- 右键菜单 -->
     <div
       v-if="ctx"
+      ref="ctxEl"
       class="lf-ctx"
-      :style="{ left: ctx.x + 'px', top: ctx.y + 'px' }"
+      :style="{ left: ctx.x + 'px', top: ctx.y + 'px', visibility: ctx.placed ? 'visible' : 'hidden' }"
       @click.stop
       @contextmenu.prevent
     >
