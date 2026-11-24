@@ -113,7 +113,7 @@ function sendToField(p: string) {
     notify('当前工作流没有图片字段', 'warn', 4000)
     return
   }
-  void imageDropTargets.get(f.key)?.(p)
+  void imageDropTargets.get(f.key)?.([p])
   notify(`已发送「${fileName(p)}」到「${f.label}」`, 'ok', 2500)
 }
 

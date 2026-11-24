@@ -467,6 +467,15 @@ body.drag-active * {
   user-select: none !important;
 }
 
+/* 拖拽悬停落点高亮（store.updateDropHot 挂/摘）：内部资产拖拽与外部文件拖入共用。
+   命中的图片参数卡 / 工作流行 / 视频卡亮起，用户明确知道松手会落到哪 */
+.drop-aim {
+  outline: 2px solid var(--accent) !important;
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+  box-shadow: 0 0 0 5px var(--accent-soft, rgba(59, 130, 246, 0.18)) !important;
+}
+
 /* ===== 漫画工坊（ComicStudio.vue） ===== */
 .comic-page {
   flex: 1;

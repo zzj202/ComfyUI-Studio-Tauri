@@ -17,7 +17,7 @@ import Storyboard from './components/Storyboard.vue'
 import ComicStudio from './components/ComicStudio.vue'
 import { addComicFiles, addComicPaths } from './core/comic'
 import { addStoryboardBlobs, insertStoryboardPaths } from './core/storyboard'
-import { disposeAll, dragGhost, imageDropTargets, init, notify, pasteSubmitField, refreshQueue, state } from './store'
+import { disposeAll, dragGhost, dropHot, imageDropTargets, init, notify, pasteSubmitField, refreshQueue, state } from './store'
 import { api, saveTempBlob } from './api/tauri'
 import type { FieldSchema } from './core/types'
 import { IMG_EXT_RE, extFromFile, filesFromClipboardData } from './core/clipboard'
@@ -38,28 +38,17 @@ function pickPasteTarget(): FieldSchema | null {
   )
 }
 
-/** 内存里的图片 File → 落临时文件 → 走字段注册的上传回调 */
+/** 内存里的图片 File → 落临时文件 → 走字段注册的上传回调（回调内部处理单图/多图语义与提示） */
 async function pasteFilesToTarget(files: File[]) {
   const target = pickPasteTarget()
   if (!target) {
     notify('当前工作流没有图片字段，粘贴的图片放不下', 'warn', 4000)
     return
   }
-  const list = target.kind === 'image' ? files.slice(0, 1) : files
   const cb = imageDropTargets.get(target.key)
-  for (const f of list) {
-    const path = await saveTempBlob(f, extFromFile(f))
-    await cb?.(path)
-  }
-  if (files.length > 1) {
-    notify(
-      target.kind === 'image'
-        ? `共 ${files.length} 张，单图字段只用了第 1 张`
-        : `已粘贴 ${files.length} 张图片到「${target.label}」`,
-      'ok',
-      3000
-    )
-  }
+  const paths: string[] = []
+  for (const f of files) paths.push(await saveTempBlob(f, extFromFile(f)))
+  await cb?.(paths)
 }
 
 /** 资源管理器复制的图片文件（WebView 看不见的 CF_HDROP）→ Rust 读路径 → 直接走回调 */
@@ -72,13 +61,7 @@ async function pastePathsToTarget(): Promise<boolean> {
     return true
   }
   const cb = imageDropTargets.get(target.key)
-  if (target.kind === 'image') {
-    await cb?.(imgs[0])
-    if (imgs.length > 1) notify(`剪贴板里有 ${imgs.length} 张图，单图字段只用了第 1 张`, 'warn', 4000)
-  } else {
-    for (const p of imgs) await cb?.(p)
-    if (imgs.length > 1) notify(`已粘贴 ${imgs.length} 张图片到「${target.label}」`, 'ok', 2500)
-  }
+  await cb?.(imgs)
   return true
 }
 
@@ -234,15 +217,17 @@ onUnmounted(() => {
       <LocalFiles />
     </div>
 
-    <!-- 应用内拖拽的跟随幽灵（ResultPanel / LocalAssets 共用） -->
+    <!-- 应用内拖拽的跟随幽灵（ResultPanel / LocalAssets 共用）：悬停落点时附带「松手 → …」提示 -->
     <div
       v-if="dragGhost.item"
       class="drag-ghost"
+      :class="{ aimed: dropHot.label }"
       :style="{ left: dragGhost.x + 14 + 'px', top: dragGhost.y + 12 + 'px' }"
     >
       <img v-if="dragGhost.item.thumb" :src="dragGhost.item.thumb" alt="" />
       <span v-else class="g-emoji">🎬</span>
       <span class="g-label">{{ dragGhost.item.label }}</span>
+      <span v-if="dropHot.label" class="g-hot">{{ dropHot.label }}</span>
     </div>
 
     <AssetDrop />
@@ -315,6 +300,17 @@ onUnmounted(() => {
 .drag-ghost .g-label {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 悬停在有效落点上：幽灵卡描边变实、附「松手 → …」提示 */
+.drag-ghost.aimed {
+  border-style: solid;
+  border-width: 2px;
+  background: var(--accent-soft, var(--panel));
+}
+.drag-ghost .g-hot {
+  font-weight: 600;
+  color: var(--accent);
   white-space: nowrap;
 }
 .right {

@@ -65,10 +65,11 @@ const perBaseQueue = new Map<string, number>()
 let toastSeq = 0
 
 /**
- * 图片控件拖拽注册表：key = field.key，value = 把拖入的本地图片上传为该控件参考图的回调。
+ * 图片控件拖拽注册表：key = field.key，value = 把拖入的图片上传为该控件参考图的回调。
  * FieldControl（image 字段）挂载时注册；AssetDrop 通过落点命中的 data-image-key 在这里取回调。
+ * 参数是路径数组：多图字段一次收全部，单图字段取第一张（回调内部自行筛选/提示）。
  */
-export const imageDropTargets = new Map<string, (path: string) => void>()
+export const imageDropTargets = new Map<string, (paths: string[]) => void>()
 
 /**
  * 应用内「结果资产 → 图片控件」的拖拽注册表（HTML5 拖拽被 dragDropEnabled 吞掉，
@@ -102,6 +103,85 @@ export const dragGhost = reactive<{ x: number; y: number; item: DragItem | null 
 /** 拖拽落点区注册表：key = data-drop-zone 的值 */
 export const dropZones = new Map<string, (item: DragItem) => void>()
 
+// ---------------------------------------------------------------- 落点悬停命中（内部拖拽与外部文件拖入共用）
+// 拖动过程中实时算出指针下的落点：给命中元素挂 .drop-hot 高亮 + 生成
+// 「松手 → 会发生什么」提示文案（幽灵卡和外部拖入遮罩都显示这条）。
+
+export const dropHot = reactive<{ kind: '' | 'image' | 'zone'; key: string; label: string }>({
+  kind: '',
+  key: '',
+  label: '',
+})
+
+let hotEl: HTMLElement | null = null
+
+function toggleHotEl(el: HTMLElement | null) {
+  if (hotEl === el) return
+  if (hotEl) hotEl.classList.remove('drop-aim')
+  hotEl = el
+  if (hotEl) hotEl.classList.add('drop-aim')
+}
+
+interface DropHit {
+  kind: 'image' | 'zone'
+  key: string
+  label: string
+  /** 要挂 .drop-hot 的元素；sb:* 落点由 Storyboard 自己画整框高亮，这里不重复挂 */
+  el: HTMLElement | null
+}
+
+/** 指针下落点命中检测（x/y 为逻辑坐标）。文案按拖拽物类型区分（asset/path/插画帧） */
+function hitDropTarget(x: number, y: number): DropHit | null {
+  try {
+    const el = document.elementFromPoint(x, y)
+    const zoneEl = el?.closest('[data-drop-zone]') as HTMLElement | null
+    if (zoneEl) {
+      const key = zoneEl.getAttribute('data-drop-zone') ?? ''
+      let label = zoneEl.getAttribute('data-drop-label') ?? ''
+      const hot = key.startsWith('sb:') ? null : zoneEl
+      if (key.startsWith('wf:')) {
+        const name = key.slice(3)
+        label = dragGhost.item?.asset
+          ? `载入「${name}」并设为参考图`
+          : `用这张图反查工作流「${name}」`
+      } else if (key === 'workflow-panel') {
+        label = dragGhost.item?.asset ? '反查这张图的工作流' : '导入工作流文件'
+      } else if (key.startsWith('sb:frame:')) {
+        label = dragGhost.item?.sbFrameId ? '调整帧顺序' : '放入这一帧'
+      } else if (key === 'sb:append') {
+        label = dragGhost.item?.sbFrameId ? '移到板尾' : '追加为插画帧'
+      }
+      return { kind: 'zone', key, label, el: hot }
+    }
+    const cardEl = el?.closest('[data-image-key]') as HTMLElement | null
+    if (cardEl) {
+      const key = cardEl.getAttribute('data-image-key') ?? ''
+      const label = cardEl.getAttribute('data-drop-label') ?? '设为参考图'
+      return { kind: 'image', key, label, el: cardEl }
+    }
+  } catch {
+    /* ignore */
+  }
+  return null
+}
+
+/** 拖动经过时更新落点高亮与提示文案（坐标为逻辑坐标；外部拖入传 position/dpr） */
+export function updateDropHot(x: number, y: number) {
+  const hit = hitDropTarget(x, y)
+  dropHot.kind = hit?.kind ?? ''
+  dropHot.key = hit?.key ?? ''
+  dropHot.label = hit?.label ?? ''
+  toggleHotEl(hit?.el ?? null)
+}
+
+/** 拖拽结束/离开窗口：清掉高亮与提示 */
+export function clearDropHot() {
+  dropHot.kind = ''
+  dropHot.key = ''
+  dropHot.label = ''
+  toggleHotEl(null)
+}
+
 let dragItem: DragItem | null = null
 let dragStart: { x: number; y: number } | null = null
 let dragClickAt = 0 // 拖拽结束的时间戳：用于拦截紧跟着派发的 click
@@ -125,11 +205,13 @@ function onDragMove(e: PointerEvent) {
   }
   dragGhost.x = e.clientX
   dragGhost.y = e.clientY
+  updateDropHot(e.clientX, e.clientY)
 }
 
 function onDragUp(e: PointerEvent) {
   window.removeEventListener('pointermove', onDragMove)
   document.body.classList.remove('drag-active')
+  clearDropHot()
   const item = dragItem
   const started = dragGhost.item != null
   dragGhost.item = null
@@ -147,7 +229,7 @@ function onDragUp(e: PointerEvent) {
   }
   const key = el?.closest('[data-image-key]')?.getAttribute('data-image-key') ?? null
   if (key) {
-    if (item.path) imageDropTargets.get(key)?.(item.path)
+    if (item.path) imageDropTargets.get(key)?.([item.path])
     else if (item.asset) assetDropTargets.get(key)?.(item.asset)
     return
   }
@@ -1771,6 +1853,94 @@ export function confirmBatchText(
   }
 }
 
+/** 图文配对弹窗的挂起状态（多图卡片的「🔗 配对」按钮设置，PairedDialog 消费）。
+ *  需求：N 张图 × M 条提示词，每条提示词只跑一次、图按均分重复
+ *  （5 图 × 3 条 = 15 个任务：图1↔1-3、图2↔4-6…），图片来自多图控件。 */
+export const pairedPending = ref<{
+  multiKey: string
+  multiLabel: string
+} | null>(null)
+
+/** 打开图文配对弹窗：要求多图控件已有图片；提示词字段在弹窗里现选/现粘贴 */
+export function openPairedDialog(f: FieldSchema) {
+  const imgs = Array.isArray(f.value) ? f.value.map(String).filter(Boolean) : []
+  if (!imgs.length) {
+    notify('请先给这个多图控件上传图片，再配对提交', 'warn', 4000)
+    return
+  }
+  pairedPending.value = { multiKey: f.key, multiLabel: f.label }
+}
+
+/** 图文配对提交：均分模式——M 条提示词按顺序切给 N 张图（前 M%N 张各多摊一条），
+ *  每条提示词 × per 张。任务序：外层图 → 中层该图分到的提示词 → 内层批次数。
+ *  走 runChain 的 perItem 通道逐任务覆盖图片与提示词，改派/ETA/看板/音效全兼容。 */
+export function submitPaired(opts: {
+  multiKey: string
+  imgs: string[]
+  promptKey: string
+  prompts: string[]
+  perLine: number
+}) {
+  ensureAudio()
+  if (!state.graph) {
+    notify('请先选择一个工作流', 'warn')
+    return
+  }
+  if (!selectWorker(schedulableWorkers(), state.jobs, submitWorkerId.value)) {
+    notify('没有可用的计算节点（全部禁用或冷却中），请到设置里检查节点列表', 'warn', 6000)
+    return
+  }
+  const imgs = opts.imgs.filter(Boolean)
+  const prompts = opts.prompts.slice(0, BATCH_TEXT_MAX)
+  const per = Math.max(1, Math.min(10, Math.floor(opts.perLine) || 1))
+  if (!imgs.length || !prompts.length) {
+    notify('请先上传图片并解析出提示词', 'warn')
+    return
+  }
+  if (prompts.length < imgs.length) {
+    notify(`提示词（${prompts.length} 条）比图片（${imgs.length} 张）少，每张图至少要有一条`, 'warn', 5000)
+    return
+  }
+  recordPromptHistory()
+  const reroll = activeChains > 0
+  activeChains++
+  state.busy = true
+  const baseSnapshot = collectParamsSnapshot()
+  // 均分切块：base = ⌊M/N⌋，前 rem 张图各多摊一条
+  const base = Math.floor(prompts.length / imgs.length)
+  const rem = prompts.length % imgs.length
+  const multiKey = opts.multiKey
+  const promptKey = opts.promptKey
+  const tasks: { img: string; p: string; gi: number; pi: number }[] = []
+  let cursor = 0
+  imgs.forEach((img, gi) => {
+    const n = base + (gi < rem ? 1 : 0)
+    for (let k = 0; k < n; k++) {
+      for (let b = 0; b < per; b++) tasks.push({ img, p: prompts[cursor + k], gi, pi: cursor + k })
+    }
+    cursor += n
+  })
+  void runChain(
+    tasks.length,
+    1,
+    undefined,
+    [],
+    reroll,
+    undefined,
+    (i, values) => {
+      const t = tasks[i]
+      values[multiKey] = t.img
+      values[promptKey] = t.p
+      return { ...(baseSnapshot ?? {}), [multiKey]: t.img, [promptKey]: t.p }
+    }
+  )
+  notify(
+    `图文配对已提交：${imgs.length} 张图 × ${prompts.length} 条提示词${per > 1 ? ` × ${per} 张` : ''} = ${tasks.length} 个任务`,
+    'ok',
+    4000
+  )
+}
+
 /** 批量拆行提交：每行一条提示词 × 批次数，走 runChain 同一链路（改派/ETA/音效/看板全兼容）。
  *  种子策略与批次一致：第 1 个任务用表单种子，其余全量换新；每条的参数快照各记各的行。 */
 function submitBatchText(
@@ -1942,7 +2112,7 @@ async function dispatchOne(
       const patched: Record<string, any> = { ...values }
       for (const f of state.fields) {
         if (
-          (f.kind === 'image' || f.kind === 'video') &&
+          (f.kind === 'image' || f.kind === 'video' || f.kind === 'multiimage') &&
           typeof values[f.key] === 'string' &&
           values[f.key]
         ) {

@@ -73,7 +73,7 @@ async function doClear() {
 // 应用内拖拽落点（收藏 / 本地素材 / 出图结果拖进来）：与 AssetDrop 的命中机制共用 key
 const DROP_KEY = 'comic-drop'
 onMounted(() => {
-  imageDropTargets.set(DROP_KEY, (p) => addComicPaths([p]))
+  imageDropTargets.set(DROP_KEY, (paths) => addComicPaths(paths))
   assetDropTargets.set(DROP_KEY, (a) => void addComicAsset(a))
   window.addEventListener('keydown', onKeydown)
   window.addEventListener('pointerdown', onDocPointerDown, true)
@@ -1310,6 +1310,7 @@ function doUniform() {
         class="comic-list"
         :class="{ grid: gridView, dragging: dragIdx !== null }"
         :data-image-key="DROP_KEY"
+        :data-drop-label="'按顺序加入漫画列表'"
       >
         <div
           v-for="(it, i) in comic.items"

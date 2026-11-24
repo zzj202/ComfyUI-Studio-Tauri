@@ -7,7 +7,7 @@ import { groupFields, parseGraph } from '../core/parseWorkflow'
 import { addComicPaths } from '../core/comic'
 import { SB_MAX_FRAMES, activeBoard, insertStoryboardPaths, sbExtHover, type SbFrame } from '../core/storyboard'
 import { IMG_EXT_RE } from '../core/clipboard'
-import { loadWorkflows, imageDropTargets, notify, selectWorkflow, state } from '../store'
+import { loadWorkflows, clearDropHot, dropHot, imageDropTargets, notify, selectWorkflow, state, updateDropHot } from '../store'
 import { ui } from '../ui'
 
 /**
@@ -21,6 +21,11 @@ const asset = ref<AssetInfo | null>(null)
 const error = ref('')
 const droppedCount = ref(0)
 
+/** 物理 → 逻辑坐标 */
+function logical(position: { x: number; y: number }) {
+  return { x: position.x / window.devicePixelRatio, y: position.y / window.devicePixelRatio }
+}
+
 let unlisten: (() => void) | null = null
 
 onMounted(async () => {
@@ -31,14 +36,19 @@ onMounted(async () => {
     if (e.type === 'enter' || e.type === 'over') {
       hovering.value = true
       sbExtHover.value = sbZoneAt(e.position)
+      // 悬停实时高亮落点 + 生成「松手 → …」提示（遮罩是半透明的，目标看得见）
+      const p = logical(e.position)
+      updateDropHot(p.x, p.y)
     } else if (e.type === 'leave') {
       hovering.value = false
       sbExtHover.value = null
+      clearDropHot()
     } else if (e.type === 'drop') {
       hovering.value = false
       sbExtHover.value = null
+      clearDropHot()
       droppedCount.value = e.paths.length
-      await routeDrop(e.paths, e.position)
+      await routeDrop(e.paths, logical(e.position))
     }
   })
 })
@@ -149,11 +159,11 @@ async function routeDrop(paths: string[], position: { x: number; y: number }) {
     return
   }
 
-  // ② 落点在图片控件（缩略卡）上 → 作为该控件的参考图上传
+  // ② 落点在图片控件（缩略卡）上 → 上传（回调内部筛选：单图取第一张，多图全收）
   const key = await hitImageKey(position)
   const uploader = key ? imageDropTargets.get(key) : undefined
   if (uploader) {
-    uploader(path)
+    uploader(paths)
     return
   }
 
@@ -161,10 +171,10 @@ async function routeDrop(paths: string[], position: { x: number; y: number }) {
   handleFile(path)
 }
 
-/** 物理坐标 → 逻辑坐标，找落点下的图片控件（FieldControl 在缩略卡上标了 data-image-key） */
+/** 逻辑坐标 → 找落点下的图片控件（FieldControl 在缩略卡上标了 data-image-key） */
 function hitImageKey(position: { x: number; y: number }): string | null {
   try {
-    const el = document.elementFromPoint(position.x / window.devicePixelRatio, position.y / window.devicePixelRatio)
+    const el = document.elementFromPoint(position.x, position.y)
     const card = el?.closest('[data-image-key]')
     return card?.getAttribute('data-image-key') ?? null
   } catch {
@@ -172,11 +182,11 @@ function hitImageKey(position: { x: number; y: number }): string | null {
   }
 }
 
-/** 物理坐标 → 逻辑坐标，取落点下的插画板落点（sb:frame:<id> / sb:append）；
+/** 逻辑坐标 → 取落点下的插画板落点（sb:frame:<id> / sb:append）；
  *  在面板上但不在具体落点上（页签区/空白）时按追加处理 */
 function sbZoneAt(position: { x: number; y: number }): string | null {
   try {
-    const el = document.elementFromPoint(position.x / window.devicePixelRatio, position.y / window.devicePixelRatio)
+    const el = document.elementFromPoint(position.x, position.y)
     const zone = el?.closest('[data-drop-zone]')?.getAttribute('data-drop-zone') ?? null
     if (zone?.startsWith('sb:')) return zone
     return el?.closest('.sb') ? 'sb:append' : null
@@ -231,12 +241,12 @@ function fmt(v: any): string {
 </script>
 
 <template>
-  <!-- 拖拽遮罩 -->
+  <!-- 拖拽遮罩：半透明（不挡住落点，目标卡实时高亮），提示卡吸顶 -->
   <div v-if="hovering" class="drop-mask">
     <div class="drop-inner">
-      <div class="icon">⬇</div>
-      <div class="title">松开鼠标</div>
-      <div class="sub" v-if="ui.view === 'comic'">全部图片按拖入顺序加入漫画列表</div>
+      <div class="title">拖放文件</div>
+      <div class="hot" v-if="dropHot.label">🎯 松手 → {{ dropHot.label }}</div>
+      <div class="sub" v-else-if="ui.view === 'comic'">全部图片按拖入顺序加入漫画列表</div>
       <div class="sub" v-else-if="ui.storyboardOpen">
         图片拖到「🎞 连续插画」栏的帧上 = 放入该帧 · 拖到其他位置 = 追加 · JSON → 导入工作流
       </div>
@@ -338,28 +348,32 @@ function fmt(v: any): string {
   position: fixed;
   inset: 0;
   z-index: 300;
-  background: rgba(10, 14, 22, 0.82);
-  backdrop-filter: blur(4px);
+  /* 半透明：拖文件过来时落点目标仍然可见（配合 .drop-hot 实时高亮瞄准） */
+  background: rgba(10, 14, 22, 0.22);
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: center;
   pointer-events: none;
 }
 .drop-inner {
+  margin-top: 52px;
   border: 2px dashed var(--accent);
-  border-radius: 18px;
-  padding: 46px 68px;
+  border-radius: 14px;
+  padding: 16px 30px;
   text-align: center;
-  background: var(--accent-soft);
-}
-.drop-inner .icon {
-  font-size: 30px;
-  color: var(--accent);
+  background: var(--bg-1);
+  box-shadow: var(--shadow);
 }
 .drop-inner .title {
-  margin-top: 10px;
-  font-size: 15px;
+  font-size: 14px;
   font-weight: 600;
+  color: var(--accent);
+}
+.drop-inner .hot {
+  margin-top: 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--accent);
 }
 .drop-inner .sub {
   margin-top: 5px;

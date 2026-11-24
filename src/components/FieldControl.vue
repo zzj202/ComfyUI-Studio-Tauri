@@ -16,6 +16,7 @@ import {
   imageOriginBase,
   notify,
   openBatchTextDialog,
+  openPairedDialog,
   pasteSubmitField,
   primaryBase,
   promptHistory,
@@ -23,6 +24,7 @@ import {
   state,
 } from '../store'
 import { randomSeed, VIDEO_EXT } from '../core/parseWorkflow'
+import { stableKeys, useDragSort } from '../core/dragSort'
 
 const props = defineProps<{ field: FieldSchema }>()
 
@@ -314,17 +316,46 @@ function removeAt(i: number) {
   ensureList().splice(i, 1)
 }
 
-// 注册成「可接收拖拽」的目标：AssetDrop（外部文件）与 ResultPanel（应用内资产）命中 data-image-key 落点后回调
+// ---- 多图缩略卡拖拽排序（插入线模式）：按住拖动 → 目标插入位亮竖线 → 松手挪过去 ----
+
+const thumbsWrap = ref<HTMLElement | null>(null)
+const dsKeys = computed(() => stableKeys(imgList.value))
+const { onDown: dsDown, dragging: dsDragging, insertAt: dsInsertAt } = useDragSort(
+  () => thumbsWrap.value,
+  () => imgList.value,
+  (arr) => {
+    ensureList()
+    props.field.value = arr
+  }
+)
+
+// 注册成「可接收拖拽」的目标：AssetDrop（外部文件）与 ResultPanel（应用内资产）命中 data-image-key 落点后回调。
+// 回调收路径数组（资源管理器一次拖 N 张很常见）：单图取第一张，多图全收，视频筛视频扩展名。
 onMounted(() => {
   const k = props.field.kind
   if (k === 'image') {
-    imageDropTargets.set(props.field.key, (p) => uploadPath(p))
+    imageDropTargets.set(props.field.key, (paths) => {
+      const imgs = paths.filter((p) => IMG_EXT_RE.test(p))
+      if (!imgs.length) return
+      void uploadPath(imgs[0])
+      if (imgs.length > 1) notify(`共拖入 ${imgs.length} 张图，单图字段只用了第 1 张`, 'warn', 4000)
+    })
     assetDropTargets.set(props.field.key, (a) => applyAsset(a))
   } else if (k === 'multiimage') {
-    imageDropTargets.set(props.field.key, (p) => addOne(p))
+    imageDropTargets.set(props.field.key, (paths) => {
+      const imgs = paths.filter((p) => IMG_EXT_RE.test(p))
+      if (!imgs.length) return
+      void (async () => {
+        for (const p of imgs) await addOne(p, true)
+        notify(imgs.length > 1 ? `已添加 ${imgs.length} 张图片` : '已添加图片', 'ok', 2000)
+      })()
+    })
     assetDropTargets.set(props.field.key, (a) => applyAsset(a))
   } else if (k === 'video') {
-    imageDropTargets.set(props.field.key, (p) => uploadVideoPath(p))
+    imageDropTargets.set(props.field.key, (paths) => {
+      const vids = paths.filter((p) => VIDEO_EXT.test(p))
+      if (vids.length) void uploadVideoPath(vids[0])
+    })
     assetDropTargets.set(props.field.key, (a) => applyAsset(a))
   }
 })
@@ -668,6 +699,7 @@ if (props.field.kind === 'video') loadVideoOptions()
       v-else-if="field.kind === 'image'"
       class="img-card"
       :data-image-key="field.key"
+      :data-drop-label="`设为参考图「${field.label}」`"
       tabindex="0"
       title="可把图片文件直接拖到卡片上；点卡片后按 Ctrl+V 也能粘贴"
       @paste="onCardPaste"
@@ -715,10 +747,29 @@ if (props.field.kind === 'video') loadVideoOptions()
     </div>
 
     <!-- 多图：一排缩略卡 + 追加上传；提交时按顺序逐张 × 批次数；支持一次粘贴多张 -->
-    <div v-else-if="field.kind === 'multiimage'" class="multi-card" :data-image-key="field.key" tabindex="0" @paste="onCardPaste">
-      <div class="thumbs">
-        <div v-for="(v, i) in imgList" :key="v + i" class="mthumb">
-          <img v-if="inputUrl(v)" :src="inputUrl(v) ?? ''" alt="" />
+    <div
+      v-else-if="field.kind === 'multiimage'"
+      class="multi-card"
+      :data-image-key="field.key"
+      :data-drop-label="`追加到「${field.label}」图片列表`"
+      tabindex="0"
+      @paste="onCardPaste"
+    >
+      <div ref="thumbsWrap" class="thumbs" :class="{ sorting: dsDragging >= 0 }">
+        <div
+          v-for="(v, i) in imgList"
+          :key="dsKeys[i]"
+          class="mthumb"
+          :class="{
+            dragging: dsDragging === i,
+            'ds-line-l': dsInsertAt === i,
+            'ds-line-r': dsInsertAt === i + 1,
+          }"
+          :title="`${v}（按住拖动可调顺序）`"
+          data-ds
+          @pointerdown="dsDown($event, i)"
+        >
+          <img v-if="inputUrl(v)" :src="inputUrl(v) ?? ''" alt="" draggable="false" />
           <span v-else class="mname" :title="v">{{ v }}</span>
           <button class="mx" title="移除" @click="removeAt(i)">✕</button>
         </div>
@@ -741,9 +792,17 @@ if (props.field.kind === 'video') loadVideoOptions()
         >
           📋 粘贴图片
         </button>
+        <button
+          v-if="imgList.length"
+          class="btn sm"
+          title="图文配对：多张图 × 多条提示词均分配对批量提交（每条提示词只跑一次）"
+          @click="openPairedDialog(field)"
+        >
+          🔗 配对提交
+        </button>
         <button class="btn sm ghost" title="清空全部图片" @click="clearImages">⌫ 清空</button>
       </div>
-      <div class="multi-tip">提交时按顺序逐张 × 批次数（每张图提交批次数次，每次自动随机种子）；可拖图片文件进来，或点卡片后 Ctrl+V——资源管理器里复制的多张图也能一次全贴上</div>
+      <div class="multi-tip">提交时按顺序逐张 × 批次数（每张图提交批次数次，每次自动随机种子）；按住缩略图拖动可调顺序；可拖图片文件进来，或点卡片后 Ctrl+V——资源管理器里复制的多张图也能一次全贴上</div>
     </div>
 
     <!-- 视频：内联预览缩略卡 + 服务器视频选择；卡片也是拖拽上传的落点 -->
@@ -751,6 +810,7 @@ if (props.field.kind === 'video') loadVideoOptions()
       v-else-if="field.kind === 'video'"
       class="img-card"
       :data-image-key="field.key"
+      :data-drop-label="`设为参考视频「${field.label}」`"
       tabindex="0"
       title="可把视频文件直接拖到卡片上"
     >
@@ -1098,14 +1158,49 @@ if (props.field.kind === 'video') loadVideoOptions()
   height: 64px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  overflow: hidden;
+  overflow: visible;
   background: var(--bg-2);
+  cursor: grab;
+  user-select: none;
+}
+/* 拖动中的原条目：变暗 + 虚线框（列表本体不动，松手才挪） */
+.mthumb.dragging {
+  opacity: 0.35;
+  border-style: dashed;
+  cursor: grabbing;
+}
+/* 插入位置指示线（dragSort 插入线模式）：亮在目标间隙的左右边缘 */
+.mthumb.ds-line-l::before,
+.mthumb.ds-line-r::after {
+  content: '';
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 4px;
+  border-radius: 2px;
+  background: var(--accent);
+  z-index: 3;
+  box-shadow: 0 0 6px var(--accent);
+}
+.mthumb.ds-line-l::before {
+  left: -6px;
+}
+.mthumb.ds-line-r::after {
+  right: -6px;
+}
+/* 拖动中给插入线让位的空隙感：整排轻微淡化 */
+.thumbs.sorting .mthumb:not(.dragging) {
+  opacity: 0.85;
 }
 .mthumb img {
   width: 100%;
   height: 100%;
   object-fit: cover;
   display: block;
+  /* overflow 改 visible（给插入线露头）后圆角裁切改由图片自己承担 */
+  border-radius: calc(var(--radius-sm) - 1px);
+  /* 禁原生图片拖拽：不然按住一动就被 WebView 原生拖放接管，排序失效 */
+  -webkit-user-drag: none;
 }
 .mname {
   display: flex;
@@ -1119,6 +1214,7 @@ if (props.field.kind === 'video') loadVideoOptions()
   overflow: hidden;
   word-break: break-all;
   text-align: center;
+  border-radius: calc(var(--radius-sm) - 1px);
 }
 .mx {
   position: absolute;
