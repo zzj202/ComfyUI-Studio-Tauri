@@ -14,6 +14,7 @@ import {
   addManualAsset,
   applyAssetParams,
   beginDrag,
+  cancelBatchJobs,
   clearAssets,
   discardJob,
   enabledWorkers,
@@ -81,16 +82,30 @@ const finishedCount = computed(
 const doneRatio = computed(() =>
   state.jobs.length ? Math.round((finishedCount.value / state.jobs.length) * 100) : 0
 )
+// 分段进度条：成功 / 失败 / 运行中各自占比（一眼看出这批质量如何）
+const doneExactCount = computed(() => state.jobs.filter((j) => j.status === 'done').length)
+const failedCount = computed(
+  () => state.jobs.filter((j) => j.status === 'error' || j.status === 'cancelled').length
+)
+const segPct = computed(() => {
+  const n = state.jobs.length || 1
+  return {
+    ok: (doneExactCount.value / n) * 100,
+    fail: (failedCount.value / n) * 100,
+    run: (runningCount.value / n) * 100,
+  }
+})
 
 const filteredJobs = computed(() => {
-  if (qFilter.value === 'running') return state.jobs.filter((j) => j.status === 'running')
-  if (qFilter.value === 'queued') return state.jobs.filter((j) => j.status === 'queued')
-  if (qFilter.value === 'paused') return state.jobs.filter((j) => j.status === 'paused')
-  if (qFilter.value === 'done')
-    return state.jobs.filter(
+  let list = state.jobs
+  if (qFilter.value === 'running') list = list.filter((j) => j.status === 'running')
+  else if (qFilter.value === 'queued') list = list.filter((j) => j.status === 'queued')
+  else if (qFilter.value === 'paused') list = list.filter((j) => j.status === 'paused')
+  else if (qFilter.value === 'done')
+    list = list.filter(
       (j) => j.status === 'done' || j.status === 'error' || j.status === 'cancelled'
     )
-  return state.jobs
+  return list
 })
 
 // ---- 批次分组：同一次提交（runChain）的任务聚为一组，组头摘要可折叠 ----
@@ -148,6 +163,24 @@ function toggleBatch(key: string) {
   } catch {
     /* ignore */
   }
+}
+
+/** 批次组头上的「取消排队」：把该批还在排队的任务整组摘除（运行中/已完成的不动） */
+async function cancelGroup(g: BatchGroup) {
+  if (!g.batchId || !g.queued) return
+  const yes = await appConfirm({
+    title: `取消这批 ${g.queued} 个排队任务？`,
+    message: '只取消还在排队的；正在生成和已完成的组员不受影响，已提交的参数会保留在任务卡上。',
+    danger: true,
+    okLabel: '取消整批',
+  })
+  if (yes) void cancelBatchJobs(g.batchId)
+}
+
+/** 失败原因摘要（卡上直接显示）：第一行截 48 字，完整内容点击展开 */
+function briefErr(job: Job): string {
+  const l = (job.error ?? '').split('\n')[0].trim()
+  return l.length > 48 ? `${l.slice(0, 48)}…` : l
 }
 
 // ---- 队列列表高度：底部拖拽条调高（80–600px），持久化 ----
@@ -410,7 +443,7 @@ const assets = computed(() => {
     .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.createdAt - a.createdAt)
 })
 
-/** 一键导入插画板：当前筛选出的图片按生成顺序（旧→新）追加为帧，弹窗确认 */
+/** 一键导入插画板：当前筛选出的图片按生成顺序（旧→新）追加为帧（用户约定：不弹确认直接导） */
 async function importToStoryboard() {
   const b = activeBoard()
   if (!b) return
@@ -426,15 +459,9 @@ async function importToStoryboard() {
   }
   const willImport = Math.min(imgs.length, room)
   const clipped = willImport < imgs.length ? `（画板剩余空位有限，只导前 ${willImport} 张）` : ''
-  const ok = await appConfirm({
-    title: '导入连续插画板',
-    message: `把结果区 ${willImport} 张图片按生成顺序追加为「${b.name}」的帧${clipped}。导入后每帧仍保留来源参数，可右键「载入参数 / 再来一次」。`,
-    okLabel: '导入',
-  })
-  if (!ok) return
   const n = await importAssetsToBoard(b, imgs.slice(0, willImport))
   if (n > 0) {
-    notify(`已导入 ${n} 张到插画板「${b.name}」`, 'ok', 5000)
+    notify(`已导入 ${n} 张到插画板「${b.name}」${clipped}`, 'ok', 5000)
     ui.storyboardOpen = true // 栏没开就自动展开，让用户立刻看到结果
     try {
       localStorage.setItem('comfyui-studio.storyboardOpen:v1', '1')
@@ -443,6 +470,8 @@ async function importToStoryboard() {
     }
   }
 }
+
+/** 清空资产：用户约定不弹确认直接清（未读和固定的本来就会保留，store 内自带提示） */
 
 /** 队列头部悬停提示：各节点待处理明细 */
 const queueDetailTitle = computed(() => {
@@ -520,17 +549,56 @@ function safeAssetFilename(a: Asset) {
   return ext && !safe.toLowerCase().endsWith(ext) ? `${safe}${ext}` : safe
 }
 
+/** 单文件存盘：优先设置里配置的下载目录，留空用系统「下载」目录；同名自动加序号 (2)(3)…（失败抛错） */
+async function saveAssetFile(a: Asset): Promise<string> {
+  const configured = String(state.settings.downloadDir ?? '').trim()
+  const dir = (configured || String(await downloadDir())).replace(/[\\/]+$/, '')
+  const dest = `${dir}/${safeAssetFilename(a)}`
+  const r = await api.saveOutput(a.base ?? primaryBase(), a.filename, a.subfolder, a.type, dest)
+  ui.fsChangeTick++ // 下载落盘 → 素材面板立即刷新（不等 5s 轮询）
+  return r.path
+}
+
 async function downloadOne(a: Asset) {
   try {
-    // 不弹窗：优先设置里配置的下载目录，留空用系统「下载」目录；同名自动加序号 (2)(3)…
-    const configured = String(state.settings.downloadDir ?? '').trim()
-    const dir = (configured || String(await downloadDir())).replace(/[\\/]+$/, '')
-    const dest = `${dir}/${safeAssetFilename(a)}`
-    const r = await api.saveOutput(a.base ?? primaryBase(), a.filename, a.subfolder, a.type, dest)
-    ui.fsChangeTick++ // 下载落盘 → 素材面板立即刷新（不等 5s 轮询）
-    notify(`已保存：${r.path}`, 'ok', 4000)
+    const p = await saveAssetFile(a)
+    notify(`已保存：${p}`, 'ok', 4000)
   } catch (e) {
     notify(`保存失败：${e}`, 'error', 8000)
+  }
+}
+
+/** 全部下载：当前筛选出的图片批量存到下载目录（有确认弹窗；视频不在批量内，单张仍可下载） */
+async function downloadAll() {
+  const imgs = assets.value.filter((a) => a.kind === 'image')
+  if (!imgs.length) {
+    notify('当前筛选下没有可下载的图片', 'warn', 4000)
+    return
+  }
+  const ok = await appConfirm({
+    title: '全部下载',
+    message: `把当前筛选的 ${imgs.length} 张图片下载到下载目录？\n同名文件自动加序号，不会覆盖。`,
+    okLabel: '下载',
+  })
+  if (!ok) return
+  let done = 0
+  const fails: string[] = []
+  for (const a of imgs) {
+    try {
+      await saveAssetFile(a)
+      done++
+    } catch {
+      fails.push(displayName(a))
+    }
+  }
+  if (fails.length) {
+    notify(
+      `已下载 ${done} 张，${fails.length} 张失败：${fails.slice(0, 3).join('、')}${fails.length > 3 ? '…' : ''}`,
+      'warn',
+      8000
+    )
+  } else {
+    notify(`已下载 ${done} 张到下载目录`, 'ok', 4000)
   }
 }
 
@@ -1093,10 +1161,16 @@ onUnmounted(() => {
           📂
         </button>
       </header>
-      <!-- 总进度：已完成/总数（含失败与取消） -->
-      <div v-if="state.jobs.length" class="q-total" :title="`已完成 ${finishedCount}/${state.jobs.length}`">
+      <!-- 总进度：分段条（青=运行中 / 红=失败 / 绿=成功），一眼看出这批质量 -->
+      <div
+        v-if="state.jobs.length"
+        class="q-total"
+        :title="`成功 ${doneExactCount} · 失败 ${failedCount} · 运行中 ${runningCount} · 共 ${state.jobs.length}`"
+      >
         <div class="q-total-bar">
-          <div class="q-total-fill" :style="{ width: doneRatio + '%' }" />
+          <div class="q-total-seg ok" :style="{ width: segPct.ok + '%' }" />
+          <div class="q-total-seg fail" :style="{ width: segPct.fail + '%' }" />
+          <div class="q-total-seg run" :style="{ width: segPct.run + '%' }" />
         </div>
         <span class="q-total-txt">{{ doneRatio }}%</span>
       </div>
@@ -1112,8 +1186,16 @@ onUnmounted(() => {
         <button class="btn ghost sm" title="不再保留这份快照" @click="dismissBatchSourceSnap()">丢弃</button>
       </div>
       <div class="q-body" :style="{ maxHeight: queueBodyH + 'px' }">
-        <div v-if="!state.jobs.length" class="q-empty">队列空 · 任务进度显示在这里</div>
-        <template v-for="g in batchGroups" :key="g.key">
+        <div v-if="!state.jobs.length" class="q-empty">
+          <span class="q-empty-ico">🛰️</span>
+          队列空 · 提交后的任务进度显示在这里
+        </div>
+        <div
+          v-for="g in batchGroups"
+          :key="g.key"
+          class="q-group"
+          :class="{ 'is-collapsed': collapsedBatches.has(g.key), 'has-run': !!g.running, 'has-fail': !g.running && !!g.failed }"
+        >
           <!-- 批次组头：摘要 + 折叠开关（单任务组也显示，信息一致） -->
           <button class="q-batch" :title="`批次 ${batchTime(g)} · 点击${collapsedBatches.has(g.key) ? '展开' : '折叠'}`" @click="toggleBatch(g.key)">
             <span class="q-batch-tri" :class="{ open: !collapsedBatches.has(g.key) }" />
@@ -1130,6 +1212,12 @@ onUnmounted(() => {
               />
             </span>
             <span class="q-batch-pct">{{ g.jobs.length ? Math.round(((g.done + g.failed) / g.jobs.length) * 100) : 0 }}%</span>
+            <span
+              v-if="g.queued && g.batchId"
+              class="q-batch-cancel"
+              title="取消这批全部排队中的任务（运行中/已完成的组员不受影响）"
+              @click.stop="cancelGroup(g)"
+            >✕ {{ g.queued }}</span>
           </button>
           <template v-if="!collapsedBatches.has(g.key)">
             <div
@@ -1180,6 +1268,12 @@ onUnmounted(() => {
             {{ job.error ? '失败' : STATUS_TEXT[job.status] }} · {{ dur(job, nowTick) }}
           </span>
           <span v-if="job.outputs.length" class="faint q-files">{{ job.outputs.length }} 文件</span>
+          <span
+            v-if="job.status === 'error' && job.error && expandedErrId !== job.promptId"
+            class="q-err-inline"
+            :title="`${job.error}（点击展开完整错误）`"
+            @click="toggleErr(job)"
+          >{{ briefErr(job) }}</span>
           <button
             v-if="job.status === 'queued' && job.graph && enabledWorkers().length > 1"
             class="btn ghost sm q-x"
@@ -1204,7 +1298,7 @@ onUnmounted(() => {
           </div>
         </div>
           </template>
-        </template>
+        </div>
       </div>
 
       <!-- 队列列表高度拖拽条 -->
@@ -1289,24 +1383,29 @@ onUnmounted(() => {
     <div class="results">
       <header class="r-head">
         <h2>结果</h2>
-        <span class="faint">
+        <span class="r-count" :class="{ filtered: filterActive }">
           {{ filterActive ? `${assets.length}/${state.assets.length}` : `${assets.length} 项` }}
         </span>
         <button v-if="unreadCount" class="btn ghost sm" @click="markAllAssetsRead">
           全部标为已读（{{ unreadCount }}）
         </button>
-        <span class="spacer" />
+        <!-- 右侧按钮组钉死在头部右缘（.r-dl-all margin-left:auto），左侧出现「标为已读」也不挤走换行错位 -->
+        <button
+          class="btn ghost sm r-dl-all"
+          :disabled="!assets.length"
+          title="把当前筛选出的图片全部下载到下载目录（弹窗确认；同名自动加序号）"
+          @click="downloadAll"
+        >
+          ⬇ 全部下载
+        </button>
         <button
           v-if="ui.view === 'workbench'"
-          class="btn sm"
+          class="btn sm r-import"
           :disabled="!assets.length"
-          title="把当前筛选出的图片按生成顺序导入连续插画板（弹窗确认）"
+          title="把当前筛选出的图片按生成顺序导入连续插画板（直接导入）"
           @click="importToStoryboard"
         >
           🎞 导入插画板
-        </button>
-        <button class="btn sm" :disabled="!assets.length" title="只清掉已看过的；未读和 📌 固定的保留" @click="clearAssets">
-          清空资产
         </button>
       </header>
       <!-- 筛选条：工作流下拉 + 节点下拉 + 未读/固定 chip；灯箱翻页跟随筛选结果 -->
@@ -1333,17 +1432,27 @@ onUnmounted(() => {
         <button class="chip-f" :class="{ on: onlyPinned }" title="只看固定的产出" @click="onlyPinned = !onlyPinned">
           📌 固定
         </button>
-        <span class="spacer" />
         <button v-if="filterActive" class="btn ghost sm" @click="resetFilters">重置筛选</button>
+        <!-- 清空资产钉死在筛选条右缘（margin-left:auto）：和头部「导入插画板」不同行不相邻，位置恒定防误点 -->
+        <button
+          class="btn ghost sm r-clear"
+          :disabled="!assets.length"
+          title="只清掉已看过的；未读和 📌 固定的保留（直接执行）"
+          @click="clearAssets"
+        >
+          🧹 清空资产
+        </button>
       </div>
       <div class="r-body">
         <div v-if="!assets.length" class="empty">
           <template v-if="filterActive">
+            <span class="empty-ico">🔍</span><br />
             当前筛选没有匹配的产出。<br /><br />
             <button class="btn sm" @click="resetFilters">清除筛选</button>
           </template>
           <template v-else>
-            还没有产出。<br />提交生成后，出图会出现在这里，点击可放大预览。<br /><br />
+            <span class="empty-ico">🖼️</span><br />
+            还没有产出。提交生成后，出图会出现在这里，点击可放大预览。<br /><br />
             <span class="faint">提示：J / K 键移动选择，Enter 放大，X 固定</span>
           </template>
         </div>
@@ -1827,7 +1936,7 @@ onUnmounted(() => {
 .q-pm-del:hover {
   background: #f871711f;
 }
-/* 总进度条（header 下的一根细条） */
+/* 总进度条（header 下的一根细条）：分段上色（绿=成功 / 红=失败 / 青=运行中），一眼看出批次质量 */
 .q-total {
   display: flex;
   align-items: center;
@@ -1836,22 +1945,33 @@ onUnmounted(() => {
 }
 .q-total-bar {
   flex: 1;
-  height: 3px;
+  height: 4px;
   border-radius: 999px;
   background: var(--bg-3);
   overflow: hidden;
+  display: flex;
 }
-.q-total-fill {
+.q-total-seg {
   height: 100%;
-  border-radius: 999px;
-  background: linear-gradient(90deg, var(--accent), var(--cyan));
   transition: width 0.4s ease;
+}
+.q-total-seg.ok {
+  background: #22c55e;
+}
+.q-total-seg.fail {
+  background: var(--err);
+}
+.q-total-seg.run {
+  background: var(--cyan);
+  animation: q-pulse 1.6s ease-in-out infinite;
 }
 .q-total-txt {
   font-size: 10.5px;
   color: var(--text-faint);
   font-variant-numeric: tabular-nums;
   flex: none;
+  min-width: 30px;
+  text-align: right;
 }
 /* 断电保险丝提示条：批量源文本快照待处置 */
 .q-snap {
@@ -1888,6 +2008,28 @@ onUnmounted(() => {
   overflow-y: auto;
   overflow-x: hidden;
   padding: 0 14px 8px;
+}
+/* 批次组卡片：一次提交聚成一块，左侧竖色条随组状态变色（青=有运行 / 红=有失败） */
+.q-group {
+  margin: 0 0 6px;
+  padding: 3px 8px 3px 10px;
+  border: 1px solid var(--border-soft);
+  border-left: 2px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-2);
+  transition: border-color 0.2s;
+}
+.q-group.has-run {
+  border-left-color: var(--cyan);
+}
+.q-group.has-fail {
+  border-left-color: var(--err);
+}
+.q-group.is-collapsed {
+  padding-bottom: 3px;
+}
+.q-group.is-collapsed .q-batch {
+  opacity: 0.75;
 }
 /* 批次组头：摘要行（时间 + 各状态计数 + 总进度） */
 .q-batch {
@@ -1960,6 +2102,37 @@ onUnmounted(() => {
   width: 30px;
   text-align: right;
 }
+/* 批次组头的「取消排队」：悬停才显形，红色警示 */
+.q-batch-cancel {
+  flex: none;
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 999px;
+  color: var(--err);
+  border: 1px solid var(--err);
+  opacity: 0.25;
+  transition: opacity 0.12s;
+  font-variant-numeric: tabular-nums;
+}
+.q-batch:hover .q-batch-cancel,
+.q-batch-cancel:hover {
+  opacity: 1;
+}
+.q-batch-cancel:hover {
+  background: #f8717122;
+}
+/* 失败原因直接上卡（截断摘要，点击展开完整错误） */
+.q-err-inline {
+  color: var(--err);
+  font-size: 11px;
+  max-width: 260px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  flex: none;
+}
 /* 队列列表高度拖拽条 */
 .q-hdrag {
   height: 7px;
@@ -1981,9 +2154,19 @@ onUnmounted(() => {
   background: var(--accent);
 }
 .q-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
   font-size: 11.5px;
   color: var(--text-faint);
-  padding: 4px 0 2px;
+  padding: 14px 0 10px;
+  text-align: center;
+}
+.q-empty-ico {
+  font-size: 20px;
+  opacity: 0.55;
+  line-height: 1;
 }
 .q-row {
   display: flex;
@@ -1991,9 +2174,14 @@ onUnmounted(() => {
   flex-wrap: wrap; /* 失败详情占满一整行时换行 */
   gap: 6px;
   font-size: 11.5px;
-  padding: 3px 0;
+  padding: 3px 4px;
   min-height: 22px;
   min-width: 0;
+  border-radius: 6px;
+  transition: background 0.12s;
+}
+.q-row:hover {
+  background: var(--bg-3);
 }
 .dot {
   flex: none;
@@ -2143,6 +2331,36 @@ onUnmounted(() => {
   font-size: 12.5px;
   font-weight: 600;
 }
+/* 结果计数徽章：筛选激活时亮起（提示当前看到的是子集） */
+.r-count {
+  flex: none;
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 3px 9px;
+  border-radius: 999px;
+  border: 1px solid var(--border-soft);
+  background: var(--bg-2);
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.r-count.filtered {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+/* 头部右侧按钮组钉死右缘：左侧出现「标为已读」也不挤走换行（防布局变化点错） */
+.r-dl-all {
+  margin-left: auto;
+}
+/* 清空资产：挪到筛选条右缘 + 警示红（与「导入插画板」不同行不相邻，防误点） */
+.r-clear {
+  margin-left: auto;
+  color: var(--err);
+}
+.r-clear:hover:not(:disabled) {
+  background: rgba(248, 113, 113, 0.12);
+  border-color: rgba(248, 113, 113, 0.4);
+}
 
 /* ---- 结果筛选条 ---- */
 .r-filter {
@@ -2214,9 +2432,14 @@ onUnmounted(() => {
 .empty {
   color: var(--text-faint);
   font-size: 12.5px;
-  padding: 32px 0;
+  padding: 28px 0;
   text-align: center;
   line-height: 2;
+}
+.empty-ico {
+  font-size: 26px;
+  line-height: 1;
+  opacity: 0.5;
 }
 .grid {
   display: grid;
@@ -2231,11 +2454,12 @@ onUnmounted(() => {
   overflow: hidden;
   cursor: zoom-in;
   background: var(--panel);
-  transition: border-color 0.14s, transform 0.14s;
+  transition: border-color 0.14s, transform 0.14s, box-shadow 0.14s;
 }
 .card:hover {
   border-color: var(--accent);
-  transform: translateY(-1px);
+  transform: translateY(-2px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
 }
 .media {
   position: relative;

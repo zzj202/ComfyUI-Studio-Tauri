@@ -210,7 +210,8 @@ async function save() {
             <span class="conv-item"><code>+</code>暴露但不编号（排在带数字的后面）</span>
             <span class="conv-item"><code>图</code>图片上传卡（图片 / 上传 / image / img 同义）</span>
             <span class="conv-item"><code>多图</code>多图上传（多张 / multiimg 同义）；实际提交数 = 图数 × 批次</span>
-            <span class="conv-item"><code>视频</code>视频上传卡（VHS_LoadVideo 等加载视频节点；vid / video 同义）※ 多输入节点上 图/多图/视频 只套到名字匹配的那个输入，不影响其余参数</span>
+            <span class="conv-item"><code>视频</code>视频上传卡（VHS_LoadVideo 等加载视频节点；vid / video 同义）</span>
+            <span class="conv-item"><code>音频</code>音频上传卡（LoadAudio 等加载音频节点；aud / audio 同义）※ 多输入节点上 图/多图/视频/音频 只套到名字匹配的那个输入，不影响其余参数</span>
             <span class="conv-item"><code>种子</code>随机种子控件（随机 / seed 同义）</span>
             <span class="conv-item"><code>长文</code>多行文本（长文本 / 多行 / textarea 同义）</span>
             <span class="conv-item"><code>文本</code>单行文本（text 同义）</span>
@@ -223,6 +224,7 @@ async function save() {
           </div>
           <div class="conv-foot">
             示例：<code>提示词|1|长文</code> · <code>人脸参考|5|图</code> · <code>参考图|多图</code> ·
+            <code>配音|21|音频</code> ·
             <code>步数|20|预设:20,25,30</code> · <code>负面词|3|长文|交换:正,反</code> · <code>批量|+</code> · <code>调试|~</code>
             。优先级：<b>定制模板 &gt; 节点标题约定 &gt; 自动推断</b>（右侧行内改动保存后即成定制模板，标题再怎么改都不受影响）
           </div>

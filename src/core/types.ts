@@ -8,6 +8,7 @@ export type FieldKind =
   | 'image'
   | 'multiimage'
   | 'video'
+  | 'audio'
 
 export type FieldAction = 'randomize' | 'clear' | 'step'
 

@@ -147,7 +147,12 @@ function hitDropTarget(x: number, y: number): DropHit | null {
       } else if (key === 'workflow-panel') {
         label = dragGhost.item?.asset ? '反查这张图的工作流' : '导入工作流文件'
       } else if (key.startsWith('sb:frame:')) {
-        label = dragGhost.item?.sbFrameId ? '调整帧顺序' : '放入这一帧'
+        // 有图帧（无 .empty 类）= 松手替换原图；空帧 = 放入；板内帧拖动 = 调整顺序
+        label = dragGhost.item?.sbFrameId
+          ? '调整帧顺序'
+          : zoneEl.classList.contains('empty')
+            ? '放入这一帧'
+            : '替换这一帧原图（旧图进历史）'
       } else if (key === 'sb:append') {
         label = dragGhost.item?.sbFrameId ? '移到板尾' : '追加为插画帧'
       }
@@ -703,6 +708,60 @@ export async function toggleWorkflowPin(name: string) {
   }
 }
 
+// ---- 收藏工作流：⭐ 标记 + 各组内置顶（localStorage，纯 UI 偏好不进 settings） ----
+
+const FAV_WF_KEY = 'comfyui-studio.favWorkflows:v1'
+
+function loadFavWorkflows(): string[] {
+  try {
+    const raw = localStorage.getItem(FAV_WF_KEY)
+    const arr = raw ? JSON.parse(raw) : null
+    return Array.isArray(arr) ? arr.map(String) : []
+  } catch {
+    return []
+  }
+}
+
+export const favWorkflows = ref<string[]>(loadFavWorkflows())
+
+function saveFavWorkflows() {
+  try {
+    localStorage.setItem(FAV_WF_KEY, JSON.stringify(favWorkflows.value))
+  } catch {
+    /* 忽略存储失败 */
+  }
+}
+
+export function isWorkflowFav(name: string): boolean {
+  return favWorkflows.value.includes(name)
+}
+
+export function toggleWorkflowFav(name: string) {
+  const i = favWorkflows.value.indexOf(name)
+  if (i >= 0) favWorkflows.value.splice(i, 1)
+  else favWorkflows.value.push(name)
+  saveFavWorkflows()
+}
+
+/**
+ * 工作流改名后同步收藏列表（renameWorkflow 全链路引用迁移的一环）。
+ */
+export function renameFavWorkflow(oldName: string, newName: string) {
+  const i = favWorkflows.value.indexOf(oldName)
+  if (i < 0) return
+  const list = [...favWorkflows.value]
+  list[i] = newName
+  favWorkflows.value = list
+  saveFavWorkflows()
+}
+
+/** 收藏置顶排序：⭐ 的排前面，其余保持原相对顺序（稳定） */
+export function sortFavFirst<T extends { name: string }>(list: T[]): T[] {
+  if (!favWorkflows.value.length) return list
+  const rank = (w: T) => (favWorkflows.value.includes(w.name) ? 0 : 1)
+  return [...list].sort((a, b) => rank(a) - rank(b))
+}
+
 /**
  * 工作流改名（重命名文件）+ 全链路引用迁移：
  * 列表元数据 / 拖拽排序 / 已填参数值缓存 / 上次打开记录 / 模板绑定。
@@ -739,6 +798,9 @@ export async function renameWorkflow(oldName: string, newName: string) {
     persistFieldValues()
   }
 
+  // 3.5) 收藏列表里的旧名 → 新名
+  renameFavWorkflow(oldName, name)
+
   // 4) 上次打开的工作流
   try {
     if (localStorage.getItem('comfyui-studio.lastWorkflow:v1') === oldName) {
@@ -769,12 +831,12 @@ export async function renameWorkflow(oldName: string, newName: string) {
 
 /**
  * 把一份结果资产设为某个工作流的参考素材（拖资产到工作流卡片）：
- * 图片资产 → 第一个图片字段（单图）或多图字段追加；视频资产 → 第一个视频字段。
+ * 图片资产 → 第一个图片字段（单图）或多图字段追加；视频资产 → 第一个视频字段；音频资产 → 第一个音频字段。
  * 复用 FieldControl 的取值规则：input 里已有文件直接引用并记上传源；output 先 copyToInput 到主节点。
  */
 export async function applyAssetToWorkflow(a: Asset, wfName: string) {
-  if (a.kind !== 'image' && a.kind !== 'video') {
-    notify('只有图片/视频能设为参考素材', 'warn')
+  if (a.kind !== 'image' && a.kind !== 'video' && a.kind !== 'audio') {
+    notify('只有图片/视频/音频能设为参考素材', 'warn')
     return
   }
   try {
@@ -785,6 +847,12 @@ export async function applyAssetToWorkflow(a: Asset, wfName: string) {
       field = state.fields.find((f) => f.kind === 'video')
       if (!field) {
         notify(`「${wfName}」没有视频字段，无法设参考视频`, 'warn', 5000)
+        return
+      }
+    } else if (a.kind === 'audio') {
+      field = state.fields.find((f) => f.kind === 'audio')
+      if (!field) {
+        notify(`「${wfName}」没有音频字段，无法设参考音频`, 'warn', 5000)
         return
       }
     } else {
@@ -815,7 +883,15 @@ export async function applyAssetToWorkflow(a: Asset, wfName: string) {
     } else {
       field.value = path
     }
-    notify(a.kind === 'video' ? `已设为「${wfName}」的参考视频` : `已设为「${wfName}」的参考图`, 'ok', 3000)
+    notify(
+      a.kind === 'video'
+        ? `已设为「${wfName}」的参考视频`
+        : a.kind === 'audio'
+          ? `已设为「${wfName}」的参考音频`
+          : `已设为「${wfName}」的参考图`,
+      'ok',
+      3000
+    )
   } catch (e) {
     notify(`引用资产失败：${e}`, 'error', 8000)
   }
@@ -1058,6 +1134,21 @@ async function reapStaleJobs(base: string) {
   }
 }
 
+/** 从 history 条目的 status.messages 挖真实的执行错误（节点类型 + 异常消息）：
+ *  WS 断连后靠 history 补记的任务，别再笼统写「执行出错」，把原因亮出来 */
+function historyErrorText(entry: any): string | null {
+  try {
+    const msgs: any[] = entry?.status?.messages ?? []
+    const m = msgs.find((x) => x?.[0] === 'execution_error')?.[1]
+    if (!m) return null
+    const node = m.node_type ? `节点 ${m.node_type}` : ''
+    const msg = String(m.exception_message ?? '执行出错')
+    return node ? `${node}: ${msg}` : msg
+  } catch {
+    return null
+  }
+}
+
 async function finishJob(promptId: string, base: string) {
   const job = state.jobs.find((j) => j.base === base && j.promptId === promptId)
   // paused 同列守卫：暂停任务被 interrupt 后 finishing 事件（如 history 补记）不得改写状态
@@ -1076,7 +1167,7 @@ async function finishJob(promptId: string, base: string) {
       // history 条目也可能执行出错（如被中断）：标 error 而不是误收成 done
       if (entry.status?.status_str === 'error') {
         job.status = 'error'
-        job.error = '执行出错（从历史记录补记）'
+        job.error = historyErrorText(entry) ?? '执行出错（从历史记录补记）'
         job.finishedAt = Date.now()
         return
       }
@@ -1705,18 +1796,21 @@ function loadPromptHistory(): string[] {
 export const promptHistory = ref<string[]>(loadPromptHistory())
 
 /** 提交时调用：把当前所有文本字段的值收进历史（去重、最近优先） */
-export function recordPromptHistory() {
+export function recordPromptHistory(overrides?: Record<string, string>) {
   let changed = false
   for (const f of state.fields) {
-    if ((f.kind === 'text' || f.kind === 'textarea') && typeof f.value === 'string') {
-      const t = f.value.trim()
-      if (!t) continue
-      const i = promptHistory.value.indexOf(t)
-      if (i > 0) promptHistory.value.splice(i, 1)
-      if (i !== 0) {
-        promptHistory.value.unshift(t)
-        changed = true
-      }
+    if (f.kind !== 'text' && f.kind !== 'textarea') continue
+    // overrides：配对提交等「提示词不在表单字段里」的路径，按 key 换成实际提交的内容，
+    // 不然历史记进去的是字段里的旧值（或什么都没有）
+    const raw = overrides?.[f.key] ?? f.value
+    if (typeof raw !== 'string') continue
+    const t = raw.trim()
+    if (!t) continue
+    const i = promptHistory.value.indexOf(t)
+    if (i > 0) promptHistory.value.splice(i, 1)
+    if (i !== 0) {
+      promptHistory.value.unshift(t)
+      changed = true
     }
   }
   if (promptHistory.value.length > PROMPT_HIST_MAX) {
@@ -1796,6 +1890,7 @@ export function submit(batch = submitBatch.value) {
   state.busy = true
   // 按下提交这一刻的参数快照：随任务挂到每个产出上，供灯箱「载入参数」一键回填
   const paramsSnapshot = collectParamsSnapshot()
+  rememberSubmitParams(paramsSnapshot)
   void runChain(total, count, multi?.key, imgs, reroll, paramsSnapshot)
 }
 
@@ -1901,16 +1996,18 @@ export function submitPaired(opts: {
     notify(`提示词（${prompts.length} 条）比图片（${imgs.length} 张）少，每张图至少要有一条`, 'warn', 5000)
     return
   }
-  recordPromptHistory()
+  const multiKey = opts.multiKey
+  const promptKey = opts.promptKey
+  recordPromptHistory({ [promptKey]: prompts.join('\n') })
+  // 已有链在跑时又提交（排队链）→ 整链重掷种子防撞车，与普通提交一致
   const reroll = activeChains > 0
   activeChains++
   state.busy = true
   const baseSnapshot = collectParamsSnapshot()
+  rememberSubmitParams(baseSnapshot)
   // 均分切块：base = ⌊M/N⌋，前 rem 张图各多摊一条
   const base = Math.floor(prompts.length / imgs.length)
   const rem = prompts.length % imgs.length
-  const multiKey = opts.multiKey
-  const promptKey = opts.promptKey
   const tasks: { img: string; p: string; gi: number; pi: number }[] = []
   let cursor = 0
   imgs.forEach((img, gi) => {
@@ -1967,6 +2064,7 @@ function submitBatchText(
   activeChains++
   state.busy = true
   const baseSnapshot = collectParamsSnapshot()
+  rememberSubmitParams(baseSnapshot)
   // 外层行 × 内层批次：与多图展开同构（Math.floor(i / count) 取行）
   void runChain(
     items.length * perLine,
@@ -2050,6 +2148,48 @@ function collectParamsSnapshot(): Record<string, any> | undefined {
   return o
 }
 
+// ---- 上次提交参数快照：字段值与之不同就在参数卡上标点（「这次改了什么」一眼可见） ----
+
+const LAST_SUBMIT_KEY = 'comfyui-studio.lastSubmitParams:v1'
+
+/** 工作流名 → 上次成功发起提交时的字段值快照 */
+const lastSubmitParams = reactive<Record<string, Record<string, any>>>(
+  (() => {
+    try {
+      const raw = localStorage.getItem(LAST_SUBMIT_KEY)
+      const o = raw ? JSON.parse(raw) : null
+      return o && typeof o === 'object' ? o : {}
+    } catch {
+      return {}
+    }
+  })()
+)
+
+function persistLastSubmit() {
+  try {
+    localStorage.setItem(LAST_SUBMIT_KEY, JSON.stringify(lastSubmitParams))
+  } catch {
+    /* 忽略存储失败 */
+  }
+}
+
+/** 每次成功发起提交时调用（普通/批量拆行/图文配对共用）：记住这批参数作为对比基准 */
+function rememberSubmitParams(snap: Record<string, any> | undefined) {
+  if (!snap || !state.currentWorkflow) return
+  lastSubmitParams[state.currentWorkflow] = snap
+  persistLastSubmit()
+}
+
+/** 该字段的当前值是否与上次提交时不同（seed 字段每次提交自动换新，不标点） */
+export function fieldDirty(f: FieldSchema): boolean {
+  const wf = state.currentWorkflow
+  const snap = wf ? lastSubmitParams[wf] : undefined
+  if (!snap || f.kind === 'seed' || !(f.key in snap)) return false
+  const a = Array.isArray(f.value) ? JSON.stringify(f.value) : String(f.value ?? '')
+  const b = Array.isArray(snap[f.key]) ? JSON.stringify(snap[f.key]) : String(snap[f.key] ?? '')
+  return a !== b
+}
+
 // ------------------------------------------------ 参考图跨机转存 + 单任务派发
 
 /** 转存去重缓存：key = `${value}|${workerId}`，值 = 进行中/已完成的转存 Promise；失败自动出缓存可重试 */
@@ -2108,11 +2248,11 @@ async function dispatchOne(
       )
     }
     try {
-      // 图片/视频字段按需转存到目标机（patched 只覆盖 image/multiimage/video 三类，其余值原样）
+      // 图片/视频/音频字段按需转存到目标机（patched 只覆盖 image/multiimage/video/audio 四类，其余值原样）
       const patched: Record<string, any> = { ...values }
       for (const f of state.fields) {
         if (
-          (f.kind === 'image' || f.kind === 'video' || f.kind === 'multiimage') &&
+          (f.kind === 'image' || f.kind === 'video' || f.kind === 'audio' || f.kind === 'multiimage') &&
           typeof values[f.key] === 'string' &&
           values[f.key]
         ) {
@@ -2166,6 +2306,7 @@ async function runChain(
   let ok = 0
   const done_ = [] as { base: string; promptId: string }[]
   const batchId = `b${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}` // 批次分组标记
+  let consecFail = 0 // 连续派发失败计数：连续 3 个失败（节点不可用）才中止整链，避免断连时刷屏
   try {
     for (let i = 0; i < total; i++) {
       const values = collectValues(state.fields.filter((f) => f.kind !== 'multiimage'))
@@ -2173,13 +2314,31 @@ async function runChain(
       const itemParams = perItem ? perItem(i, values) : params
       // 第 1 个任务沿用表单上的种子（可复现）；其余每个都全量换新种子，整批不重样
       const reseed = i > 0 || reroll
-      const r = await dispatchOne(
-        values,
-        submitWorkerId.value,
-        state.currentWorkflow,
-        itemParams,
-        reseed
-      )
+      // 单任务派发失败不再中止整链：多节点时其他机器还能接手后面的任务；
+      // 连续 3 个失败（基本等于全节点不可用）才放弃，并明确告知剩余多少没交
+      let r: Awaited<ReturnType<typeof dispatchOne>>
+      try {
+        r = await dispatchOne(
+          values,
+          submitWorkerId.value,
+          state.currentWorkflow,
+          itemParams,
+          reseed
+        )
+        consecFail = 0
+      } catch (e) {
+        consecFail++
+        if (consecFail >= 3) {
+          notify(
+            `连续 ${consecFail} 个任务派发失败（${e}），本链剩余 ${total - i} 个任务未提交，请检查节点连接后重新提交`,
+            'error',
+            10000
+          )
+          break
+        }
+        notify(`任务 ${i + 1}/${total} 派发失败：${e}，跳过继续下一个`, 'error', 8000)
+        continue
+      }
       ok++
       state.jobs.unshift({
         promptId: r.promptId,
@@ -2242,13 +2401,29 @@ async function runChain(
 }
 
 export async function interrupt() {
-  try {
-    // 只中断主节点当前任务（「全部中断」属 P2 范围）
-    await api.interrupt(primaryBase())
-    notify('已发送中断指令', 'info', 3000)
-  } catch (e) {
-    notify(`中断失败：${e}`, 'error')
+  // 中断所有「有运行中任务」的节点（多节点时任务可能跑在任意一台，只发主节点会漏）；
+  // 应用内没有运行中任务时退回旧行为：中断主节点当前任务（兜住其他客户端提交的任务）
+  const running = state.jobs.filter((j) => j.status === 'running')
+  const bases = [...new Set(running.map((j) => j.base ?? primaryBase()))]
+  if (!bases.length) {
+    try {
+      await api.interrupt(primaryBase())
+      notify('已发送中断指令', 'info', 3000)
+    } catch (e) {
+      notify(`中断失败：${e}`, 'error')
+    }
+    return
   }
+  const failed: string[] = []
+  for (const base of bases) {
+    try {
+      await api.interrupt(base)
+    } catch {
+      failed.push(workerName(base))
+    }
+  }
+  if (failed.length) notify(`中断失败：${failed.join('、')}`, 'error', 8000)
+  else notify(`已向 ${bases.length} 个节点发送中断指令`, 'info', 3000)
 }
 
 /** 每台启用节点的待处理数（refreshQueue 填充），队列头部悬停明细用 */
@@ -2280,7 +2455,7 @@ async function pollFinishJob(j: Job) {
     }
     if (entry.status?.status_str === 'error') {
       j.status = 'error'
-      j.error = '执行出错（从历史记录补记）'
+      j.error = historyErrorText(entry) ?? '执行出错（从历史记录补记）'
       j.finishedAt = Date.now()
       removePendingRec(j.promptId, base) // 终态
       return
@@ -2325,6 +2500,27 @@ export async function refreshQueue() {
   } catch {
     /* ignore */
   }
+  // 断连/节点池变更兜底：任务挂在已移除/禁用的节点名下 → pollFinishJob 对不可达
+  // 节点永远静默失败，任务永久卡住还堵死「全部完成」判定（音效/系统通知不触发）。
+  // base 不在当前启用池里（池非空才有判断依据）→ 立即标终态。
+  if (state.jobs.some((j) => j.status === 'running' || j.status === 'queued')) {
+    const aliveBases = new Set(enabledWorkers().map((w) => w.base))
+    if (!aliveBases.size && state.settings.baseUrl) aliveBases.add(state.settings.baseUrl)
+    if (aliveBases.size) {
+      let orphaned = 0
+      for (const j of state.jobs) {
+        if (j.status !== 'running' && j.status !== 'queued') continue
+        if (!aliveBases.has(j.base ?? primaryBase())) {
+          j.status = 'error'
+          j.error = '节点已禁用或移除，任务终止（可改派其他节点或重新提交）'
+          j.finishedAt = Date.now()
+          removePendingRec(j.promptId, j.base ?? primaryBase())
+          orphaned++
+        }
+      }
+      if (orphaned) notify(`${orphaned} 个任务的节点已禁用/移除，已标记为失败`, 'warn', 8000)
+    }
+  }
   // 历史兜底（见 pollFinishJob）：queued+running 都查（恢复的任务可能停在 queued）
   for (const j of state.jobs) {
     if (j.status === 'running' || j.status === 'queued') void pollFinishJob(j)
@@ -2358,6 +2554,48 @@ export async function discardJob(job: Job) {
   const i = state.jobs.indexOf(job)
   if (i >= 0) state.jobs.splice(i, 1)
   removePendingRec(job.promptId, base) // 用户主动移除 = 索引同步删除
+  void refreshQueue()
+}
+
+/**
+ * 批次整组取消：把该批次所有**排队中**的任务从各节点队列批量摘除并删本地记录。
+ * 运行中/已完成/已暂停的组员不动（运行中的去任务卡上单独 ✕ 中断）。
+ * 摘除失败的节点其任务保留（任务实际还在远端队列，刷新后会恢复）。
+ * 本地记录删除后 waitForJob 按「任务不存在」正常收尾，提交链不会卡死。
+ */
+export async function cancelBatchJobs(batchId: string) {
+  const targets = state.jobs.filter((j) => j.batchId === batchId && j.status === 'queued')
+  if (!targets.length) {
+    notify('这一批没有排队中的任务', 'info', 3000)
+    return
+  }
+  const byBase = new Map<string, string[]>()
+  for (const j of targets) {
+    const b = j.base ?? primaryBase()
+    const ids = byBase.get(b)
+    if (ids) ids.push(j.promptId)
+    else byBase.set(b, [j.promptId])
+  }
+  const okBases = new Set<string>()
+  const failed: string[] = []
+  let removed = 0
+  for (const [base, ids] of byBase) {
+    try {
+      await api.queueDelete(base, ids)
+      okBases.add(base)
+      removed += ids.length
+    } catch {
+      failed.push(workerName(base))
+    }
+  }
+  const victims = state.jobs.filter(
+    (j) => j.batchId === batchId && j.status === 'queued' && okBases.has(j.base ?? primaryBase())
+  )
+  for (const j of victims) removePendingRec(j.promptId, j.base ?? primaryBase())
+  state.jobs = state.jobs.filter((j) => !victims.includes(j))
+  persistPendingJobs()
+  if (removed) notify(`已取消整批排队任务（${removed} 个）`, 'ok', 4000)
+  if (failed.length) notify(`节点 ${failed.join('、')} 摘除失败，其名下任务保留`, 'warn', 8000)
   void refreshQueue()
 }
 

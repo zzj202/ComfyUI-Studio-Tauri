@@ -320,7 +320,7 @@ textarea {
 .field {
   display: flex;
   flex-direction: column;
-  gap: 5px;
+  gap: 3px;
 }
 .field-label {
   display: flex;
@@ -334,6 +334,16 @@ textarea {
   color: var(--text);
   font-weight: 500;
   white-space: nowrap; /* 中文名不折行（「自定义高度」不再断成两行） */
+}
+/* 参数改动标点：字段值与上次提交时不同就亮一个点，提交后（快照更新）自动熄灭 */
+.field-label .dirty-dot {
+  flex: none;
+  align-self: center;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warn);
+  box-shadow: 0 0 6px var(--warn);
 }
 .field-label .code {
   color: var(--text-faint);

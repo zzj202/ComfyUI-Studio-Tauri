@@ -119,15 +119,36 @@ function onDrop(zoneKey: string, item: DragItem) {
     return
   }
   if (item.asset) {
+    const prev = target.path // 有图帧 = 替换：旧图先存进历史再换，防丢
     void fillFrameFromAsset(b, target, item.asset).then((ok) => {
-      if (ok) broken.delete(target.id)
+      if (!ok) return
+      broken.delete(target.id)
+      if (prev) {
+        pushFrameHistory(target, prev)
+        notify(`已替换第 ${frameNo(target)} 帧（旧图在灯箱「历史」里可找回）`, 'ok', 3000)
+      }
     })
   } else if (item.path && IMG_EXT_RE.test(item.path)) {
+    const prev = target.path
+    if (prev && prev !== item.path) pushFrameHistory(target, prev)
     fillFrameFromPath(target, item.path)
     broken.delete(target.id)
+    if (prev) notify(`已替换第 ${frameNo(target)} 帧（旧图在灯箱「历史」里可找回）`, 'ok', 3000)
   } else {
     notify('插画板帧只收图片', 'warn', 3000)
   }
+}
+
+/** 替换前的旧图进帧历史（灯箱历史条可回看/换回），上限 5 份防膨胀——与「再来一次」同规则 */
+function pushFrameHistory(f: SbFrame, prev: string) {
+  const h = f.history ?? (f.history = [])
+  h.push(prev)
+  if (h.length > 5) h.splice(0, h.length - 5)
+}
+
+/** 帧序号（提示文案用） */
+function frameNo(f: SbFrame): number {
+  return board.value ? board.value.frames.indexOf(f) + 1 : 0
 }
 
 /** 指针在落点框的左半还是右半（决定「插到它前 / 后」；网格按阅读序 2 列） */
@@ -242,18 +263,8 @@ function addFrame() {
 function clearAll() {
   const b = board.value
   if (!b) return
-  if (!b.frames.some((f) => f.path)) {
-    resetBoard(b)
-    return
-  }
-  void appConfirm({
-    title: '清空画板',
-    message: `清空画板「${b.name}」的全部帧？\n磁盘上的图片保留。`,
-    danger: true,
-    okLabel: '清空',
-  }).then((ok) => {
-    if (ok && board.value === b) resetBoard(b) // 清完留 4 个空框（用户约定）
-  })
+  // 用户约定：不弹确认直接清（磁盘图片本就保留，可重导入）
+  resetBoard(b) // 清完留 4 个空框（用户约定）
 }
 
 function frameTitle(f: SbFrame) {
@@ -811,12 +822,19 @@ async function doExport() {
         <span v-if="lbViewTag" class="sb-lb-hist-tag">{{ lbViewTag }}</span>
         <span v-if="lbFrame.caption && !lbView" class="sb-lb-sub">{{ lbFrame.caption }}</span>
         <!-- 提示词浮层：主区域的 flex 兄弟节点，天然紧贴图片右缘（gap 14px），点击条目复制 -->
-        <div v-if="lbPromptsOpen && lbPromptEntries.length" class="sb-lb-prompts" @click.stop>
+        <!-- contextmenu.stop：放行 WebView 原生菜单——选中文本右键「复制」是基本操作，
+             不能被灯箱根节点的 contextmenu.prevent（防图片原生菜单）误伤 -->
+        <div
+          v-if="lbPromptsOpen && lbPromptEntries.length"
+          class="sb-lb-prompts"
+          @click.stop
+          @contextmenu.stop
+        >
           <div
             v-for="e in lbPromptEntries"
             :key="e.key"
             class="sb-lb-prompt"
-            title="点击复制"
+            :title="`点击复制整条；也可以选中部分文字后右键复制`"
             @click="copyLbPrompt(e.text)"
           >
             <span class="sb-lp-label">{{ e.label }}</span>
@@ -1595,5 +1613,7 @@ async function doExport() {
   min-width: 0;
   word-break: break-all;
   color: var(--text-1, #e7ecf5);
+  /* 允许选中部分文字（右键原生菜单复制用）；面板整体默认可选中，这里显式声明防全局规则误伤 */
+  user-select: text;
 }
 </style>

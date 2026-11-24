@@ -15,7 +15,8 @@ import type { FieldKind } from './types'
  *   图/图片/上传    暴露 + 图片上传卡
  *   多图/多张       暴露 + 多图上传（多张图各跑一次，图数 × 批次 = 提交数）
  *   视频/vid        暴露 + 视频上传卡（VHS_LoadVideo 等加载视频节点）
- *                    ※ 多输入节点上，图/多图/视频 只套到名字对应的输入
+ *   音频/aud        暴露 + 音频上传卡（LoadAudio 等加载音频节点；audio 同义）
+ *                    ※ 多输入节点上，图/多图/视频/音频 只套到名字对应的输入
  *                      （如 VHS_LoadVideo 只影响 video，不碰其余数字/下拉）
  *   种子/随机       暴露 + 随机种子
  *   长文/长文本/多行 暴露 + 多行文本
@@ -77,6 +78,7 @@ const KIND_ALIASES: [string, FieldKind][] = [
   ['多图', 'multiimage'],
   ['多张', 'multiimage'],
   ['视频', 'video'],
+  ['音频', 'audio'],
   ['长文本', 'textarea'],
   ['上传', 'image'],
   ['随机', 'seed'],
@@ -96,6 +98,8 @@ const KIND_ALIASES: [string, FieldKind][] = [
   ['multiimg', 'multiimage'],
   ['vid', 'video'],
   ['video', 'video'],
+  ['audio', 'audio'],
+  ['aud', 'audio'],
   ['seed', 'seed'],
   ['textarea', 'textarea'],
   ['number', 'number'],

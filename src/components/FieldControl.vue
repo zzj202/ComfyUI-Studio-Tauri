@@ -10,8 +10,10 @@ import {
   filesFromClipboardData,
 } from '../core/clipboard'
 import { open } from '@tauri-apps/plugin-dialog'
+import { appConfirm } from '../core/confirm'
 import {
   assetDropTargets,
+  fieldDirty,
   imageDropTargets,
   imageOriginBase,
   notify,
@@ -23,10 +25,13 @@ import {
   recordImageOrigin,
   state,
 } from '../store'
-import { randomSeed, VIDEO_EXT } from '../core/parseWorkflow'
+import { randomSeed, VIDEO_EXT, AUDIO_EXT } from '../core/parseWorkflow'
 import { stableKeys, useDragSort } from '../core/dragSort'
 
 const props = defineProps<{ field: FieldSchema }>()
+
+/** 与上次提交时的值不同 → 标题旁亮一个点（seed 字段每次提交自动换新，不参与对比） */
+const dirty = computed(() => fieldDirty(props.field))
 
 const uploading = ref(false)
 const imgOptions = ref<string[] | null>(null)
@@ -92,9 +97,23 @@ const vidPreviewUrl = computed(() => {
   }
 })
 
+/** 音频字段预览地址（值形如 "xxx.mp3" 或 "子目录/xxx.mp3"；回源逻辑与图片一致） */
+const audPreviewUrl = computed(() => {
+  if (props.field.kind !== 'audio') return null
+  const s = String(props.field.value ?? '').trim()
+  if (!s || !AUDIO_EXT.test(s)) return null
+  const i = s.indexOf('/')
+  const sub = i >= 0 ? s.slice(0, i) : ''
+  const name = i >= 0 ? s.slice(i + 1) : s
+  try {
+    return viewUrl(imageOriginBase(s), name, sub, 'input')
+  } catch {
+    return null
+  }
+})
+
 /** 多图字段的值：服务器文件名列表 */
-const imgList = computed<string[]>(() => {
-  const v = props.field.value
+const imgList = computed<string[]>(() => {  const v = props.field.value
   return Array.isArray(v) ? v.map(String) : v ? [String(v)] : []
 })
 
@@ -221,6 +240,68 @@ async function pickAndUploadVideo() {
 function clearVideo() {
   props.field.value = ''
   notify('已清空视频', 'ok', 1500)
+}
+
+// ---- 音频字段（LoadAudio / LoadAudioUpload 等）：上传卡 + 服务器音频列表 ----
+
+const audOptions = ref<string[] | null>(
+  (props.field.options ?? []).length ? props.field.options!.map(String) : null
+)
+
+/** 拉服务器上该节点 audio 输入的文件列表（LoadAudio 的 combo 定义在 object_info 里） */
+async function loadAudioOptions() {
+  if (audOptions.value) return
+  try {
+    const def = await api.objectInfo(primaryBase(), props.field.classType)
+    const nodeDef = def?.[props.field.classType]
+    const list =
+      nodeDef?.input?.required?.[props.field.inputName]?.[0] ??
+      nodeDef?.input?.optional?.[props.field.inputName]?.[0]
+    audOptions.value = Array.isArray(list) ? list.map(String) : []
+  } catch {
+    audOptions.value = []
+  }
+}
+
+async function refreshAudios() {
+  audOptions.value = null
+  await loadAudioOptions()
+}
+
+/** 上传本地音频并替换当前值（与图片/视频同链路：主节点 input/studio，跨机派发时按需转存） */
+async function uploadAudioPath(path: string) {
+  uploading.value = true
+  try {
+    const base = primaryBase()
+    const res = await api.uploadImage(base, path, undefined, 'studio', true)
+    const name = String(res?.name ?? '')
+    const sub = String(res?.subfolder ?? 'studio')
+    const value = name ? (sub ? `${sub}/${name}` : name) : null
+    if (value) {
+      recordImageOrigin(value, base)
+      await loadAudioOptions()
+      props.field.value = value
+      notify('已上传音频', 'ok', 2500)
+    }
+  } catch (e) {
+    notify(`上传失败：${e}`, 'error', 8000)
+  } finally {
+    uploading.value = false
+  }
+}
+
+async function pickAndUploadAudio() {
+  const picked = await open({
+    multiple: false,
+    filters: [{ name: '音频', extensions: ['mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'wma', 'opus'] }],
+  })
+  if (!picked || Array.isArray(picked)) return
+  await uploadAudioPath(picked)
+}
+
+function clearAudio() {
+  props.field.value = ''
+  notify('已清空音频', 'ok', 1500)
 }
 
 // ---- 多图节点：追加式上传 ----
@@ -357,6 +438,12 @@ onMounted(() => {
       if (vids.length) void uploadVideoPath(vids[0])
     })
     assetDropTargets.set(props.field.key, (a) => applyAsset(a))
+  } else if (k === 'audio') {
+    imageDropTargets.set(props.field.key, (paths) => {
+      const auds = paths.filter((p) => AUDIO_EXT.test(p))
+      if (auds.length) void uploadAudioPath(auds[0])
+    })
+    assetDropTargets.set(props.field.key, (a) => applyAsset(a))
   }
 })
 onUnmounted(() => {
@@ -365,11 +452,18 @@ onUnmounted(() => {
 })
 
 /** 把一份结果资产设为参考素材：input 里的直接引用，output/temp 先让服务器转存进 input。
- *  图片字段收图片资产，视频字段收视频资产。 */
+ *  图片字段收图片资产，视频字段收视频资产，音频字段收音频资产。 */
 async function applyAsset(a: Asset) {
-  const wantVideo = props.field.kind === 'video'
-  if (a.kind !== (wantVideo ? 'video' : 'image')) {
-    notify(wantVideo ? '只有视频能设为参考视频' : '只有图片能设为参考图', 'warn')
+  const wantKind = props.field.kind === 'video' ? 'video' : props.field.kind === 'audio' ? 'audio' : 'image'
+  if (a.kind !== wantKind) {
+    notify(
+      wantKind === 'video'
+        ? '只有视频能设为参考视频'
+        : wantKind === 'audio'
+          ? '只有音频能设为参考音频'
+          : '只有图片能设为参考图',
+      'warn'
+    )
     return
   }
   try {
@@ -384,15 +478,20 @@ async function applyAsset(a: Asset) {
       const sub = String(res?.subfolder ?? 'studio')
       path = sub ? `${sub}/${res.name}` : String(res.name)
       recordImageOrigin(path, base)
-      if (wantVideo) await loadVideoOptions()
+      if (props.field.kind === 'video') await loadVideoOptions()
+      else if (props.field.kind === 'audio') await loadAudioOptions()
       else await loadImageOptions()
     }
-    if (props.field.kind === 'video' || props.field.kind === 'image') {
+    if (props.field.kind === 'video' || props.field.kind === 'audio' || props.field.kind === 'image') {
       props.field.value = path
     } else if (props.field.kind === 'multiimage') {
       ensureList().push(path)
     }
-    notify(wantVideo ? '已设为参考视频' : '已设为参考图', 'ok', 2000)
+    notify(
+      wantKind === 'video' ? '已设为参考视频' : wantKind === 'audio' ? '已设为参考音频' : '已设为参考图',
+      'ok',
+      2000
+    )
   } catch (e) {
     notify(`引用资产失败：${e}`, 'error', 8000)
   }
@@ -466,27 +565,75 @@ function clearText() {
 
 // 「⚡ 粘贴提交」的实现已提到 store（pasteSubmitField）：按钮和全局快捷键 Ctrl+E 共用
 
-// ---- 常用提示词快捷按钮：所有文本字段共用一份库，localStorage 持久化 ----
+// ---- 常用提示词库（v2：分组 + 搜索；旧版平铺数组自动迁移，不丢数据） ----
 
-const QUICK_KEY = 'comfyui-studio.quickPrompts:v1'
+interface QuickEntry {
+  t: string // 短语文本
+  g: string // 分组名（空 = 未分组）
+}
+const QUICK_KEY_V2 = 'comfyui-studio.quickPrompts:v2'
+const QUICK_KEY_V1 = 'comfyui-studio.quickPrompts:v1'
 
-function loadQuick(): string[] {
+function loadQuick(): QuickEntry[] {
   try {
-    const raw = localStorage.getItem(QUICK_KEY)
+    const raw2 = localStorage.getItem(QUICK_KEY_V2)
+    if (raw2) {
+      const arr = JSON.parse(raw2)
+      if (Array.isArray(arr))
+        return arr
+          .filter((e: any) => e && typeof e.t === 'string' && e.t)
+          .map((e: any) => ({ t: String(e.t), g: String(e.g ?? '') }))
+          .slice(0, 120)
+    }
+    // v1 平铺（string[]）迁移
+    const raw = localStorage.getItem(QUICK_KEY_V1)
     const arr = raw ? JSON.parse(raw) : null
-    return Array.isArray(arr) ? arr.map(String).filter(Boolean).slice(0, 60) : []
+    return Array.isArray(arr)
+      ? arr
+          .map(String)
+          .filter(Boolean)
+          .slice(0, 60)
+          .map((t: string) => ({ t, g: '' }))
+      : []
   } catch {
     return []
   }
 }
 
-const quickPrompts = ref<string[]>(loadQuick())
-const quickAdding = ref(false)
-const quickInput = ref('')
+const quickEntries = ref<QuickEntry[]>(loadQuick())
 
 function saveQuick() {
-  localStorage.setItem(QUICK_KEY, JSON.stringify(quickPrompts.value))
+  try {
+    localStorage.setItem(QUICK_KEY_V2, JSON.stringify(quickEntries.value))
+  } catch {
+    /* ignore */
+  }
 }
+
+/** 已有的分组名（≥2 个才显示分组过滤 chips） */
+const quickGroups = computed(() => {
+  const set = new Set<string>()
+  for (const e of quickEntries.value) if (e.g) set.add(e.g)
+  return [...set]
+})
+
+const quickSearch = ref('')
+const quickGroupSel = ref('')
+const quickAdding = ref(false)
+const quickInput = ref('')
+const quickGroupInput = ref('')
+
+/** 搜索 + 分组过滤后的可见短语（无过滤条件时全量，保持旧观感） */
+const visibleQuick = computed(() => {
+  const q = quickSearch.value.trim().toLowerCase()
+  return quickEntries.value
+    .map((e, i) => ({ e, i }))
+    .filter(({ e }) => {
+      if (quickGroupSel.value && e.g !== quickGroupSel.value) return false
+      if (q && !e.t.toLowerCase().includes(q) && !e.g.toLowerCase().includes(q)) return false
+      return true
+    })
+})
 
 function addQuick() {
   const t = quickInput.value.trim()
@@ -494,16 +641,20 @@ function addQuick() {
     quickAdding.value = false
     return
   }
-  if (!quickPrompts.value.includes(t)) {
-    quickPrompts.value.push(t)
+  const g = quickGroupInput.value.trim()
+  const dup = quickEntries.value.findIndex((e) => e.t === t && e.g === g)
+  if (dup < 0) {
+    quickEntries.value.unshift({ t, g })
+    if (quickEntries.value.length > 120) quickEntries.value.length = 120
     saveQuick()
   }
   quickInput.value = ''
+  quickGroupInput.value = ''
   quickAdding.value = false
 }
 
-function removeQuick(p: string) {
-  quickPrompts.value = quickPrompts.value.filter((x) => x !== p)
+function removeQuickAt(i: number) {
+  quickEntries.value.splice(i, 1)
   saveQuick()
 }
 
@@ -513,6 +664,86 @@ function applyQuick(p: string) {
   if (!cur) props.field.value = p
   else if (/[,，;；\n]$/.test(cur)) props.field.value = cur + ' ' + p
   else props.field.value = cur + ', ' + p
+}
+
+// ---- 文本模板库：批量稿等常用整段文本存成模板，一键回填（textarea 字段） ----
+
+interface TextTemplate {
+  name: string
+  content: string
+}
+const TPL_KEY = 'comfyui-studio.textTemplates:v1'
+
+function loadTextTemplates(): TextTemplate[] {
+  try {
+    const arr = JSON.parse(localStorage.getItem(TPL_KEY) ?? '[]')
+    return Array.isArray(arr)
+      ? arr
+          .filter((x: any) => x && typeof x.name === 'string' && typeof x.content === 'string')
+          .slice(0, 40)
+      : []
+  } catch {
+    return []
+  }
+}
+
+const textTemplates = ref<TextTemplate[]>(loadTextTemplates())
+
+function saveTplStore() {
+  try {
+    localStorage.setItem(TPL_KEY, JSON.stringify(textTemplates.value))
+  } catch {
+    /* ignore */
+  }
+}
+
+const tplAdding = ref(false)
+const tplName = ref('')
+
+function startTplAdd() {
+  if (!String(props.field.value ?? '').trim()) {
+    notify('输入框是空的，先粘贴内容再存模板', 'warn', 3000)
+    return
+  }
+  tplName.value = ''
+  tplAdding.value = true
+}
+
+function saveTemplate() {
+  const name = tplName.value.trim()
+  const content = String(props.field.value ?? '')
+  if (!name || !content.trim()) {
+    tplAdding.value = false
+    return
+  }
+  const dup = textTemplates.value.findIndex((t) => t.name === name)
+  if (dup >= 0) textTemplates.value.splice(dup, 1)
+  textTemplates.value.unshift({ name, content })
+  if (textTemplates.value.length > 40) textTemplates.value.length = 40
+  saveTplStore()
+  tplAdding.value = false
+  notify(`已存模板「${name}」`, 'ok', 2000)
+}
+
+/** 点模板：整框替换（框里有内容先确认，防止手滑覆盖） */
+async function applyTemplate(tp: TextTemplate) {
+  const cur = String(props.field.value ?? '')
+  if (cur.trim() && cur !== tp.content) {
+    const yes = await appConfirm({
+      title: `替换为模板「${tp.name}」？`,
+      message: `「${props.field.label}」当前内容将被覆盖（${cur.length} 字 → 模板 ${tp.content.length} 字）。`,
+      danger: true,
+      okLabel: '替换',
+    })
+    if (!yes) return
+  }
+  props.field.value = tp.content
+  notify(`已填入模板「${tp.name}」`, 'ok', 2000)
+}
+
+function removeTemplate(i: number) {
+  textTemplates.value.splice(i, 1)
+  saveTplStore()
 }
 
 // ---- 提示词历史：输入框光标在最开头时按 ↑ 弹出最近提交过的提示词，选中即填入 ----
@@ -579,11 +810,13 @@ function swapText() {
 
 if (props.field.kind === 'image') loadImageOptions()
 if (props.field.kind === 'video') loadVideoOptions()
+if (props.field.kind === 'audio') loadAudioOptions()
 </script>
 
 <template>
   <div class="field">
     <div class="field-label">
+      <span v-if="dirty" class="dirty-dot" title="与上次提交时的值不同（提交后会熄灭）" />
       <span class="name">{{ field.label }}</span>
       <span class="code">{{ field.nodeId }}.{{ field.inputName }}</span>
       <span v-if="field.actions?.length" class="acts">
@@ -635,7 +868,7 @@ if (props.field.kind === 'video') loadVideoOptions()
           class="textarea"
           :data-field-key="field.key"
           :placeholder="field.placeholder || field.label"
-          rows="7"
+          rows="5"
           @keydown="onTextKeydown"
           @input="histOpen = false"
         />
@@ -802,7 +1035,7 @@ if (props.field.kind === 'video') loadVideoOptions()
         </button>
         <button class="btn sm ghost" title="清空全部图片" @click="clearImages">⌫ 清空</button>
       </div>
-      <div class="multi-tip">提交时按顺序逐张 × 批次数（每张图提交批次数次，每次自动随机种子）；按住缩略图拖动可调顺序；可拖图片文件进来，或点卡片后 Ctrl+V——资源管理器里复制的多张图也能一次全贴上</div>
+      <div class="multi-tip">提交时逐张 × 批次数（自动随机种子）· 按住缩略图拖动调顺序 · 可拖入图片文件，或点卡片后 Ctrl+V（可一次贴多张）</div>
     </div>
 
     <!-- 视频：内联预览缩略卡 + 服务器视频选择；卡片也是拖拽上传的落点 -->
@@ -848,6 +1081,56 @@ if (props.field.kind === 'video') loadVideoOptions()
       </div>
     </div>
 
+    <!-- 音频：♪ 缩略卡（点击上传）+ 试听条 + 服务器音频选择；卡片也是拖拽上传的落点 -->
+    <div
+      v-else-if="field.kind === 'audio'"
+      class="img-card"
+      :data-image-key="field.key"
+      :data-drop-label="`设为参考音频「${field.label}」`"
+      tabindex="0"
+      title="可把音频文件直接拖到卡片上"
+    >
+      <button
+        class="thumb"
+        :title="uploading ? '上传中…' : '点击上传音频，或直接把音频文件拖到这张卡片上'"
+        @click="pickAndUploadAudio"
+      >
+        <span v-if="!audPreviewUrl || uploading" class="ph">{{ uploading ? '…' : '♪' }}</span>
+        <span v-else class="ph aud-playing">♪</span>
+      </button>
+      <div class="img-side">
+        <audio
+          v-if="audPreviewUrl"
+          :src="audPreviewUrl"
+          class="aud-prev"
+          controls
+          preload="metadata"
+        />
+        <select
+          v-if="(audOptions ?? []).length"
+          v-model="field.value"
+          class="select"
+          @focus="loadAudioOptions"
+        >
+          <option v-for="o in audOptions ?? []" :key="o" :value="o">{{ o }}</option>
+        </select>
+        <input
+          v-else
+          v-model="field.value"
+          class="input"
+          placeholder="服务器上的音频，如 studio/a.mp3"
+          @focus="loadAudioOptions"
+        />
+        <div class="img-btns">
+          <button class="btn sm" :disabled="uploading" @click="pickAndUploadAudio">
+            {{ uploading ? '上传中…' : '上传音频' }}
+          </button>
+          <button class="btn sm ghost" title="清空已选音频" @click="clearAudio">⌫ 清空</button>
+          <button class="btn sm ghost" title="重新拉取服务器音频列表" @click="refreshAudios">⟳</button>
+        </div>
+      </div>
+    </div>
+
     <!-- 兜底：单行文本 -->
     <div v-else class="ta-wrap">
       <input
@@ -872,27 +1155,53 @@ if (props.field.kind === 'video') loadVideoOptions()
       </div>
     </div>
 
-    <!-- 用户自定义常用提示词：点一下追加到输入框（所有文本字段共用一份库，悬停 chip 出 × 删除） -->
+    <!-- 用户自定义常用提示词库（v2）：分组过滤 + 搜索（短语多时才出现），点一下追加到输入框 -->
     <div v-if="field.kind === 'textarea' || field.kind === 'text'" class="quick-row">
+      <input
+        v-if="quickEntries.length > 6"
+        v-model="quickSearch"
+        class="input q-search"
+        placeholder="搜短语…"
+      />
       <button
-        v-for="p in quickPrompts"
-        :key="p"
-        class="chip quick"
-        :title="`追加「${p}」到输入框`"
-        @click="applyQuick(p)"
+        v-for="g in quickGroups"
+        :key="g"
+        class="chip q-group"
+        :class="{ on: quickGroupSel === g }"
+        :title="`只看分组「${g}」`"
+        @click="quickGroupSel = quickGroupSel === g ? '' : g"
       >
-        <span class="q-text">{{ p }}</span>
-        <span class="q-del" title="从常用列表删除" @click.stop="removeQuick(p)">×</span>
+        {{ g }}
+      </button>
+      <button
+        v-for="(x, i) in visibleQuick"
+        :key="i"
+        class="chip quick"
+        :title="`${x.e.g ? `分组「${x.e.g}」· ` : ''}追加「${x.e.t}」到输入框`"
+        @click="applyQuick(x.e.t)"
+      >
+        <span v-if="x.e.g && !quickGroupSel" class="q-gtag">{{ x.e.g }}</span>
+        <span class="q-text">{{ x.e.t }}</span>
+        <span class="q-del" title="从常用列表删除" @click.stop="removeQuickAt(x.i)">×</span>
       </button>
       <button
         v-if="!quickAdding"
         class="chip quick-add"
-        title="把一段提示词存成常用按钮"
+        title="把一段提示词存成常用按钮（可填分组）"
         @click="quickAdding = true"
       >
         ＋ 常用
       </button>
       <span v-else class="quick-editor">
+        <input
+          v-model="quickGroupInput"
+          class="input q-g-input"
+          placeholder="分组(可空)"
+          :list="`quick-groups-${field.key}`"
+        />
+        <datalist :id="`quick-groups-${field.key}`">
+          <option v-for="g in quickGroups" :key="g" :value="g" />
+        </datalist>
         <input
           v-model="quickInput"
           class="input"
@@ -902,6 +1211,40 @@ if (props.field.kind === 'video') loadVideoOptions()
         />
         <button class="btn sm" @click="addQuick">保存</button>
         <button class="btn sm ghost" @click="quickAdding = false">取消</button>
+      </span>
+    </div>
+
+    <!-- 整段文本模板库（textarea 字段）：批量稿等常用格式存成模板，一键回填 -->
+    <div v-if="field.kind === 'textarea'" class="tpl-row">
+      <span class="tpl-lbl" title="常用整段文本模板（批量稿/固定格式），点击整框替换">📄 模板</span>
+      <span
+        v-for="(tp, i) in textTemplates"
+        :key="i"
+        class="chip tpl"
+        :title="`整框替换为「${tp.name}」（${tp.content.length} 字；框里有内容会先确认）`"
+        @click="applyTemplate(tp)"
+      >
+        <span class="t-name">{{ tp.name }}</span>
+        <span class="t-del" title="删除模板" @click.stop="removeTemplate(i)">×</span>
+      </span>
+      <button
+        v-if="!tplAdding"
+        class="chip tpl-add"
+        title="把当前输入框的内容存成模板"
+        @click="startTplAdd"
+      >
+        💾 存当前
+      </button>
+      <span v-else class="quick-editor">
+        <input
+          v-model="tplName"
+          class="input"
+          placeholder="模板名，回车保存"
+          @keydown.enter.prevent="saveTemplate"
+          @keydown.esc="tplAdding = false"
+        />
+        <button class="btn sm" @click="saveTemplate">保存</button>
+        <button class="btn sm ghost" @click="tplAdding = false">取消</button>
       </span>
     </div>
 
@@ -994,8 +1337,8 @@ if (props.field.kind === 'video') loadVideoOptions()
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  margin-top: 6px;
+  gap: 4px;
+  margin-top: 4px;
 }
 .chip.quick {
   display: inline-flex;
@@ -1026,6 +1369,79 @@ if (props.field.kind === 'video') loadVideoOptions()
 .chip.quick-add {
   color: var(--text-faint);
 }
+/* 常用库搜索框 + 分组过滤 chips */
+.q-search {
+  width: 110px;
+  flex: none;
+  font-size: 11.5px;
+  padding: 2px 8px;
+}
+.chip.q-group {
+  color: var(--accent);
+  border-color: var(--accent);
+  opacity: 0.65;
+}
+.chip.q-group.on {
+  opacity: 1;
+  background: var(--accent-soft, transparent);
+}
+.quick .q-gtag {
+  flex: none;
+  max-width: 64px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  padding: 0 5px;
+  line-height: 1.4;
+}
+.quick-editor .q-g-input {
+  width: 96px;
+}
+/* 整段文本模板行 */
+.tpl-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+}
+.tpl-lbl {
+  font-size: 11px;
+  color: var(--text-faint);
+  flex: none;
+}
+.chip.tpl {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 220px;
+}
+.chip.tpl .t-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chip.tpl .t-del {
+  color: var(--text-faint);
+  font-size: 12px;
+  line-height: 1;
+  padding: 0 2px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.chip.tpl:hover .t-del {
+  opacity: 1;
+}
+.chip.tpl .t-del:hover {
+  color: var(--err);
+}
+.chip.tpl-add {
+  color: var(--text-faint);
+}
 .quick-editor {
   display: inline-flex;
   align-items: center;
@@ -1039,12 +1455,12 @@ if (props.field.kind === 'video') loadVideoOptions()
 .ta-tools {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-bottom: 6px;
+  gap: 4px;
+  margin-bottom: 4px;
 }
 .tbtn {
   font-size: 11px;
-  padding: 2px 9px;
+  padding: 1px 7px;
   border-radius: 999px;
   border: 1px solid var(--border);
   background: var(--bg-2);
@@ -1095,8 +1511,8 @@ if (props.field.kind === 'video') loadVideoOptions()
 }
 .thumb {
   flex: none;
-  width: 76px;
-  height: 76px;
+  width: 60px;
+  height: 60px;
   border: 1px dashed var(--border);
   border-radius: var(--radius-sm);
   background: var(--bg-2);
@@ -1118,14 +1534,23 @@ if (props.field.kind === 'video') loadVideoOptions()
   display: block;
 }
 .thumb .ph {
-  font-size: 22px;
+  font-size: 18px;
   color: var(--text-faint);
+}
+/* 音频卡：缩略位 ♪ 主题色强调 + 侧栏试听条（原生 audio 控件压到紧凑高度） */
+.thumb .ph.aud-playing {
+  color: var(--accent);
+}
+.aud-prev {
+  width: 100%;
+  height: 34px;
+  min-width: 0;
 }
 .img-side {
   flex: 1;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
   min-width: 0;
 }
 /* 下拉/输入框统一撑满右侧列，长文件名不再把控件撑溢出 */
@@ -1145,17 +1570,17 @@ if (props.field.kind === 'video') loadVideoOptions()
 .multi-card {
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 .thumbs {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
 }
 .mthumb {
   position: relative;
-  width: 64px;
-  height: 64px;
+  width: 52px;
+  height: 52px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   overflow: visible;
@@ -1238,13 +1663,13 @@ if (props.field.kind === 'video') loadVideoOptions()
   background: rgba(220, 38, 38, 0.85);
 }
 .madd {
-  width: 64px;
-  height: 64px;
+  width: 52px;
+  height: 52px;
   border: 1px dashed var(--border);
   border-radius: var(--radius-sm);
   background: var(--bg-2);
   color: var(--text-faint);
-  font-size: 22px;
+  font-size: 18px;
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -1256,16 +1681,17 @@ if (props.field.kind === 'video') loadVideoOptions()
   color: var(--accent);
 }
 .multi-tip {
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text-faint);
+  line-height: 1.45;
 }
 
 /* 预设值 chips */
 .presets {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 6px;
+  gap: 4px;
+  margin-top: 4px;
 }
 .chip {
   font-size: 11.5px;

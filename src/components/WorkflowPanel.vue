@@ -8,6 +8,7 @@ import {
   dragGhost,
   dropZones,
   isDragClick,
+  isWorkflowFav,
   isWorkflowPinned,
   loadWorkflows,
   notify,
@@ -15,7 +16,9 @@ import {
   persistWorkflowOrder,
   renameWorkflow,
   selectWorkflow,
+  sortFavFirst,
   state,
+  toggleWorkflowFav,
   toggleWorkflowPin,
 } from '../store'
 import type { DragItem } from '../store'
@@ -86,22 +89,36 @@ type Row =
   | { kind: 'group'; name: string; count: number; collapsed: boolean }
   | { kind: 'wf'; w: WorkflowMeta }
 
-/** 扁平渲染列表：组头行 + 组内工作流行（折叠则隐藏组内）；末尾固定「未分组」区 */
+/** 扁平渲染列表：组头行 + 组内工作流行（折叠则隐藏组内）；末尾固定「未分组」区。
+ *  组内收藏（⭐）的工作流排到最前面（isWorkflowFav 读 ref，收藏变化自动重排）。
+ *  搜索时切平铺模式：名字或组名命中的工作流直接列出，不带组头（找 = 搜索，不排序）。 */
 const rows = computed<Row[]>(() => {
   const out: Row[] = []
+  const q = wfSearch.value.trim().toLowerCase()
+  if (q) {
+    for (const w of state.workflows) {
+      if (wfLabel(w).toLowerCase().includes(q) || (w.group ?? '').toLowerCase().includes(q)) {
+        out.push({ kind: 'wf', w })
+      }
+    }
+    return out
+  }
   const seen = new Set<string>()
   for (const g of state.workflowGroups) {
-    const mine = state.workflows.filter((w) => w.group === g)
+    const mine = sortFavFirst(state.workflows.filter((w) => w.group === g))
     seen.add(g)
     out.push({ kind: 'group', name: g, count: mine.length, collapsed: !!collapsed.value[g] })
     if (!collapsed.value[g]) for (const w of mine) out.push({ kind: 'wf', w })
   }
   // 顶层（无组）+ 组目录被手动删掉的兜底回落
-  const loose = state.workflows.filter((w) => !w.group || !seen.has(w.group))
+  const loose = sortFavFirst(state.workflows.filter((w) => !w.group || !seen.has(w.group)))
   out.push({ kind: 'group', name: '', count: loose.length, collapsed: !!collapsed.value[''] })
   if (!collapsed.value['']) for (const w of loose) out.push({ kind: 'wf', w })
   return out
 })
+
+/** 工作流搜索：按名字 / 分组名过滤（搜索时平铺显示） */
+const wfSearch = ref('')
 
 /** 工作流显示名：只显示文件名段（组名在组头） */
 function wfLabel(w: WorkflowMeta) {
@@ -132,8 +149,10 @@ function dropTargetAt(x: number, y: number): { idx: number; group: string | null
 function onItemPointerDown(e: PointerEvent, idx: number) {
   if (e.button !== 0) return
   if (editingWf.value || editingGroup.value) return // 改名输入中：不动
+  if (wfSearch.value) return // 搜索模式只用于找，不排序
   if ((e.target as HTMLElement).closest('.wf-ops') || (e.target as HTMLElement).closest('.g-ops'))
     return // 操作按钮不触发拖拽
+  if ((e.target as HTMLElement).closest('.fav-toggle')) return // 收藏星标点击 = 切换收藏，不拖拽
   const startY = e.clientY
   let started = false
   const move = (ev: PointerEvent) => {
@@ -410,6 +429,12 @@ async function openDir() {
       </div>
     </header>
 
+    <!-- 搜索：按名字 / 分组名过滤，搜索时平铺显示匹配项 -->
+    <div class="search-row">
+      <input v-model="wfSearch" class="input wf-search" placeholder="🔍 搜工作流…" />
+      <button v-if="wfSearch" class="btn sm ghost s-clear" title="清空搜索" @click="wfSearch = ''">✕</button>
+    </div>
+
     <div class="body" :class="{ reordering: reorder.active }">
       <!-- 加载骨架：首次读取列表时占位（列表已有内容时不闪） -->
       <div v-if="state.workflowsLoading && !state.workflows.length" class="skel-list">
@@ -469,7 +494,11 @@ async function openDir() {
           }"
           :data-wf-idx="ri"
           :data-drop-zone="'wf:' + row.w.name"
-          :title="row.w.name + ' · 点击载入 · 拖动排序 · 拖到组头归组 · 右键更多'"
+          :title="
+            wfSearch
+              ? row.w.name + ' · 点击载入 · 右键更多'
+              : row.w.name + ' · 点击载入 · 拖动排序 · 拖到组头归组 · 右键更多'
+          "
           @click="onWfClick(row.w)"
           @pointerdown="onItemPointerDown($event, ri)"
           @contextmenu.prevent="openWfCtx($event, row.w)"
@@ -487,31 +516,40 @@ async function openDir() {
             />
           </template>
           <template v-else>
-            <span class="wf-name" :title="row.w.name">
+            <!-- 收藏星标：名前常驻位（收藏=⭐实心，未收藏=☆悬停淡显），点击切换 -->
+            <span
+              class="fav-toggle"
+              :class="{ on: isWorkflowFav(row.w.name) }"
+              :title="isWorkflowFav(row.w.name) ? '取消收藏' : '收藏（组内置顶）'"
+              @click.stop="toggleWorkflowFav(row.w.name)"
+            >{{ isWorkflowFav(row.w.name) ? '⭐' : '☆' }}</span>
+            <span class="wf-name" :title="`${row.w.name} · ${row.w.nodeCount} 节点${row.w.hasMeta ? '' : ' · 无标题语法'}`">
               {{ wfLabel(row.w) }}
               <span v-if="row.w.broken" class="broken" title="JSON 解析失败">!</span>
             </span>
-            <span class="wf-meta">
-              {{ row.w.nodeCount }} 节点<template v-if="!row.w.hasMeta"> · 无标题</template>
+            <span class="wf-ops">
+              <span
+                class="op pin"
+                :class="{ on: isWorkflowPinned(row.w.name) }"
+                :title="isWorkflowPinned(row.w.name) ? '取消固定' : '固定（固定后不可删除）'"
+                @click.stop="toggleWorkflowPin(row.w.name)"
+              >📌</span>
+              <span class="op ren" title="改名" @click.stop="startRename(row.w)">✎</span>
+              <span
+                v-if="!isWorkflowPinned(row.w.name)"
+                class="op del"
+                title="删除"
+                @click.stop="remove(row.w.name)"
+              >✕</span>
             </span>
           </template>
-          <span class="wf-ops">
-            <span
-              class="op pin"
-              :class="{ on: isWorkflowPinned(row.w.name) }"
-              :title="isWorkflowPinned(row.w.name) ? '取消固定' : '固定（固定后不可删除）'"
-              @click.stop="toggleWorkflowPin(row.w.name)"
-            >📌</span>
-            <span class="op ren" title="改名" @click.stop="startRename(row.w)">✎</span>
-            <span
-              v-if="!isWorkflowPinned(row.w.name)"
-              class="op del"
-              title="删除"
-              @click.stop="remove(row.w.name)"
-            >✕</span>
-          </span>
         </button>
       </template>
+
+      <!-- 搜索无结果 -->
+      <div v-if="wfSearch && !rows.length" class="empty">
+        没有匹配「{{ wfSearch }}」的工作流
+      </div>
 
       <!-- 新建分组：虚线行，点击变输入 -->
       <div v-if="creatingGroup" class="group-create">
@@ -546,6 +584,9 @@ async function openDir() {
           </button>
           <button class="wctx-item" @click="wctxRun((name) => toggleWorkflowPin(name))">
             {{ isWorkflowPinned(wctx.name) ? '📌 取消固定' : '📌 固定' }}
+          </button>
+          <button class="wctx-item" @click="wctxRun((name) => toggleWorkflowFav(name))">
+            {{ isWorkflowFav(wctx.name) ? '☆ 取消收藏' : '⭐ 收藏（组内置顶）' }}
           </button>
           <button
             class="wctx-item"
@@ -608,7 +649,7 @@ async function openDir() {
 }
 /* 资产拖到具体卡片上：卡片亮边提示「松手设为该模板的参考图」 */
 .panel.drag-hot .wf-item:hover {
-  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
   background: var(--accent-soft);
 }
 /* 拖拽排序中的状态 */
@@ -626,9 +667,10 @@ async function openDir() {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px 14px;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--border-soft);
   flex: none;
+  background: linear-gradient(180deg, var(--bg-2), transparent);
 }
 .head h2 {
   margin: 0;
@@ -639,6 +681,24 @@ async function openDir() {
   display: flex;
   gap: 6px;
 }
+/* 搜索行：按名字/分组名过滤，搜索时平铺匹配项（找 = 搜索，不排序） */
+.search-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px 0;
+  flex: none;
+}
+.wf-search {
+  flex: 1;
+  font-size: 12px;
+  padding: 4px 10px;
+  min-width: 0;
+}
+.s-clear {
+  flex: none;
+  padding: 3px 7px;
+}
 .body {
   flex: 1;
   overflow: auto;
@@ -646,9 +706,9 @@ async function openDir() {
 }
 /* 首次加载骨架 */
 .skel-item {
-  height: 44px;
+  height: 32px;
   border-radius: var(--radius-sm);
-  margin-bottom: 4px;
+  margin-bottom: 3px;
   background: linear-gradient(90deg, var(--bg-2) 25%, var(--bg-3) 45%, var(--bg-2) 65%);
   background-size: 200% 100%;
   animation: wf-skel 1.2s infinite linear;
@@ -661,38 +721,42 @@ async function openDir() {
     background-position: -200% 0;
   }
 }
+/* 工作流行：单行紧凑布局（名字一行到底，「N 节点」进 tooltip），操作组悬停浮出 */
 .wf-item {
   position: relative;
   width: 100%;
   display: flex;
-  flex-direction: column;
-  gap: 2px;
-  align-items: flex-start;
-  padding: 9px 64px 9px 10px; /* 右侧给操作组留位 */
-  margin-bottom: 4px;
+  align-items: center;
+  gap: 5px;
+  height: 30px;
+  padding: 0 4px;
+  margin-bottom: 2px;
   background: transparent;
-  border: 1px solid transparent;
+  border: none;
   border-radius: var(--radius-sm);
   cursor: pointer;
   text-align: left;
-  transition: background 0.14s, border-color 0.14s;
+  transition: background 0.14s, box-shadow 0.14s;
 }
-/* 组内工作流：缩进 + 左侧树连接线 */
+/* 组内工作流：缩进 */
 .wf-item.in-group {
-  margin-left: 18px;
-  width: calc(100% - 18px);
+  margin-left: 16px;
+  width: calc(100% - 16px);
 }
-/* 组头行 */
+/* 组头行：吸顶（滚动时长列表组名常驻可见） */
 .group-head {
-  position: relative;
+  position: sticky;
+  top: -2px;
+  z-index: 2;
   display: flex;
   align-items: center;
   gap: 6px;
   width: 100%;
-  padding: 6px 8px;
-  margin-bottom: 4px;
+  padding: 5px 8px;
+  margin-bottom: 3px;
   border-radius: var(--radius-sm);
   background: var(--bg-2);
+  box-shadow: inset 0 -1px 0 var(--border-soft);
   cursor: pointer;
   user-select: none;
   transition: background 0.14s, box-shadow 0.14s;
@@ -738,6 +802,11 @@ async function openDir() {
   margin-left: auto;
   font-size: 10.5px;
   color: var(--text-faint);
+  opacity: 0;
+  transition: opacity 0.14s;
+}
+/* 「拖到这里移出分组」只在拖拽进行时可见（平时是碍眼的常驻噪音） */
+.body.reordering .g-hint {
   opacity: 0.7;
 }
 /* 组头操作组（与 wf-ops 同款 hover 显隐） */
@@ -776,14 +845,16 @@ async function openDir() {
 .wf-item:hover {
   background: var(--bg-2);
 }
+/* 当前载入的工作流：左侧 accent 竖条 + 底色 */
 .wf-item.active {
   background: var(--accent-soft);
-  border-color: #7c8cff55;
+  box-shadow: inset 2px 0 0 var(--accent);
 }
 .wf-name {
+  flex: 1;
+  min-width: 0;
   font-size: 12.5px;
   font-weight: 500;
-  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -791,24 +862,50 @@ async function openDir() {
 .broken {
   color: var(--err);
 }
-.wf-meta {
+/* 名前收藏星标：收藏=⭐常亮实心，未收藏=☆仅悬停淡显（点击切换，替代原 ops 里的 ⭐） */
+.fav-toggle {
+  flex: none;
+  width: 16px;
+  text-align: center;
   font-size: 11px;
-  color: var(--text-faint);
+  line-height: 1;
+  opacity: 0;
+  filter: grayscale(1);
+  cursor: pointer;
+  transition: opacity 0.12s, transform 0.12s;
 }
-/* 右侧操作组：固定 / 改名 / 删除（hover 出现；固定的 📌 常亮） */
+.wf-item:hover .fav-toggle {
+  opacity: 0.5;
+}
+.fav-toggle:hover {
+  opacity: 1 !important;
+  transform: scale(1.2);
+}
+.fav-toggle.on {
+  opacity: 1;
+  filter: none;
+}
+.wf-item:hover .fav-toggle.on {
+  opacity: 1; /* 已收藏的行悬停时星标不随 hover 淡化 */
+}
+/* 右侧操作组：固定 / 改名 / 删除（hover 浮出；固定常亮）。
+   渐变左缘遮住底下文字，浮出时不和长名重叠 */
 .wf-ops {
   position: absolute;
-  right: 6px;
+  right: 2px;
   top: 50%;
   transform: translateY(-50%);
   display: flex;
-  gap: 2px;
+  gap: 1px;
+  padding-left: 18px;
+  background: inherit;
+  -webkit-background-clip: padding-box;
 }
 .op {
   color: var(--text-faint);
   font-size: 12px;
   line-height: 1;
-  padding: 3px 5px;
+  padding: 4px 4px;
   border-radius: 4px;
   opacity: 0;
   cursor: pointer;

@@ -38,8 +38,11 @@ watch(
 )
 
 const raw = ref('')
-/** 拆出的提示词块（粘贴后实时解析预览） */
-const prompts = computed(() => (raw.value.trim() ? splitBatchLines(raw.value) : []))
+/** 拆出的提示词块（粘贴后实时解析预览；与 submitPaired 一致截到 BATCH_TEXT_MAX，
+ *  否则预览/总数按 120 条算、实际只提交 100 条，均分预览会骗人） */
+const prompts = computed(() =>
+  raw.value.trim() ? splitBatchLines(raw.value).slice(0, BATCH_TEXT_MAX) : []
+)
 const truncated = computed(() => {
   const n = raw.value.trim() ? splitBatchLines(raw.value).length : 0
   return n > BATCH_TEXT_MAX

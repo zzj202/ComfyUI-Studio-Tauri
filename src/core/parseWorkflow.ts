@@ -51,8 +51,14 @@ const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i
 /** 视频文件扩展名（VHS_LoadVideo 等加载视频节点的值/选项） */
 export const VIDEO_EXT = /\.(mp4|webm|mov|mkv|avi|m4v|flv)$/i
 
+/** 音频文件扩展名（LoadAudio 等加载音频节点的值/选项） */
+export const AUDIO_EXT = /\.(mp3|wav|flac|ogg|m4a|aac|wma|opus)$/i
+
 /** 加载视频节点类名（VHS_LoadVideo / LoadVideo / LoadVideoUpload 等） */
 const VIDEO_LOADER_RE = /loadvideo|vhs_/i
+
+/** 加载音频节点类名（LoadAudio / LoadAudioUpload 等） */
+const AUDIO_LOADER_RE = /loadaudio/i
 
 /** 加载视频节点的输入名 → 内置中文标签（组件级映射，不依赖定制模板/标题约定） */
 const VIDEO_INPUT_LABELS: Record<string, string> = {
@@ -131,13 +137,17 @@ export function parseGraph(graph: any, objectInfo?: Record<string, any> | null):
       if (VIDEO_LOADER_RE.test(classType) && field.label === inputName) {
         field.label = VIDEO_INPUT_LABELS[inputName] ?? field.label
       }
+      // 加载音频节点（LoadAudio）：唯一输入 audio → 套「音频」标签
+      if (AUDIO_LOADER_RE.test(classType) && field.label === inputName) {
+        field.label = '音频'
+      }
       if (info.kindHint) {
         // 功能词控件提示：单输入节点直接套；多输入节点（如 VHS_LoadVideo 的
         // 「加载视频|视频|20」）的图/多图/视频提示只套到名字对应的输入上，
         // 防止整节点的数字/下拉全被改成媒体上传卡
         const h = info.kindHint
         const mediaHint =
-          h === 'video' ? /video/i : h === 'image' || h === 'multiimage' ? /image|img/i : null
+          h === 'video' ? /video/i : h === 'audio' ? /audio/i : h === 'image' || h === 'multiimage' ? /image|img/i : null
         if (editable.length === 1 || !mediaHint || mediaHint.test(inputName)) {
           field.kind = h
         }
@@ -203,6 +213,14 @@ function buildField(ctx: BuildCtx): FieldSchema | null {
       const vidHits = list.filter((x) => VIDEO_EXT.test(x))
       if (list.length && (vidHits.length === list.length || VIDEO_EXT.test(String(ctx.raw ?? '')))) {
         f.kind = 'video'
+        f.options = list
+        f.value = ctx.raw == null ? (list[0] ?? '') : String(ctx.raw)
+        return f
+      }
+      // 加载音频节点（LoadAudio 等）：下拉选项全是音频文件 → 音频上传卡
+      const audHits = list.filter((x) => AUDIO_EXT.test(x))
+      if (list.length && (audHits.length === list.length || AUDIO_EXT.test(String(ctx.raw ?? '')))) {
+        f.kind = 'audio'
         f.options = list
         f.value = ctx.raw == null ? (list[0] ?? '') : String(ctx.raw)
         return f
@@ -273,6 +291,13 @@ function buildField(ctx: BuildCtx): FieldSchema | null {
     (videoNode && name === 'video')
   ) {
     f.kind = 'video'
+    f.value = ctx.raw == null ? '' : rawStr
+    return f
+  }
+  // 未连线的 audio 类输入必然是服务器上的音频文件名（LoadAudio 等）
+  const audioNode = AUDIO_LOADER_RE.test(ctx.classType)
+  if ((audioNode && name === 'audio') || (name.includes('audio') && AUDIO_EXT.test(rawStr))) {
+    f.kind = 'audio'
     f.value = ctx.raw == null ? '' : rawStr
     return f
   }
@@ -389,4 +414,5 @@ export const KIND_LABELS: Record<FieldKind, string> = {
   image: '图片',
   multiimage: '多图上传',
   video: '视频',
+  audio: '音频',
 }
