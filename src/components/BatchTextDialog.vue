@@ -98,7 +98,7 @@ const jobCount = computed(() => selCount.value * perLine.value)
           >
             ⚡ 逐条提交 {{ jobCount }} 个任务
           </button>
-          <button class="btn" @click="confirmBatchText('whole', remember, perLine)">整段提交 1 个</button>
+          <button class="btn" @click="confirmBatchText('whole', remember, perLine)">整段提交 {{ perLine }} 个</button>
           <button class="btn ghost" @click="confirmBatchText('cancel', false)">取消</button>
         </div>
       </div>

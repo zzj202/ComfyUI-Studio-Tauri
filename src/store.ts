@@ -445,6 +445,16 @@ function loadImageOrigin() {
 
 /** 记录一个图片 value 的上传源机器（FieldControl 所有写图片 value 的入口都要调） */
 export function recordImageOrigin(value: string, base: string) {
+  // 同名重传（value 不变、内容已变）→ 该值的跨机转存缓存必须全部作废。
+  // 否则 ensureOnWorker 命中旧的完成态 Promise 直接短路，工作机 input 里
+  // 留着的还是上一次的同名旧文件——「应用里是新图、ComfyUI 跑的是旧图」。
+  // 必须放在 origin 未变的早退之前：同名重传时 origin 往往没变。
+  if (value) {
+    const pfx = `${value}|`
+    for (const k of [...transferCache.keys()]) {
+      if (k.startsWith(pfx)) transferCache.delete(k)
+    }
+  }
   if (!value || !base || imageOrigin.get(value) === base) return
   // 简单封顶：超限删最早的，防无限增长（转存缓存丢了也只是重新转存一次）
   if (imageOrigin.size >= IMAGE_ORIGIN_MAX) {
@@ -1323,7 +1333,15 @@ async function resumeOne(j: Job): Promise<boolean> {
     // （params 的 key 是 nodeId::input，applyValues 直接覆盖节点输入，种子也在里面）
     try {
       const baseGraph = await api.readWorkflow(j.workflow)
-      graph = j.params ? applyValues(baseGraph, j.params) : baseGraph
+      if (j.params) {
+        // 数组值（旧版整批共享的多图快照）取第 1 张兜底：applyValues 会把数组原样
+        // 写进节点输入，LoadImage/LoadAudio 拿到数组必挂（新版 submit 快照已是单值）
+        const flat: Record<string, any> = {}
+        for (const [k, v] of Object.entries(j.params)) flat[k] = Array.isArray(v) ? v[0] : v
+        graph = applyValues(baseGraph, flat)
+      } else {
+        graph = baseGraph
+      }
       j.graph = graph
     } catch (e) {
       j.status = 'error'
@@ -1891,7 +1909,17 @@ export function submit(batch = submitBatch.value) {
   // 按下提交这一刻的参数快照：随任务挂到每个产出上，供灯箱「载入参数」一键回填
   const paramsSnapshot = collectParamsSnapshot()
   rememberSubmitParams(paramsSnapshot)
-  void runChain(total, count, multi?.key, imgs, reroll, paramsSnapshot)
+  // 每个任务的快照把多图字段换成「这条任务实际用的那一张」：整批共享外层快照时
+  // multiimage 是数组——「载入参数」会灌回整组图，刷新后用快照重建执行图时数组
+  // 原样写进 LoadImage 输入直接报错（applyValues 不做类型转换）
+  const mk = multi?.key
+  const perTask = mk
+    ? (i: number, values: Record<string, any>) => ({
+        ...paramsSnapshot,
+        [mk]: values[mk],
+      })
+    : undefined
+  void runChain(total, count, multi?.key, imgs, reroll, paramsSnapshot, perTask)
 }
 
 // ---- 批量拆行提交（方案 A）：粘贴多行提示词自动识别，逐条 = 每行一个任务 ----
@@ -1943,8 +1971,10 @@ export function confirmBatchText(
     // 选择框：只提交勾选的条目（未传则全量）
     submitBatchText(selectedLines ?? p.lines, p.fieldKey, p.fieldLabel, count)
   } else {
-    submit()
-    notify(`已粘贴并提交到「${p.fieldLabel}」`, 'ok', 2000)
+    // 整段 = 1 条提示词 × count 张（弹窗里的「每条张数」）。
+    // 曾是无参 submit() 吃顶栏批次——弹窗显示「整段提交 1 个」实际却按顶栏批次跑，个数不符
+    submit(count)
+    notify(`已提交到「${p.fieldLabel}」（整段 × ${count} 个任务）`, 'ok', 2000)
   }
 }
 
@@ -1975,26 +2005,26 @@ export function submitPaired(opts: {
   promptKey: string
   prompts: string[]
   perLine: number
-}) {
+}): boolean {
   ensureAudio()
   if (!state.graph) {
     notify('请先选择一个工作流', 'warn')
-    return
+    return false
   }
   if (!selectWorker(schedulableWorkers(), state.jobs, submitWorkerId.value)) {
     notify('没有可用的计算节点（全部禁用或冷却中），请到设置里检查节点列表', 'warn', 6000)
-    return
+    return false
   }
   const imgs = opts.imgs.filter(Boolean)
   const prompts = opts.prompts.slice(0, BATCH_TEXT_MAX)
   const per = Math.max(1, Math.min(10, Math.floor(opts.perLine) || 1))
   if (!imgs.length || !prompts.length) {
     notify('请先上传图片并解析出提示词', 'warn')
-    return
+    return false
   }
   if (prompts.length < imgs.length) {
     notify(`提示词（${prompts.length} 条）比图片（${imgs.length} 张）少，每张图至少要有一条`, 'warn', 5000)
-    return
+    return false
   }
   const multiKey = opts.multiKey
   const promptKey = opts.promptKey
@@ -2036,6 +2066,7 @@ export function submitPaired(opts: {
     'ok',
     4000
   )
+  return true
 }
 
 /** 批量拆行提交：每行一条提示词 × 批次数，走 runChain 同一链路（改派/ETA/音效/看板全兼容）。
@@ -2058,6 +2089,19 @@ function submitBatchText(
   }
   const items = lines.slice(0, BATCH_TEXT_MAX)
   const perLine = Math.max(1, Math.min(10, Math.floor(count) || 1))
+  // 多图字段与 submit() 同一规则：工作流带多图节点就必须有图；图片按行轮替绑定
+  // （第 j 行用 imgs[j % n]，该行的 perLine 个批次共用这张图）。
+  // 曾完全不带图：runChain 的 collectValues 排除 multiimage 且 multiKey 未传 →
+  // 图片值从未写进任务 → ComfyUI 用的是工作流里烘焙的旧文件名（用户上传的图没参与）。
+  const multi = state.fields.find((f) => f.kind === 'multiimage')
+  const imgs = multi
+    ? (Array.isArray(multi.value) ? multi.value.map(String).filter(Boolean) : [])
+    : []
+  if (multi && !imgs.length) {
+    notify('多图节点还没有上传图片', 'warn')
+    return
+  }
+  const multiKey = multi?.key
   recordPromptHistory()
   // 已有链在跑时又提交（排队链）→ 整链重掷种子防撞车，与普通提交一致
   const reroll = activeChains > 0
@@ -2076,16 +2120,23 @@ function submitBatchText(
     (i, values) => {
       const line = items[Math.floor(i / perLine)]
       values[fieldKey] = line
-      return { ...(baseSnapshot ?? {}), [fieldKey]: line }
+      const snap: Record<string, any> = { ...(baseSnapshot ?? {}), [fieldKey]: line }
+      if (multiKey && imgs.length) {
+        const img = imgs[Math.floor(i / perLine) % imgs.length]
+        values[multiKey] = img
+        snap[multiKey] = img
+      }
+      return snap
     }
   )
   // 方案 B 保险丝：整段源文本留底——断电后 ComfyUI 队列没了也能一键重投
   // （A 的对账只覆盖「ComfyUI 还活着」的场景）
   saveBatchSourceSnap(lines.join('\n'), fieldKey, fieldLabel, items.length)
+  const imgNote = imgs.length > 1 ? `，图片按行轮替（${imgs.length} 张循环）` : ''
   notify(
     perLine > 1
-      ? `「${fieldLabel}」已按行拆分：${items.length} 条 × ${perLine} 张 = ${items.length * perLine} 个任务`
-      : `「${fieldLabel}」已按行拆分：提交 ${items.length} 个任务（每行一条）`,
+      ? `「${fieldLabel}」已按行拆分：${items.length} 条 × ${perLine} 张 = ${items.length * perLine} 个任务${imgNote}`
+      : `「${fieldLabel}」已按行拆分：提交 ${items.length} 个任务（每行一条）${imgNote}`,
     'ok',
     4000
   )
@@ -2307,6 +2358,9 @@ async function runChain(
   const done_ = [] as { base: string; promptId: string }[]
   const batchId = `b${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}` // 批次分组标记
   let consecFail = 0 // 连续派发失败计数：连续 3 个失败（节点不可用）才中止整链，避免断连时刷屏
+  // 新链开始先清跨机转存缓存：链内并发派发照旧共用去重；跨链（可能隔了很久、
+  // 同名文件可能被外部换过内容）强制重转，工作机不再拿陈旧字节
+  transferCache.clear()
   try {
     for (let i = 0; i < total; i++) {
       const values = collectValues(state.fields.filter((f) => f.kind !== 'multiimage'))
@@ -2659,6 +2713,40 @@ export async function interruptAll() {
   }
 }
 
+/** 媒体文件名判定（图/视频/音频扩展名）：graph 换机重投时识别哪些字符串值是媒体引用 */
+const MEDIA_VALUE_RE =
+  /\.(png|jpe?g|webp|gif|bmp|mp4|webm|mov|mkv|avi|m4v|flv|mp3|wav|flac|ogg|m4a|aac|wma|opus)$/i
+
+/**
+ * 任务留存 graph 换机重投前（改派 requeueJob / 指定 pinJobToWorker / 重试 retryJob 共用）：
+ * 把 graph 里所有媒体文件名引用（图/视频/音频）按需转存到目标机——原 graph 只保证
+ * 文件在「提交时的那台机器」input 里存在，直接提到别机会因 value 不在列表而失败。
+ * 返回深拷贝的换机版 graph（原 job.graph 不动，后续再改派还能从原始值重算）。
+ * 转存失败的值保留原值：提交时由节点校验报错兜底（与 dispatchOne 同口径）。
+ */
+async function retargetJobGraph(graph: any, target: { id: string; base: string }): Promise<any> {
+  const patched = JSON.parse(JSON.stringify(graph ?? {}))
+  const jobs: Promise<void>[] = []
+  for (const node of Object.values<any>(patched)) {
+    const inputs = node?.inputs
+    if (!inputs || typeof inputs !== 'object') continue
+    for (const [k, v] of Object.entries(inputs)) {
+      if (typeof v !== 'string' || !v || !MEDIA_VALUE_RE.test(v)) continue
+      jobs.push(
+        ensureOnWorker(v, target)
+          .then((nv) => {
+            inputs[k] = nv
+          })
+          .catch(() => {
+            /* 保留原值，提交时由节点报错 */
+          })
+      )
+    }
+  }
+  await Promise.all(jobs)
+  return patched
+}
+
 /**
  * 排队任务改派（慢节点拥堵时用）：从原节点 /queue 摘除 → 带提交时的原图 + 参数
  * 重新提交到 least-busy 的其他节点 → 换绑本地记录（workflow/params/产出历史全保留）。
@@ -2689,13 +2777,15 @@ export async function requeueJob(job: Job) {
     return
   }
   try {
+    // 媒体引用先按需转存到目标机：graph 里的文件名只保证在原机器 input 存在
+    const graph = await retargetJobGraph(job.graph, target)
     const res = await api.submit(
       target.base,
-      job.graph,
+      graph,
       job.workflow || undefined,
       job.params ? JSON.stringify(job.params) : undefined
     )
-    const err = extractSubmitError(res, job.graph)
+    const err = extractSubmitError(res, graph)
     if (err) throw new Error(err)
     const i = state.jobs.indexOf(job)
     if (i >= 0) state.jobs.splice(i, 1)
@@ -2773,13 +2863,15 @@ export async function pinJobToWorker(job: Job, workerId: string) {
     // 拉不到 /queue 就按「仍在队列」处理，与改派（requeueJob）的兜底一致
   }
   try {
+    // 媒体引用先按需转存到目标机（同 requeueJob）
+    const graph = await retargetJobGraph(job.graph, target)
     const res = await api.submit(
       target.base,
-      job.graph,
+      graph,
       job.workflow || undefined,
       job.params ? JSON.stringify(job.params) : undefined
     )
-    const err = extractSubmitError(res, job.graph)
+    const err = extractSubmitError(res, graph)
     if (err) throw new Error(err)
     const i = state.jobs.indexOf(job)
     if (i >= 0) state.jobs.splice(i, 1)
@@ -2822,13 +2914,15 @@ export async function retryJob(job: Job) {
     return
   }
   try {
+    // 媒体引用先按需转存到目标机（失败任务可能换节点跑，原机器的 input 文件不带过去）
+    const graph = await retargetJobGraph(job.graph, target)
     const res = await api.submit(
       target.base,
-      job.graph,
+      graph,
       job.workflow || undefined,
       job.params ? JSON.stringify(job.params) : undefined
     )
-    const err = extractSubmitError(res, job.graph)
+    const err = extractSubmitError(res, graph)
     if (err) throw new Error(err)
     const i = state.jobs.indexOf(job)
     if (i >= 0) state.jobs.splice(i, 1)

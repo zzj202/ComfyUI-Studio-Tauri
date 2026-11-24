@@ -113,7 +113,8 @@ const audPreviewUrl = computed(() => {
 })
 
 /** 多图字段的值：服务器文件名列表 */
-const imgList = computed<string[]>(() => {  const v = props.field.value
+const imgList = computed<string[]>(() => {
+  const v = props.field.value
   return Array.isArray(v) ? v.map(String) : v ? [String(v)] : []
 })
 
@@ -321,7 +322,15 @@ async function pickMulti() {
   })
   if (!picked) return
   const paths = Array.isArray(picked) ? picked : [picked]
-  for (const p of paths) await addOne(p)
+  // 整轮持锁：uploadOne 每张上传完会把 uploading 归零，不整体锁住的话
+  // 「＋」卡会在张与张之间闪回可点，容易叠开第二个文件对话框
+  uploading.value = true
+  try {
+    for (const p of paths) await addOne(p, paths.length > 1)
+    if (paths.length > 1) notify(`已添加 ${paths.length} 张图片`, 'ok', 2000)
+  } finally {
+    uploading.value = false
+  }
 }
 
 // ---- 剪贴板粘贴图片（两条来源）----
@@ -336,11 +345,18 @@ async function uploadBlob(blob: Blob, ext: string) {
   else await addOne(path)
 }
 
-/** 资源管理器复制的图片文件（可能多张）：Rust 读剪贴板文件路径 → 逐张上传。读到图返回 true */
-async function pasteFromClipboardFiles(): Promise<boolean> {
+/** 资源管理器复制的图片文件（可能多张）：Rust 读剪贴板文件路径 → 逐张上传。
+ *  返回 'handled'=上传完成 / 'empty'=剪贴板没有图片文件 / 'error'=读取本身失败（要向用户报错，不能当没图） */
+async function pasteFromClipboardFiles(): Promise<'handled' | 'empty' | 'error'> {
+  let imgs: string[]
   try {
-    const imgs = (await api.clipboardFilePaths()).filter((p) => IMG_EXT_RE.test(p))
-    if (!imgs.length) return false
+    imgs = (await api.clipboardFilePaths()).filter((p) => IMG_EXT_RE.test(p))
+  } catch (e) {
+    notify(`读取剪贴板文件失败：${e}`, 'error', 8000)
+    return 'error'
+  }
+  if (!imgs.length) return 'empty'
+  try {
     if (props.field.kind === 'image') {
       await uploadPath(imgs[0])
       if (imgs.length > 1) notify(`剪贴板里有 ${imgs.length} 张图，单图字段只用了第 1 张`, 'warn', 4000)
@@ -348,9 +364,9 @@ async function pasteFromClipboardFiles(): Promise<boolean> {
       for (const p of imgs) await addOne(p, true)
       notify(imgs.length > 1 ? `已粘贴 ${imgs.length} 张图片` : '已添加图片', 'ok', 2000)
     }
-    return true
+    return 'handled'
   } catch {
-    return false
+    return 'error' // 上传错误已由 uploadOne 内部 notify，这里只终止流程
   }
 }
 
@@ -368,7 +384,7 @@ async function pasteImage() {
   } catch {
     /* 位图读不到很常见（比如复制的是文件），走文件列表兜底 */
   }
-  if (await pasteFromClipboardFiles()) return
+  if (await pasteFromClipboardFiles() !== 'empty') return
   notify('剪贴板里没有图片', 'warn', 3000)
 }
 
@@ -379,10 +395,15 @@ function onCardPaste(e: ClipboardEvent) {
   e.preventDefault()
   e.stopPropagation()
   void (async () => {
-    const list = props.field.kind === 'image' ? files.slice(0, 1) : files
-    for (const f of list) await uploadBlob(f, extFromFile(f))
-    if (files.length > list.length) notify(`共 ${files.length} 张，单图字段只用了第 1 张`, 'warn', 4000)
-    else if (list.length > 1) notify(`已粘贴 ${list.length} 张图片`, 'ok', 2000)
+    try {
+      const list = props.field.kind === 'image' ? files.slice(0, 1) : files
+      for (const f of list) await uploadBlob(f, extFromFile(f))
+      if (files.length > list.length) notify(`共 ${files.length} 张，单图字段只用了第 1 张`, 'warn', 4000)
+      else if (list.length > 1) notify(`已粘贴 ${list.length} 张图片`, 'ok', 2000)
+    } catch (err) {
+      // saveTempBlob / extFromFile 抛错（磁盘满、权限等）不能静默吞掉
+      notify(`粘贴图片失败：${err}`, 'error', 8000)
+    }
   })()
 }
 
@@ -855,7 +876,7 @@ if (props.field.kind === 'audio') loadAudioOptions()
         </button>
         <button
           class="tbtn"
-          title="把框内内容按行拆分：每行一条提示词，各提交一个任务"
+          title="把框内内容按行/编号块拆分，弹窗里确认：可勾选条目、设定每条张数后批量提交"
           @click="openBatchTextDialog(field)"
         >
           ✂ 拆行提交

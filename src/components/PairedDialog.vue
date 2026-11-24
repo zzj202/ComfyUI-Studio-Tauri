@@ -119,14 +119,14 @@ function submit() {
     notify('没有可用的提示词字段', 'warn')
     return
   }
-  submitPaired({
+  // 只在真正提交成功后才关弹窗：校验失败（没节点/提示词比图少等）时保住已输入的内容
+  if (submitPaired({
     multiKey: p.value!.multiKey,
     imgs: imgs.value,
     promptKey: pk,
     prompts: prompts.value,
     perLine: perLine.value,
-  })
-  close()
+  })) close()
 }
 </script>
 
