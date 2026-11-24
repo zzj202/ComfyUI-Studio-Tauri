@@ -8,7 +8,7 @@
  *    时间轴行不是编号，防止把整稿的编号序列打断回落按行拆）、`【图1｜下班进门 · 有字版】标题`（前缀词+数字+竖线，四格漫画格子批量稿；
  *    分隔符扩到 ·・:：、——`【参考图1 · 小金毛抱臂生气】正文` 2026-11-23 同支持；
  *    无包裹的 `图1｜标题`（行独立、正文下一段）2026-11-23 同支持）、`【1】`、
- *    `【第 1 条｜标题】`/`【新第 61 条｜标题（短语）】`（「新」前缀可选）、`提示词 1：标题`（含 `提示词 1-1：` 子编号）、`【提示词 1-1】标题`、`[1]`、`[Shot 1]`、`#1`、
+ *    `【第 1 条｜标题】`/`【新第 61 条｜标题（短语）】`（「新」前缀可选）、`提示词 1：标题`（含 `提示词 1-1：` 子编号）、`--- 提示词 1-1 ---`（分隔线包裹，2026-11-23）、`【提示词 1-1】标题`、`[1]`、`[Shot 1]`、`#1`、
  *    `【玩球 · 动作一】标题正文`（前缀词+中文数字，一~九十九，前缀可含 ref-0 这类
  *    阿拉伯数字片段、最长 20 字符）、`标题：xxx`（无数字独立标题行，按出现顺序赋号），以及无数字的
  *    `【纯中文标题】`（整行仅标题、≥4 字符，按出现顺序赋号）。
@@ -96,6 +96,8 @@ function blockStartNum(line: string): BlockStart | null {
   if (m) return { n: Number(m[1]), strong: true }
   m = line.match(/^\s*[-=_*]{3,}\s*(\d{1,3})\s*[｜|]\s*\S/) // ========== 01 | 标题 ==========（分隔线行内包裹编号式，英文批量稿常用）
   if (m) return { n: Number(m[1]), strong: true }
+  m = line.match(/^\s*[-=_*]{3,}\s*提示词\s*(\d{1,3})(?:-\d{1,3})?\s*[-=_*]{3,}/) // --- 提示词 1-1 ---（分隔线包裹提示词编号，英文视频字段块批量稿；不修复会被字段块锚点把标题行与 For the target video 行丢块外）
+  if (m) return { n: Number(m[1]), strong: true }
   m = line.match(/^\s*(\d{1,3})\s*([.、)）：:｜])\s*(?!\d)\S/) // 1. / 1、 / 1) / 1） / 1: / 1： / 01｜标题（数字+全角竖线编号式）
   if (m) return { n: Number(m[1]), strong: m[2] === '｜' } // ｜ 竖线特征强可免递增校验；裸数字仍需递增
   // 编号分隔符后 (?!\d)：时间轴行 0.0-1.2s（1.2秒）： / 0:30s 不是编号（编号后不会紧跟数字），
@@ -161,6 +163,15 @@ export function splitBatchLines(text: string): string[] {
           blocks.push(nl >= 0 ? head + chunk.slice(nl) : head)
         }
       })
+      // 纯标题横幅块并入下一块（2026-11-24）：横幅式稿「====【N · 标题】==== + --- 提示词 N --- + 字段」
+      // 里【N · 标题】自成起点且整块只有一行 → 标题与正文分离成 2N 条。仅合并整块单行且以【[ 开头的
+      // 横幅（裸编号单行列表 1. xxx 不受影响）；从后往前并，连续横幅也能落到最终正文块。
+      for (let i = blocks.length - 2; i >= 0; i--) {
+        if (!blocks[i].includes('\n') && /^[【\[]/.test(blocks[i])) {
+          blocks[i + 1] = `${blocks[i]}\n${blocks[i + 1]}`
+          blocks.splice(i, 1)
+        }
+      }
       if (blocks.length >= 2) return blocks.slice(0, BATCH_TEXT_MAX)
     }
   }
@@ -258,7 +269,7 @@ export function extractPromptTitle(text: string): string | null {
     }
     m = line.match(/^[【\[]\s*(\d{1,3})\s*[｜|]\s*(.+?)[】\]]\s*$/) // 【01｜标题】
     if (m) return sanitizeFileName(`${m[1]} ${m[2]}`)
-    m = line.match(/^[【\[]\s*(\d{1,3})\s*[.、．]\s*(.+?)[】\]]\s*$/) // 【91. 踩水洼嬉戏】（【】包裹编号+点号+标题）
+    m = line.match(/^[【\[]\s*(\d{1,3})\s*[.、．·・:：]\s*(.+?)[】\]]\s*$/) // 【91. 踩水洼嬉戏】/【1 · 贴脸蹭】（【】包裹编号+分隔符+标题，分隔符含点/顿号/间隔点/冒号）
     if (m) return sanitizeFileName(`${m[1]} ${m[2]}`)
     m = line.match(/^#{1,4}\s*(\d{1,3})\s*[.、．]?\s*(\S.+)$/) // ## 1. 坐下（Markdown 标题编号，标题在编号后同行）
     if (m) return sanitizeFileName(`${m[1]} ${m[2]}`)
@@ -268,6 +279,10 @@ export function extractPromptTitle(text: string): string | null {
     if (m) return sanitizeFileName(`${m[1]}${m[2]} ${m[3]}`)
     m = line.match(/^提示词\s*(\d{1,3}(?:-\d{1,3})?)\s*[：:]\s*(.+)$/) // 提示词 3：标题 / 提示词 1-1：标题
     if (m) return sanitizeFileName(`${m[1]} ${m[2]}`)
+    m = line.match(/^[-=_*]{3,}\s*提示词\s*(\d{1,3}(?:-\d{1,3})?)\s*[-=_*]{3,}\s*$/) // --- 提示词 1-1 ---（分隔线包裹提示词编号，建议 = 1-1 保留子编号）
+    if (m) return sanitizeFileName(m[1])
+    m = line.match(/^提示词\s*(\d{1,3}(?:-\d{1,3})?)\s*$/) // 提示词 1-1（裸编号行 = 分隔线剥离后的块首，建议同上）
+    if (m) return sanitizeFileName(m[1])
     // 【提示词 1-1】照镜整理仪容：建议 = 编号 标题（编号保留 1-1 子编号形式）；标题超长截到 60 字
     m = line.match(/^[【\[]\s*提示词\s*(\d{1,3}(?:-\d{1,3})?)\s*[】\]]\s*(.*)$/)
     if (m) {
