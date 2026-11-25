@@ -370,11 +370,109 @@ const submitLabel = computed(() =>
 /** 节点池 ≥2 时显示节点下拉（auto = 空闲优先自动分配） */
 const workerOptions = computed(() => enabledWorkers())
 
+// ---- 参数撤回 / 回退（整个参数区）：值快照栈，按 field.key 存取；
+//  切工作流/模板（字段键集变化）自动清栈重新基线，避免把 A 工作流的值套到 B 上 ----
+
+const undoStack = ref<string[]>([])
+const redoStack = ref<string[]>([])
+let histLast = ''
+let histTimer = 0
+
+const canUndo = computed(() => undoStack.value.length > 0)
+const canRedo = computed(() => redoStack.value.length > 0)
+
+/** 当前全部字段值 → 快照串（键→值对象，回填按 key 对号，字段重建也安全） */
+function sigNow(): string {
+  const o: Record<string, any> = {}
+  for (const f of state.fields) o[f.key] = f.value
+  return JSON.stringify(o)
+}
+
+/** 把一份快照写回字段（只碰两边都有的 key） */
+function applySig(sig: string): boolean {
+  let o: Record<string, any>
+  try {
+    o = JSON.parse(sig)
+  } catch {
+    return false
+  }
+  let hit = 0
+  for (const [k, v] of Object.entries(o)) {
+    const f = state.fields.find((x) => x.key === k)
+    if (!f) continue
+    f.value = Array.isArray(v) ? [...v] : v
+    hit++
+  }
+  return hit > 0
+}
+
+/** 字段键集变化（切工作流 / 切模板 / 字段重建）：清栈 + 以当前值为新基线 */
+function resetHistory() {
+  window.clearTimeout(histTimer)
+  histLast = sigNow()
+  undoStack.value = []
+  redoStack.value = []
+}
+
+watch(() => state.fields.map((f) => f.key).join('\n'), resetHistory, { immediate: true })
+
+watch(
+  () => sigNow(),
+  () => {
+    // 300ms 合并连续小改动（打字、连续点 ±），一次改动只进一条历史
+    window.clearTimeout(histTimer)
+    histTimer = window.setTimeout(() => {
+      const cur = sigNow()
+      if (cur === histLast) return
+      undoStack.value.push(histLast)
+      if (undoStack.value.length > 100) undoStack.value.shift()
+      redoStack.value = []
+      histLast = cur
+    }, 300)
+  }
+)
+
+function undoParams() {
+  const target = undoStack.value.pop()
+  if (target == null) return
+  if (!applySig(target)) {
+    undoStack.value.push(target)
+    return
+  }
+  redoStack.value.push(histLast)
+  histLast = target
+}
+
+function redoParams() {
+  const nxt = redoStack.value.pop()
+  if (nxt == null) return
+  if (!applySig(nxt)) {
+    redoStack.value.push(nxt)
+    return
+  }
+  undoStack.value.push(histLast)
+  histLast = nxt
+}
+
 /** Ctrl+Enter 快捷提交（长提示词时不用挪鼠标去点按钮） */
 function onKeydown(e: KeyboardEvent) {
   if (e.ctrlKey && !e.shiftKey && !e.altKey && e.key === 'Enter') {
     e.preventDefault()
     if (state.currentWorkflow && state.fields.length) submit()
+    return
+  }
+  // Ctrl+Z / Ctrl+Shift+Z / Ctrl+Y：参数区撤回 / 回退。
+  // 焦点在输入框里时让位给原生文本撤销/重做，不拦。
+  if ((e.ctrlKey || e.metaKey) && !e.altKey) {
+    const k = e.key.toLowerCase()
+    if (k !== 'z' && k !== 'y') return
+    const t = e.target as HTMLElement | null
+    const typing =
+      !!t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)
+    if (typing) return
+    e.preventDefault()
+    if (k === 'y' || e.shiftKey) redoParams()
+    else undoParams()
   }
 }
 onMounted(() => window.addEventListener('keydown', onKeydown))
@@ -400,6 +498,22 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
       </div>
       <div class="actions">
+        <button
+          class="btn sm ghost hist-btn"
+          :disabled="!canUndo"
+          title="撤回上一次参数改动（Ctrl+Z；焦点在输入框里时是原生文本撤销）"
+          @click="undoParams"
+        >
+          ↶
+        </button>
+        <button
+          class="btn sm ghost hist-btn"
+          :disabled="!canRedo"
+          title="回退刚被撤回的改动（Ctrl+Shift+Z / Ctrl+Y）"
+          @click="redoParams"
+        >
+          ↷
+        </button>
         <select v-model="selected" class="select tpl-select" :disabled="!state.currentWorkflow">
           <option value="auto">通用模式（自动全部字段）</option>
           <option v-for="t in templatesForWorkflow" :key="t.name" :value="t.name">
@@ -604,6 +718,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
   padding: 7px 14px;
   border-bottom: 1px solid var(--border-soft);
   flex: none;
+  flex-wrap: wrap; /* 窄窗口：动作区换行，不压标题 */
+  row-gap: 6px;
   background: linear-gradient(180deg, var(--bg-2), transparent);
 }
 /* 工作流图标徽标：渐变小方块，标题左侧的视觉锚点（紧凑尺寸压头部高度） */
@@ -909,9 +1025,21 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
   display: flex;
   gap: 8px;
   flex: none;
+  flex-wrap: wrap;
+  row-gap: 6px;
+  min-width: 0;
+}
+/* 撤回/回退：图标化小方钮，窄窗口也不挤标题 */
+.hist-btn {
+  width: 28px;
+  padding: 0;
+  justify-content: center;
+  font-size: 13px;
+  flex: none;
 }
 .tpl-select {
   width: 220px;
+  max-width: 100%;
 }
 .body {
   flex: 1;
@@ -1001,6 +1129,11 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 .param-line > :deep(.field) {
   flex: 1;
   min-width: 140px;
+}
+/* 人物Lora / 人物Lora强度 同行两列：等宽并列，内容再宽也不挤换行 */
+.param-line > :deep(.field.lora-cmp) {
+  flex: 1 1 0;
+  min-width: 0;
 }
 /* 参数行内的媒体卡压缩：小缩略图 + 更小的行间距，整行高度不被卡片撑高 */
 .param-line > :deep(.thumb) {

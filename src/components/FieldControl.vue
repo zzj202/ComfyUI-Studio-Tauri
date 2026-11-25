@@ -27,6 +27,8 @@ import {
 } from '../store'
 import { randomSeed, VIDEO_EXT, AUDIO_EXT } from '../core/parseWorkflow'
 import { stableKeys, useDragSort } from '../core/dragSort'
+import LoraNameField from './LoraNameField.vue'
+import LoraStrengthField from './LoraStrengthField.vue'
 
 const props = defineProps<{ field: FieldSchema }>()
 
@@ -832,13 +834,66 @@ function swapText() {
 if (props.field.kind === 'image') loadImageOptions()
 if (props.field.kind === 'video') loadVideoOptions()
 if (props.field.kind === 'audio') loadAudioOptions()
+
+// ---- 人物Lora / 人物Lora强度 独立组件 ----
+// 命中规则：节点标题（字段显示名/分组名）带「人物Lora」「人物Lora强度」即启用；
+// 没起标题的工作流按结构兜底（字段喂给 LoraLoader 的 lora_name → 名称组件，
+// 喂 strength_model / strength_clip / lora_strength → 强度组件）。
+
+const loraLink = computed<{ input: string; classType: string } | null>(() => {
+  const g = state.graph as Record<string, any> | null
+  const nid = props.field.nodeId
+  if (!g || !nid) return null
+  const WANT = new Set(['lora_name', 'strength_model', 'strength_clip', 'lora_strength'])
+  for (const n of Object.values<any>(g)) {
+    if (!/loraloader/i.test(String(n?.class_type ?? ''))) continue
+    for (const [k, v] of Object.entries(n?.inputs ?? {})) {
+      if (!WANT.has(k) || !Array.isArray(v) || v[0] !== nid) continue
+      return { input: k, classType: String(n.class_type) }
+    }
+  }
+  return null
+})
+
+const titleTxt = computed(() => `${props.field.label} ${props.field.group}`)
+
+const isLoraStrength = computed(
+  () =>
+    /lora\s*强度/i.test(titleTxt.value) ||
+    (!!loraLink.value && loraLink.value.input !== 'lora_name')
+)
+
+const isLoraName = computed(
+  () =>
+    (/人物\s*lora/i.test(titleTxt.value) && !isLoraStrength.value) ||
+    (!!loraLink.value && loraLink.value.input === 'lora_name')
+)
+
+/** 数字字段步长：object_info 有定义用定义；离线推断——值带小数 0.1、整数 1 */
+const numStep = computed(() => {
+  const s = props.field.step
+  if (s && s > 0) return s
+  return Number.isInteger(Number(props.field.value)) ? 1 : 0.1
+})
+
+/** −/＋ 步进：浮点精度修正到 2 位，min/max 有定义时夹紧 */
+function bumpNumber(dir: 1 | -1) {
+  const f = props.field
+  let v = Number(f.value) || 0
+  v = Math.round((v + dir * numStep.value) * 100) / 100
+  if (f.min != null) v = Math.max(f.min, v)
+  if (f.max != null) v = Math.min(f.max, v)
+  f.value = v
+}
 </script>
 
 <template>
-  <div class="field">
+  <div class="field" :class="{ 'lora-cmp': isLoraName || isLoraStrength }">
     <div class="field-label">
-      <span v-if="dirty" class="dirty-dot" title="与上次提交时的值不同（提交后会熄灭）" />
       <span class="name">{{ field.label }}</span>
+      <!-- 常驻占位（只亮/灭不位移）：亮 = 与上次提交时的值不同，提交后自动熄灭。
+           放在中段弹性空隙里，出现/熄灭只占弹性区，名称与编号纹丝不动 -->
+      <span class="dirty-dot" :class="{ lit: dirty }" title="与上次提交时的值不同（提交后会熄灭）" />
       <span class="code">{{ field.nodeId }}.{{ field.inputName }}</span>
       <span v-if="field.actions?.length" class="acts">
         <button
@@ -853,8 +908,11 @@ if (props.field.kind === 'audio') loadAudioOptions()
       </span>
     </div>
 
+    <!-- 人物Lora 组件：可文本输入 + 快捷键 + 自定义快捷键（节点标题「人物Lora」或结构命中时启用） -->
+    <LoraNameField v-if="isLoraName" :field="field" />
+
     <!-- 多行文本：自带 复制/粘贴/清空 工具条，标题带「交换:A,B」时多一个交换按钮 -->
-    <template v-if="field.kind === 'textarea'">
+    <template v-else-if="field.kind === 'textarea'">
       <div class="ta-tools">
         <button class="tbtn" title="复制到剪贴板" @click="copyText">⧉ 复制</button>
         <button class="tbtn" title="粘贴到光标处" @click="pasteText">📋 粘贴</button>
@@ -916,25 +974,32 @@ if (props.field.kind === 'audio') loadAudioOptions()
       <button class="btn sm" title="随机" @click="field.value = randomSeed()">🎲</button>
     </div>
 
-    <!-- 数字 -->
-    <div v-else-if="field.kind === 'number'" class="num-row">
-      <input
-        v-model.number="field.value"
-        type="number"
-        class="input"
-        :min="field.min"
-        :max="field.max"
-        :step="field.step ?? 1"
-      />
-      <input
-        v-if="hasRange"
-        v-model.number="field.value"
-        type="range"
-        class="input"
-        :min="field.min"
-        :max="field.max"
-        :step="field.step ?? 1"
-      />
+    <!-- 人物Lora强度 组件：−/＋ 0.1 步进 + 默认快捷键 0.9~1.5 + 自定义快捷键 -->
+    <LoraStrengthField v-else-if="field.kind === 'number' && isLoraStrength" :field="field" />
+
+    <!-- 数字：−/＋ 步进按钮（步长见悬停） -->
+    <div v-else-if="field.kind === 'number'" class="num-wrap">
+      <div class="num-row">
+        <button class="btn sm step-btn" :title="`减小 ${numStep}`" @click="bumpNumber(-1)">−</button>
+        <input
+          v-model.number="field.value"
+          type="number"
+          class="input"
+          :min="field.min"
+          :max="field.max"
+          :step="field.step ?? 1"
+        />
+        <button class="btn sm step-btn" :title="`加大 ${numStep}`" @click="bumpNumber(1)">＋</button>
+        <input
+          v-if="hasRange"
+          v-model.number="field.value"
+          type="range"
+          class="input"
+          :min="field.min"
+          :max="field.max"
+          :step="field.step ?? 1"
+        />
+      </div>
     </div>
 
     <!-- 下拉 -->
@@ -1176,8 +1241,11 @@ if (props.field.kind === 'audio') loadAudioOptions()
       </div>
     </div>
 
-    <!-- 用户自定义常用提示词库（v2）：分组过滤 + 搜索（短语多时才出现），点一下追加到输入框 -->
-    <div v-if="field.kind === 'textarea' || field.kind === 'text'" class="quick-row">
+    <!-- 用户自定义常用提示词库（v2）：分组过滤 + 搜索（短语多时才出现），点一下追加到输入框（人物Lora 组件有自己的快捷键行，不出这排） -->
+    <div
+      v-if="(field.kind === 'textarea' || field.kind === 'text') && !isLoraName"
+      class="quick-row"
+    >
       <input
         v-if="quickEntries.length > 6"
         v-model="quickSearch"
@@ -1291,6 +1359,24 @@ if (props.field.kind === 'audio') loadAudioOptions()
 }
 .num-row .input[type='range'] {
   flex: 1;
+}
+/* 数字字段的 −/＋ 步进按钮 */
+.step-btn {
+  flex: none;
+  min-width: 30px;
+  padding: 0 8px;
+  font-size: 13px;
+  line-height: 1;
+}
+.chip.on {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.chip.ghost {
+  color: var(--text-faint);
+  background: transparent;
+  border-style: dashed;
 }
 .seed-row .input {
   flex: 1;

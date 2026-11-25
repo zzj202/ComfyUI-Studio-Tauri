@@ -1708,6 +1708,7 @@ export function buildFields() {
 
   // 重建后：fields 现在属于当前工作流，恢复这个工作流上次填过的值
   fieldsWorkflow = state.currentWorkflow
+  pairLoraFields(state.fields)
   const saved = fieldsWorkflow ? fieldValueCache.get(fieldsWorkflow) : undefined
   if (saved) {
     for (const f of state.fields) {
@@ -1715,6 +1716,47 @@ export function buildFields() {
       const v = saved.get(f.key)
       f.value = Array.isArray(v) ? [...v] : v
     }
+  }
+}
+
+/**
+ * 人物Lora / 人物Lora强度 组件自动配对同行：标题（人物Lora / 人物Lora强度）
+ * 或结构（喂 LoraLoader 的 lora_name / strength_model 等输入）命中的两个字段，
+ * 行号对齐到同一行——行号相同就会并排成一行两列（titleSyntax 同行机制）。
+ * 多个 lora 组按出现顺序配对；行号都没写时取现有最大行号 +1。
+ */
+function pairLoraFields(fields: FieldSchema[]) {
+  const graph = state.graph as Record<string, any> | null
+  const nameNodes = new Set<string>()
+  const strNodes = new Set<string>()
+  if (graph) {
+    for (const n of Object.values<any>(graph)) {
+      if (!/loraloader/i.test(String(n?.class_type ?? ''))) continue
+      for (const [k, v] of Object.entries(n?.inputs ?? {})) {
+        if (!Array.isArray(v)) continue
+        if (k === 'lora_name') nameNodes.add(String(v[0]))
+        else if (/^(strength_model|strength_clip|lora_strength)$/.test(k)) strNodes.add(String(v[0]))
+      }
+    }
+  }
+  const kindOf = (f: FieldSchema): 'name' | 'strength' | null => {
+    const t = `${f.label} ${f.group}`
+    if (/lora\s*强度/i.test(t) || strNodes.has(f.nodeId)) return 'strength'
+    if (/人物\s*lora/i.test(t) || nameNodes.has(f.nodeId)) return 'name'
+    return null
+  }
+  const names = fields.filter((f) => kindOf(f) === 'name')
+  const strengths = fields.filter((f) => kindOf(f) === 'strength')
+  const n = Math.min(names.length, strengths.length)
+  if (!n) return
+  const fallbackRow = Math.max(0, ...fields.map((f) => f.row ?? 0)) + 1
+  for (let i = 0; i < n; i++) {
+    const a = names[i]
+    const b = strengths[i]
+    if (a.row != null && a.row === b.row) continue
+    const row = a.row ?? b.row ?? fallbackRow
+    a.row = row
+    b.row = row
   }
 }
 

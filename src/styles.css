@@ -316,6 +316,16 @@ textarea {
   accent-color: var(--accent);
   cursor: pointer;
 }
+/* 数字输入框：藏掉原生上下小箭头（字段都配了 −/＋ 步进按钮，原生箭头又丑又容易误点） */
+.input[type='number']::-webkit-inner-spin-button,
+.input[type='number']::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.input[type='number'] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
 
 .field {
   display: flex;
@@ -335,7 +345,7 @@ textarea {
   font-weight: 500;
   white-space: nowrap; /* 中文名不折行（「自定义高度」不再断成两行） */
 }
-/* 参数改动标点：字段值与上次提交时不同就亮一个点，提交后（快照更新）自动熄灭 */
+/* 参数改动标点：常驻占位只亮/灭（v-if 会出现时把文案挤一下），亮 = 与上次提交不同 */
 .field-label .dirty-dot {
   flex: none;
   align-self: center;
@@ -344,6 +354,11 @@ textarea {
   border-radius: 50%;
   background: var(--warn);
   box-shadow: 0 0 6px var(--warn);
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.field-label .dirty-dot.lit {
+  opacity: 1;
 }
 .field-label .code {
   color: var(--text-faint);
