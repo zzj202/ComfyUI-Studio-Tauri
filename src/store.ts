@@ -3020,6 +3020,7 @@ function addAssets(job: Job) {
       read: false,
       pinned: false,
       params: job.params,
+      batchId: job.batchId,
       base,
     })
     added++

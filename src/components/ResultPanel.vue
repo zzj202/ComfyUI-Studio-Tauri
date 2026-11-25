@@ -443,6 +443,167 @@ const assets = computed(() => {
     .sort((a, b) => (b.pinned ? 1 : 0) - (a.pinned ? 1 : 0) || b.createdAt - a.createdAt)
 })
 
+// ---------------------------------------------------------------- 结果区分组 v2
+//  📌 固定一组排最前 → 各提交组（batchId，组头带运行/排队/未读状态）→ 散图（旧资产/手动加入）。
+//  组头吸顶、点击折叠（高度过渡动画）、悬停出「⬇ 本组下载」；可在「分组 / 平铺」间切换（记忆偏好）。
+
+const groupedMode = ref(true)
+try {
+  groupedMode.value = localStorage.getItem('comfyui-studio.assetGrouped:v1') !== '0'
+} catch {
+  /* ignore */
+}
+function toggleGroupedMode() {
+  groupedMode.value = !groupedMode.value
+  try {
+    localStorage.setItem('comfyui-studio.assetGrouped:v1', groupedMode.value ? '1' : '0')
+  } catch {
+    /* ignore */
+  }
+}
+
+interface AssetGroup {
+  key: string
+  label: string
+  time: number // 组内最新产出时刻
+  wf: string // 组内工作流（全部相同时显示）
+  items: Asset[]
+  unread: number
+  running: number
+  queued: number
+}
+
+const PIN_GROUP = '__pinned__'
+const LOOSE_GROUP = '__loose__'
+
+const CAG_KEY = 'comfyui-studio.collapsedAssetGroups:v1'
+function loadCollapsedAssetGroups(): Set<string> | null {
+  try {
+    const r = JSON.parse(localStorage.getItem(CAG_KEY) ?? 'null')
+    if (Array.isArray(r)) {
+      // 没存过 → 返回 null，用默认策略播种（散图组默认折叠）
+      return null
+    }
+    return new Set(Array.isArray(r) ? r.filter((x) => typeof x === 'string') : [])
+  } catch {
+    return new Set<string>()
+  }
+}
+const storedCollapsed = loadCollapsedAssetGroups()
+const collapsedAssetGroups = ref(storedCollapsed ?? new Set<string>([LOOSE_GROUP]))
+
+function saveCollapsedAssetGroups() {
+  try {
+    localStorage.setItem(CAG_KEY, JSON.stringify([...collapsedAssetGroups.value]))
+  } catch {
+    /* ignore */
+  }
+}
+
+function isGroupCollapsed(key: string): boolean {
+  // 用户没动过的组走默认策略：固定组/最新一组展开，其余折叠（组多时一眼看到最近的提交）
+  if (collapsedAssetGroups.value.has(key)) return true
+  if (storedCollapsed !== null) return false // 用户操作过 → 完全听用户的
+  const groups = assetGroups.value
+  const idx = groups.findIndex((g) => g.key === key)
+  if (idx < 0) return false
+  if (key === LOOSE_GROUP) return true
+  const real = groups.filter((g) => g.key !== PIN_GROUP && g.key !== LOOSE_GROUP)
+  return real.length > 1 && key !== real[0].key
+}
+
+function toggleAssetGroup(key: string) {
+  const s = new Set(collapsedAssetGroups.value)
+  s.has(key) ? s.delete(key) : s.add(key)
+  collapsedAssetGroups.value = s
+  saveCollapsedAssetGroups()
+}
+
+const assetGroups = computed<AssetGroup[]>(() => {
+  const list = assets.value
+  if (!list.length) return []
+  const map = new Map<string, AssetGroup>()
+  for (const a of list) {
+    const key = a.pinned ? PIN_GROUP : (a.batchId ?? LOOSE_GROUP)
+    let g = map.get(key)
+    if (!g) {
+      g = { key, label: '', time: a.createdAt, wf: a.workflow, items: [], unread: 0, running: 0, queued: 0 }
+      map.set(key, g)
+    }
+    g.items.push(a)
+    g.time = Math.max(g.time, a.createdAt)
+    if (!a.read) g.unread++
+    if (g.wf !== a.workflow) g.wf = ''
+  }
+  // 组内还有对应任务在跑/排队 → 组头亮状态（任务删了就不显示，不影响）
+  for (const g of map.values()) {
+    if (g.key === PIN_GROUP || g.key === LOOSE_GROUP) continue
+    for (const j of state.jobs) {
+      if (j.batchId !== g.key) continue
+      if (j.status === 'running') g.running++
+      else if (j.status === 'queued') g.queued++
+    }
+  }
+  const out: AssetGroup[] = []
+  const pinned = map.get(PIN_GROUP)
+  if (pinned) {
+    pinned.label = '📌 固定'
+    out.push(pinned)
+  }
+  const rest = [...map.values()]
+    .filter((g) => g.key !== PIN_GROUP)
+    .sort((x, y) => (x.key === LOOSE_GROUP ? 1 : 0) - (y.key === LOOSE_GROUP ? 1 : 0) || y.time - x.time)
+  for (const g of rest) {
+    const d = new Date(g.time)
+    const pad = (n: number) => String(n).padStart(2, '0')
+    g.label =
+      g.key === LOOSE_GROUP
+        ? '散图'
+        : `提交组 ${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+    out.push(g)
+  }
+  return out
+})
+
+/** 实际渲染的组：平铺模式合成一个匿名组（复用同一套卡片模板，免复制粘贴） */
+const displayGroups = computed<AssetGroup[]>(() => {
+  if (!groupedMode.value) {
+    const all = assets.value
+    return all.length
+      ? [{ key: '__flat__', label: '', time: 0, wf: '', items: all, unread: 0, running: 0, queued: 0 }]
+      : []
+  }
+  return assetGroups.value
+})
+
+/** 下载整组图片（用户约定：除「全部下载」外不弹确认；视频不进批量，单张仍可下载） */
+async function downloadGroup(g: AssetGroup) {
+  const imgs = g.items.filter((a) => a.kind === 'image')
+  if (!imgs.length) {
+    notify('这一组没有可下载的图片', 'warn', 4000)
+    return
+  }
+  let done = 0
+  const fails: string[] = []
+  for (const a of imgs) {
+    try {
+      await saveAssetFile(a)
+      done++
+    } catch {
+      fails.push(displayName(a))
+    }
+  }
+  if (fails.length) {
+    notify(
+      `本组已下载 ${done} 张，${fails.length} 张失败：${fails.slice(0, 3).join('、')}${fails.length > 3 ? '…' : ''}`,
+      'warn',
+      8000
+    )
+  } else {
+    notify(`本组 ${done} 张已下载到下载目录`, 'ok', 4000)
+  }
+}
+
 /** 一键导入插画板：当前筛选出的图片按生成顺序（旧→新）追加为帧（用户约定：不弹确认直接导） */
 async function importToStoryboard() {
   const b = activeBoard()
@@ -1432,6 +1593,14 @@ onUnmounted(() => {
         <button class="chip-f" :class="{ on: onlyPinned }" title="只看固定的产出" @click="onlyPinned = !onlyPinned">
           📌 固定
         </button>
+        <button
+          class="chip-f"
+          :class="{ on: groupedMode }"
+          title="按提交组分段显示（组头带状态、可折叠、可整组下载）；点击切换 分组/平铺"
+          @click="toggleGroupedMode"
+        >
+          {{ groupedMode ? '🗂 分组' : '▤ 平铺' }}
+        </button>
         <button v-if="filterActive" class="btn ghost sm" @click="resetFilters">重置筛选</button>
         <!-- 清空资产钉死在筛选条右缘（margin-left:auto）：和头部「导入插画板」不同行不相邻，位置恒定防误点 -->
         <button
@@ -1456,9 +1625,39 @@ onUnmounted(() => {
             <span class="faint">提示：J / K 键移动选择，Enter 放大，X 固定</span>
           </template>
         </div>
-        <div v-else class="grid">
-          <figure
-            v-for="a in assets"
+        <!-- 资产分组 v2：📌 固定 / 各提交组（组头吸顶 + 状态 + 整组下载）/ 散图；可切平铺 -->
+        <template v-else>
+          <section
+            v-for="g in displayGroups"
+            :key="g.key"
+            class="a-group"
+            :class="{ collapsed: groupedMode && isGroupCollapsed(g.key), solo: !groupedMode || displayGroups.length === 1 }"
+          >
+            <button
+              v-if="groupedMode && displayGroups.length > 1"
+              class="a-group-h"
+              :title="`点击${isGroupCollapsed(g.key) ? '展开' : '折叠'}「${g.label}」`"
+              @click="toggleAssetGroup(g.key)"
+            >
+              <span class="a-dot" :class="{ live: !!g.running || !!g.queued }" />
+              <span class="a-g-label">{{ g.label }}</span>
+              <span v-if="g.running" class="a-g-stat run" title="运行中">▶{{ g.running }}</span>
+              <span v-if="g.queued" class="a-g-stat" title="排队中">◌{{ g.queued }}</span>
+              <span v-if="g.unread" class="a-g-stat unread" title="未读产出数">未读 {{ g.unread }}</span>
+              <span v-if="g.wf" class="a-g-wf" :title="`工作流：${g.wf}`">{{ g.wf }}</span>
+              <span class="a-g-count" title="本组产出数">{{ g.items.length }}</span>
+              <span
+                v-if="g.items.some((a) => a.kind === 'image')"
+                class="a-g-dl"
+                title="下载本组图片到下载目录（直接执行）"
+                @click.stop="downloadGroup(g)"
+              >⬇</span>
+            </button>
+            <div class="a-collapse">
+              <div class="a-collapse-in">
+                <div class="grid">
+                  <figure
+                    v-for="a in g.items"
             :key="a.key"
             class="card"
             :class="{ 'unread-card': !a.read, 'kb-focus': a.key === gridFocus }"
@@ -1522,8 +1721,12 @@ onUnmounted(() => {
               <button class="tool" title="下载到本地" @click="downloadOne(a)">⬇</button>
               <button class="tool danger" title="移除" @click="removeAsset(a)">✕</button>
             </div>
-          </figure>
-        </div>
+                </figure>
+                </div>
+              </div>
+            </div>
+          </section>
+        </template>
       </div>
     </div>
 
@@ -2445,6 +2648,141 @@ onUnmounted(() => {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
   gap: 10px;
+}
+/* ---- 资产提交组 v2：吸顶组头（状态点 + 提交时间 + 运行/排队/未读 + 工作流 + 张数 + 本组下载），
+   组间留白 + 渐变分隔；折叠走 grid-rows 0fr→1fr 高度过渡，展开收起都是平滑的 ---- */
+.a-group {
+  padding-bottom: 14px;
+  margin-bottom: 14px;
+  border-bottom: 1px solid var(--border-soft);
+}
+.a-group:last-child {
+  padding-bottom: 0;
+  margin-bottom: 0;
+  border-bottom: none;
+}
+.a-group-h {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px;
+  margin-bottom: 8px;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: linear-gradient(90deg, var(--accent-soft), transparent 80%), var(--bg);
+  cursor: pointer;
+  text-align: left;
+  color: var(--text-dim);
+  backdrop-filter: blur(6px);
+  transition: background 0.15s, color 0.15s;
+}
+.a-group-h:hover {
+  color: var(--text);
+  background: linear-gradient(90deg, var(--accent-soft), transparent 60%), var(--bg-2);
+}
+/* 组头状态点：有任务在跑时亮主色并呼吸 */
+.a-dot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  opacity: 0.35;
+}
+.a-dot.live {
+  opacity: 1;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  animation: a-dot-pulse 1.6s ease-in-out infinite;
+}
+@keyframes a-dot-pulse {
+  50% {
+    box-shadow: 0 0 0 5px transparent;
+  }
+}
+.a-g-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+}
+.a-g-stat {
+  flex: none;
+  font-size: 10.5px;
+  line-height: 1;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  color: var(--text-dim);
+  font-variant-numeric: tabular-nums;
+}
+.a-g-stat.run {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+.a-g-stat.unread {
+  color: var(--warn);
+  border-color: #fbbf2455;
+  background: #fbbf2414;
+}
+.a-g-wf {
+  font-size: 11px;
+  color: var(--text-faint);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.a-g-count {
+  flex: none;
+  margin-left: auto;
+  font-size: 10.5px;
+  color: var(--text-faint);
+  background: var(--bg);
+  border: 1px solid var(--border-soft);
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-variant-numeric: tabular-nums;
+}
+/* 本组下载：悬停组头才出现，主色描边胶囊 */
+.a-g-dl {
+  flex: none;
+  display: none;
+  width: 22px;
+  height: 22px;
+  line-height: 20px;
+  text-align: center;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+}
+.a-group-h:hover .a-g-dl {
+  display: block;
+}
+.a-g-dl:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+/* 折叠动画：grid-template-rows 1fr→0fr 平滑收起 */
+.a-collapse {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 0.24s ease;
+}
+.a-group.collapsed .a-collapse {
+  grid-template-rows: 0fr;
+}
+.a-collapse-in {
+  overflow: hidden;
+  min-height: 0;
 }
 .card {
   position: relative;

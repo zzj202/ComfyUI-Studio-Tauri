@@ -175,4 +175,6 @@ export interface Asset {
   alias?: string
   /** 提交时的参数快照（key → 字段值），灯箱「载入参数」一键回填表单用 */
   params?: Record<string, any>
+  /** 提交批次标记（同一次提交的产出同组，结果区按组分段显示）；旧资产/手动加入的没有 */
+  batchId?: string
 }
