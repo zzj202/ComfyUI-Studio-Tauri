@@ -533,6 +533,135 @@ pub fn list_local_media(path: String) -> Result<Value, String> {
     }))
 }
 
+/// 文件名自然排序比较：数字段按数值比（1、2、…、10 正确排序，不出现 1,10,2）。
+/// 非数字段按 char 逐位比；大小写不敏感。txt 拖入合并顺序用。
+fn nat_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let (a, b) = (a.to_lowercase(), b.to_lowercase());
+    let (mut ai, mut bi) = (0usize, 0usize);
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    while ai < ab.len() && bi < bb.len() {
+        let (ca, cb) = (ab[ai], bb[bi]);
+        if ca.is_ascii_digit() && cb.is_ascii_digit() {
+            // 各吃下一段连续数字，比数值（前导零多者视为更小，长度兜底防溢出）
+            let (a0, b0) = (ai, bi);
+            while ai < ab.len() && ab[ai].is_ascii_digit() {
+                ai += 1;
+            }
+            while bi < bb.len() && bb[bi].is_ascii_digit() {
+                bi += 1;
+            }
+            let (sa, sb) = (&a[a0..ai], &b[b0..bi]);
+            let (ta, tb) = (sa.trim_start_matches('0'), sb.trim_start_matches('0'));
+            let ord = ta.len().cmp(&tb.len()).then_with(|| ta.cmp(tb)).then_with(|| sa.len().cmp(&sb.len()));
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        } else {
+            let ord = ca.cmp(&cb);
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+            ai += 1;
+            bi += 1;
+        }
+    }
+    (ab.len() - ai).cmp(&(bb.len() - bi))
+}
+
+/// 展开一个路径里的全部 txt（文件 = 自身若是 .txt；目录 = 递归收集，跳过隐藏目录）。
+/// 深度上限 8 层防环；单文件上限 16MB（提示词文本远用不到）。返回绝对路径列表。
+fn collect_txt_paths(root: &Path, out: &mut Vec<PathBuf>, depth: usize) {
+    if depth > 8 {
+        return;
+    }
+    if root.is_file() {
+        let is_txt = root
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase() == "txt")
+            .unwrap_or(false);
+        if is_txt {
+            out.push(root.to_path_buf());
+        }
+        return;
+    }
+    if !root.is_dir() {
+        return;
+    }
+    let Ok(rd) = fs::read_dir(root) else {
+        return;
+    };
+    let mut kids: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .map(|n| !n.to_string_lossy().starts_with('.'))
+                .unwrap_or(false)
+        })
+        .collect();
+    kids.sort_by(|a, b| nat_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
+    for kid in kids {
+        collect_txt_paths(&kid, out, depth + 1);
+    }
+}
+
+/// 单个 txt 解码：BOM 探测（encoding_rs 的 decode 自带 BOM 嗅探）→ UTF-8 严格 →
+/// GBK 兜底（中文 Windows 记事本 ANSI 默认编码）→ 仍有错再转 lossy 不炸整批。
+fn decode_txt(bytes: &[u8]) -> String {
+    let (t, _, errs) = encoding_rs::UTF_8.decode(bytes);
+    if !errs {
+        return t.into_owned();
+    }
+    let (t2, _, errs2) = encoding_rs::GBK.decode(bytes);
+    if !errs2 {
+        return t2.into_owned();
+    }
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// txt 拖入读文本：入参 = 拖入的文件/文件夹路径列表。展开所有 .txt（目录递归），
+/// 文件名自然排序，逐个解码读出。单个失败不炸整批，失败清单一并返回。
+/// 返回 { files, texts, failed }（files/texts 一一对应）。
+#[command]
+pub fn txt_drop_read(paths: Vec<String>) -> Result<Value, String> {
+    let mut files: Vec<PathBuf> = Vec::new();
+    for p in &paths {
+        collect_txt_paths(Path::new(p), &mut files, 0);
+    }
+    // 跨拖入项去重（同一文件夹 + 其中的文件同时拖入时）+ 全局自然排序
+    files.sort_by(|a, b| nat_cmp(&a.to_string_lossy(), &b.to_string_lossy()));
+    files.dedup();
+    let mut names: Vec<String> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    let mut failed: Vec<String> = Vec::new();
+    for f in &files {
+        let name = f
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let meta = match fs::metadata(f) {
+            Ok(m) => m,
+            Err(_) => {
+                failed.push(name);
+                continue;
+            }
+        };
+        if meta.len() > 16 * 1024 * 1024 {
+            failed.push(name);
+            continue;
+        }
+        match fs::read(f) {
+            Ok(bytes) => {
+                names.push(name);
+                texts.push(decode_txt(&bytes));
+            }
+            Err(_) => failed.push(name),
+        }
+    }
+    Ok(serde_json::json!({ "files": names, "texts": texts, "failed": failed }))
+}
+
 /// 读取本地媒体文件的字节（base64）——素材面板的「复制图片 / 视频截帧」用。
 /// asset protocol 的源对 canvas 是跨源的（drawImage 后 toBlob 抛 SecurityError），
 /// 所以字节必须经 Rust 中转拿回，前端转 blob URL（同源）再喂给 img/video/canvas。

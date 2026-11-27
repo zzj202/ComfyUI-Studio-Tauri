@@ -44,6 +44,10 @@ export const api = {
     }>('list_local_media', { path }),
   /** 读取本地媒体文件字节（base64）：素材面板复制图片/视频截帧用（asset 源跨域污染 canvas，必须 Rust 中转） */
   readLocalFile: (path: string) => invoke<string>('read_local_file', { path }),
+  /** txt 拖入读文本：展开拖入项里的全部 .txt（目录递归、跳隐藏目录）、文件名自然排序、
+   *  编码兜底 UTF-8→GBK→lossy；单文件失败不炸整批。返回 { files, texts, failed } 一一对应 */
+  txtDropRead: (paths: string[]) =>
+    invoke<{ files: string[]; texts: string[]; failed: string[] }>('txt_drop_read', { paths }),
   saveLocalBytes: (dir: string, name: string, b64: string) =>
     invoke<string>('save_local_bytes', { dir, name, b64 }),
   /** 复制本地文件进应用收藏库（favorites/），返回收藏后的路径（同名覆盖，前端按路径去重） */

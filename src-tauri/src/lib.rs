@@ -205,6 +205,7 @@ pub fn run() {
             store::path_mtimes,
             store::list_local_media,
             store::read_local_file,
+            store::txt_drop_read,
             store::save_local_bytes,
             store::copy_to_favorites,
             store::rename_local_file,

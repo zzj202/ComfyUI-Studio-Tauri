@@ -45,6 +45,9 @@ clipboard-win = "5"
 # 复制长图到剪贴板：Rust 侧把 PNG 解码成 CF_DIB（前端只传压缩字节，不搬几十 MB 的 RGBA）
 png = "0.17"
 
+# txt 拖入读编码兜底：UTF-8 失败后按 GBK 解（中文 Windows 记事本 ANSI 默认编码）
+encoding_rs = "0.8"
+
 [profile.release]
 codegen-units = 1
 lto = true

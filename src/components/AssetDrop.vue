@@ -7,7 +7,18 @@ import { groupFields, parseGraph } from '../core/parseWorkflow'
 import { addComicPaths } from '../core/comic'
 import { SB_MAX_FRAMES, activeBoard, insertStoryboardPaths, sbExtHover, type SbFrame } from '../core/storyboard'
 import { IMG_EXT_RE } from '../core/clipboard'
-import { loadWorkflows, clearDropHot, dropHot, imageDropTargets, notify, selectWorkflow, state, updateDropHot } from '../store'
+import { splitBatchLines } from '../core/batchText'
+import {
+  loadWorkflows,
+  clearDropHot,
+  dropHot,
+  imageDropTargets,
+  notify,
+  openBatchTextDialog,
+  selectWorkflow,
+  state,
+  updateDropHot,
+} from '../store'
 import { ui } from '../ui'
 
 /**
@@ -146,6 +157,18 @@ async function routeDrop(paths: string[], position: { x: number; y: number }) {
     }
   }
 
+  // ⓪¾ 提示词文本框：拖入 txt / 文件夹 → Rust 递归展开读取 → 填入字段 → 弹拆行确认。
+  // 全是图片/JSON 等已知类型时跳过（仍走原路由：拖图到文本框附近=上传参考图/反查工作流）
+  const txtKey = hitTxtKey(position)
+  if (txtKey) {
+    const knownNonTxt = (p: string) =>
+      IMG_EXT_RE.test(p) || /\.(json|mp4|webm|mov|mkv|avi|mp3|wav|flac)$/i.test(p)
+    if (!paths.every(knownNonTxt)) {
+      await dropTxtToField(paths, txtKey)
+      return
+    }
+  }
+
   // ① 工作流 JSON → 直接导入
   if (/\.json$/i.test(path)) {
     try {
@@ -179,6 +202,64 @@ function hitImageKey(position: { x: number; y: number }): string | null {
     return card?.getAttribute('data-image-key') ?? null
   } catch {
     return null
+  }
+}
+
+/** 逻辑坐标 → 找落点下的提示词文本框（FieldControl 在 ta-wrap 上标了 data-txt-drop = 字段 key） */
+function hitTxtKey(position: { x: number; y: number }): string | null {
+  try {
+    const el = document.elementFromPoint(position.x, position.y)
+    return el?.closest('[data-txt-drop]')?.getAttribute('data-txt-drop') ?? null
+  } catch {
+    return null
+  }
+}
+
+/** 单份 txt 拆块：结构化模式（编号块/字段块）直接用；按行回落视为「整文件一条提示词」
+ *  （多文件各自拆分时，多行的单条提示词文件不该被拆成一行一条）。判定：块数 ≥2 且
+ *  少于非空行数 = 有合并/剔除发生（结构化）；相等 = 每行一块（回落）。 */
+function splitOneFile(text: string): string[] {
+  const t = text.replace(/^\uFEFF/, '').trim()
+  if (!t) return []
+  const blocks = splitBatchLines(t)
+  const nonEmpty = t.split(/\r?\n/).filter((l) => l.trim()).length
+  if (blocks.length >= 2 && blocks.length < nonEmpty) return blocks
+  return [t]
+}
+
+/** txt 拖入文本框：Rust 展开读取（目录递归+自然排序+编码兜底）→ 拼接填入字段 → 弹拆行确认。
+ *  多文件时按文件各自拆分再合并——每份稿的头部说明/通用要求落在它首条之前被自然丢弃，
+ *  不会粘进上一份稿的末条（2026-11-27 30031-30039 九稿拼接实测）。 */
+async function dropTxtToField(paths: string[], fieldKey: string) {
+  const field = state.fields.find((f) => f.key === fieldKey)
+  if (!field) {
+    notify('找不到拖入目标字段（可能已切换工作流），未填入', 'warn', 5000)
+    return
+  }
+  try {
+    const r = await api.txtDropRead(paths)
+    if (!r.files.length) {
+      notify('拖入项里没有找到 txt 文件', 'warn', 4000)
+      return
+    }
+    const cleaned = r.texts.map((t) => t.replace(/^\uFEFF/, '').trim()).filter(Boolean)
+    const raw =
+      r.files.length >= 2
+        ? cleaned.flatMap((t) => splitOneFile(t)).join('\n\n')
+        : cleaned.join('\n\n')
+    field.value = raw
+    const n = splitBatchLines(raw).length
+    const failNote = r.failed.length ? `，${r.failed.length} 个读取失败` : ''
+    notify(
+      n >= 2
+        ? `已读入 ${r.files.length} 个 txt${failNote}，拆出 ${n} 条，请在弹窗里确认`
+        : `已读入 ${r.files.length} 个 txt${failNote}（不足两条，未弹拆行确认，可直接提交）`,
+      r.failed.length ? 'warn' : 'ok',
+      6000
+    )
+    if (n >= 2) openBatchTextDialog(field)
+  } catch (e) {
+    notify(`读入 txt 失败：${e}`, 'error', 8000)
   }
 }
 
@@ -251,7 +332,7 @@ function fmt(v: any): string {
         图片拖到「🎞 连续插画」栏的帧上 = 放入该帧 · 拖到其他位置 = 追加 · JSON → 导入工作流
       </div>
       <div class="sub" v-else>
-        工作流 JSON → 直接导入 · 图片拖到参数卡 → 设为参考图 · ComfyUI 产出 → 反查工作流
+        工作流 JSON → 直接导入 · 图片拖到参数卡 → 设为参考图 · txt 拖到提示词框 → 整组读入 · ComfyUI 产出 → 反查工作流
       </div>
     </div>
   </div>

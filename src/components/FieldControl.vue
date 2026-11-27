@@ -940,7 +940,8 @@ function bumpNumber(dir: 1 | -1) {
           ✂ 拆行提交
         </button>
       </div>
-      <div class="ta-wrap">
+      <!-- data-txt-drop：外部 txt/文件夹拖入的落点（AssetDrop 全局路由命中后整组读入本字段） -->
+      <div class="ta-wrap" :data-txt-drop="field.key">
         <textarea
           ref="ta"
           v-model="field.value"

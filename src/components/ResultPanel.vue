@@ -445,7 +445,7 @@ const assets = computed(() => {
 
 // ---------------------------------------------------------------- 结果区分组 v2
 //  📌 固定一组排最前 → 各提交组（batchId，组头带运行/排队/未读状态）→ 散图（旧资产/手动加入）。
-//  组头吸顶、点击折叠（高度过渡动画）、悬停出「⬇ 本组下载」；可在「分组 / 平铺」间切换（记忆偏好）。
+//  组头吸顶、点击折叠（高度过渡动画）、悬停出「⬇ 本组下载 / 🎞 导入插画板」；可在「分组 / 平铺」间切换（记忆偏好）。
 
 const groupedMode = ref(true)
 try {
@@ -477,46 +477,56 @@ const PIN_GROUP = '__pinned__'
 const LOOSE_GROUP = '__loose__'
 
 const CAG_KEY = 'comfyui-studio.collapsedAssetGroups:v1'
-function loadCollapsedAssetGroups(): Set<string> | null {
+/** 用户显式点过的组：key → 是否折叠（没出现过的组走默认策略）。
+ *  旧版存的是「折叠集合」数组——默认折叠的组点开时集合里没有它的键，
+ *  toggle 会再把它 add 回去，永远点不开（v2 已改成本表模型）。 */
+function loadGroupOverrides(): Record<string, boolean> | null {
   try {
     const r = JSON.parse(localStorage.getItem(CAG_KEY) ?? 'null')
     if (Array.isArray(r)) {
-      // 没存过 → 返回 null，用默认策略播种（散图组默认折叠）
-      return null
+      const o: Record<string, boolean> = {}
+      for (const x of r) if (typeof x === 'string') o[x] = true // 旧格式：列出的 = 显式折叠
+      return o
     }
-    return new Set(Array.isArray(r) ? r.filter((x) => typeof x === 'string') : [])
+    if (r && typeof r === 'object') {
+      const o: Record<string, boolean> = {}
+      for (const [k, v] of Object.entries(r)) if (typeof v === 'boolean') o[k] = v
+      return o
+    }
+    return null // 没存过 → 全走默认策略
   } catch {
-    return new Set<string>()
+    return {}
   }
 }
-const storedCollapsed = loadCollapsedAssetGroups()
-const collapsedAssetGroups = ref(storedCollapsed ?? new Set<string>([LOOSE_GROUP]))
+const storedOverrides = loadGroupOverrides()
+const groupOverrides = ref<Record<string, boolean>>(storedOverrides ?? {})
 
-function saveCollapsedAssetGroups() {
+function saveGroupOverrides() {
   try {
-    localStorage.setItem(CAG_KEY, JSON.stringify([...collapsedAssetGroups.value]))
+    localStorage.setItem(CAG_KEY, JSON.stringify(groupOverrides.value))
   } catch {
     /* ignore */
   }
 }
 
-function isGroupCollapsed(key: string): boolean {
-  // 用户没动过的组走默认策略：固定组/最新一组展开，其余折叠（组多时一眼看到最近的提交）
-  if (collapsedAssetGroups.value.has(key)) return true
-  if (storedCollapsed !== null) return false // 用户操作过 → 完全听用户的
-  const groups = assetGroups.value
-  const idx = groups.findIndex((g) => g.key === key)
-  if (idx < 0) return false
+/** 默认策略：📌 固定展开；散图折叠；提交组只有最新一组展开（组多时一眼看到最近的提交） */
+function defaultGroupCollapsed(key: string): boolean {
+  if (key === PIN_GROUP) return false
   if (key === LOOSE_GROUP) return true
-  const real = groups.filter((g) => g.key !== PIN_GROUP && g.key !== LOOSE_GROUP)
+  const real = assetGroups.value.filter((g) => g.key !== PIN_GROUP && g.key !== LOOSE_GROUP)
   return real.length > 1 && key !== real[0].key
 }
 
+function isGroupCollapsed(key: string): boolean {
+  const o = groupOverrides.value[key]
+  return o !== undefined ? o : defaultGroupCollapsed(key)
+}
+
+/** 翻转当前生效状态并记为显式选择（默认折叠的组点一下 = 展开，且以后都听这条记录） */
 function toggleAssetGroup(key: string) {
-  const s = new Set(collapsedAssetGroups.value)
-  s.has(key) ? s.delete(key) : s.add(key)
-  collapsedAssetGroups.value = s
-  saveCollapsedAssetGroups()
+  const next = !isGroupCollapsed(key)
+  groupOverrides.value = { ...groupOverrides.value, [key]: next }
+  saveGroupOverrides()
 }
 
 const assetGroups = computed<AssetGroup[]>(() => {
@@ -604,15 +614,10 @@ async function downloadGroup(g: AssetGroup) {
   }
 }
 
-/** 一键导入插画板：当前筛选出的图片按生成顺序（旧→新）追加为帧（用户约定：不弹确认直接导） */
-async function importToStoryboard() {
+/** 导入图片列表到当前插画板（容量检查 + 截断提示 + 自动展开插画栏，头部/组头按钮共用） */
+async function importImgsToBoard(imgs: Asset[]) {
   const b = activeBoard()
   if (!b) return
-  const imgs = [...assets.value].filter((a) => a.kind === 'image').reverse() // createdAt 升序 = 生成顺序
-  if (!imgs.length) {
-    notify('当前筛选下没有可导入的图片', 'warn', 4000)
-    return
-  }
   const room = SB_MAX_FRAMES - b.frames.length
   if (room <= 0) {
     notify(`插画板「${b.name}」已满（上限 ${SB_MAX_FRAMES} 帧）`, 'warn', 5000)
@@ -630,6 +635,26 @@ async function importToStoryboard() {
       /* ignore */
     }
   }
+}
+
+/** 一键导入插画板：当前筛选出的图片按生成顺序（旧→新）追加为帧（用户约定：不弹确认直接导） */
+async function importToStoryboard() {
+  const imgs = [...assets.value].filter((a) => a.kind === 'image').reverse() // createdAt 升序 = 生成顺序
+  if (!imgs.length) {
+    notify('当前筛选下没有可导入的图片', 'warn', 4000)
+    return
+  }
+  await importImgsToBoard(imgs)
+}
+
+/** 提交组组头「🎞」：整组图片按生成顺序（旧→新）追加为帧（与头部按钮同规则，不弹确认） */
+async function importGroupToStoryboard(g: AssetGroup) {
+  const imgs = g.items.filter((a) => a.kind === 'image').reverse() // items 按新→旧压入，反转 = 生成顺序
+  if (!imgs.length) {
+    notify('本组没有可导入的图片', 'warn', 4000)
+    return
+  }
+  await importImgsToBoard(imgs)
 }
 
 /** 清空资产：用户约定不弹确认直接清（未读和固定的本来就会保留，store 内自带提示） */
@@ -821,7 +846,7 @@ function openLb(a: Asset) {
   if (isDragClick()) return // 拖拽结束在原卡上时浏览器仍会派发 click，别误开预览
   if (!assets.value.includes(a)) return
   lightboxKey.value = a.key
-  lbPromptsOpen.value = false
+  lbPromptsOpen.value = true // 打开灯箱默认展开提示词面板（无提示词条目时浮层自身隐藏）
   markAssetRead(a)
 }
 
@@ -842,7 +867,7 @@ function stepLb(d: number) {
   }
   lightboxKey.value = assets.value[(i + d + n) % n].key
   lbEditing.value = false
-  lbPromptsOpen.value = false
+  lbPromptsOpen.value = true // 翻页时保持提示词面板展开（连续插画灯箱同款行为）
   markAssetRead(assets.value[lbIndex.value])
 }
 
@@ -1652,6 +1677,12 @@ onUnmounted(() => {
                 title="下载本组图片到下载目录（直接执行）"
                 @click.stop="downloadGroup(g)"
               >⬇</span>
+              <span
+                v-if="g.key !== '__pinned__' && g.key !== '__loose__' && g.items.some((a) => a.kind === 'image')"
+                class="a-g-dl"
+                title="导入本组图片到插画板（按生成顺序追加，直接执行）"
+                @click.stop="importGroupToStoryboard(g)"
+              >🎞</span>
             </button>
             <div class="a-collapse">
               <div class="a-collapse-in">
@@ -1766,24 +1797,29 @@ onUnmounted(() => {
           <button class="v-btn" title="截取当前帧（R）：进剪贴板，结果区留底并自动固定" @click="captureVideoFrame">📷</button>
           <span v-if="frameLabel" class="v-time">{{ frameLabel }}</span>
         </div>
-      </div>
-      <button class="nav next" title="下一张（→ / D）" @click="stepLb(1)">›</button>
-      <div
-        v-if="lbPromptsOpen && lbPromptEntries.length"
-        class="lb-prompts"
-        @click.stop
-      >
+        <!-- 提示词侧栏：stage 的 flex 兄弟节点，天然紧贴图片右缘（gap 14px）。
+             pointerdown.stop 防止长按文字误触发舞台的径向菜单；contextmenu.stop
+             放行 WebView 原生菜单——选中文本右键「复制」是基本操作 -->
         <div
-          v-for="e in lbPromptEntries"
-          :key="e.key"
-          class="lb-prompt"
-          title="点击复制"
-          @click="copyLbPrompt(e.text)"
+          v-if="lbPromptsOpen && lbPromptEntries.length"
+          class="lb-prompts"
+          @click.stop
+          @pointerdown.stop
+          @contextmenu.stop
         >
-          <span class="lp-label">{{ e.label }}</span>
-          <span class="lp-text">{{ e.text }}</span>
+          <div
+            v-for="e in lbPromptEntries"
+            :key="e.key"
+            class="lb-prompt"
+            title="点击复制整条；也可以选中部分文字后右键复制"
+            @click="copyLbPrompt(e.text)"
+          >
+            <span class="lp-label">{{ e.label }}</span>
+            <span class="lp-text">{{ e.text }}</span>
+          </div>
         </div>
       </div>
+      <button class="nav next" title="下一张（→ / D）" @click="stepLb(1)">›</button>
       <footer class="lb-foot" @click.stop>
         <template v-if="lbEditing">
           <input
@@ -2649,7 +2685,7 @@ onUnmounted(() => {
   grid-template-columns: repeat(auto-fill, minmax(128px, 1fr));
   gap: 10px;
 }
-/* ---- 资产提交组 v2：吸顶组头（状态点 + 提交时间 + 运行/排队/未读 + 工作流 + 张数 + 本组下载），
+/* ---- 资产提交组 v2：吸顶组头（状态点 + 提交时间 + 运行/排队/未读 + 工作流 + 张数 + 本组下载/导入插画板），
    组间留白 + 渐变分隔；折叠走 grid-rows 0fr→1fr 高度过渡，展开收起都是平滑的 ---- */
 .a-group {
   padding-bottom: 14px;
@@ -2749,7 +2785,7 @@ onUnmounted(() => {
   border-radius: 999px;
   font-variant-numeric: tabular-nums;
 }
-/* 本组下载：悬停组头才出现，主色描边胶囊 */
+/* 本组下载/导入插画板：悬停组头才出现，主色描边胶囊 */
 .a-g-dl {
   flex: none;
   display: none;
@@ -2770,6 +2806,9 @@ onUnmounted(() => {
 .a-g-dl:hover {
   border-color: var(--accent);
   background: var(--accent-soft);
+}
+.a-g-dl + .a-g-dl {
+  margin-left: 4px;
 }
 /* 折叠动画：grid-template-rows 1fr→0fr 平滑收起 */
 .a-collapse {
@@ -2975,6 +3014,7 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   justify-content: center;
+  gap: 14px; /* 提示词侧栏与图片的贴合间隙 */
   padding: 34px 12px 56px;
   min-width: 0;
 }
@@ -3106,52 +3146,96 @@ onUnmounted(() => {
   color: var(--accent);
 }
 /* 灯箱提示词面板：footer 上方浮层，点击条目复制 */
+/* 提示词侧栏：stage 的 flex 兄弟节点，紧贴图片右缘（与连续插画灯箱同款版式） */
 .lb-prompts {
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 42px;
-  max-height: 38%;
-  overflow: auto;
-  padding: 8px 10px;
+  position: relative;
+  flex: none;
+  align-self: center;
+  width: min(336px, 28vw);
+  max-height: 100%;
+  overflow-y: auto;
+  padding: 10px;
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--panel, rgb(16, 20, 28)) 82%, transparent);
+  backdrop-filter: blur(14px) saturate(1.15);
+  -webkit-backdrop-filter: blur(14px) saturate(1.15);
+  border: 1px solid var(--border);
+  box-shadow:
+    0 20px 56px rgba(0, 0, 0, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.06);
   display: flex;
   flex-direction: column;
   gap: 6px;
-  background: rgba(10, 12, 18, 0.82);
-  border-top: 1px solid rgba(255, 255, 255, 0.08);
-  backdrop-filter: blur(6px);
+  animation: lb-prompts-in 0.18s ease-out;
+}
+@keyframes lb-prompts-in {
+  from {
+    opacity: 0;
+    transform: translateX(14px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 .lb-prompt {
+  position: relative;
   display: flex;
-  gap: 10px;
-  align-items: baseline;
-  padding: 6px 8px;
-  border-radius: 6px;
+  flex-direction: column; /* 窄版式：标签胶囊在上、正文整行铺开 */
+  gap: 4px;
+  padding: 8px 10px;
+  border-radius: 10px;
   cursor: pointer;
+  font-size: 12px;
+  line-height: 1.6;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid transparent;
+  transition: background 0.12s, border-color 0.12s;
 }
 .lb-prompt:hover {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--accent-soft);
+  border-color: var(--accent);
+}
+/* 悬停时右上角浮现「复制」角标 */
+.lb-prompt::after {
+  content: '📋 复制';
+  position: absolute;
+  right: 8px;
+  top: 7px;
+  font-size: 10px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  opacity: 0;
+  transform: translateY(-3px);
+  transition: opacity 0.12s, transform 0.12s;
+  pointer-events: none;
+}
+.lb-prompt:hover::after {
+  opacity: 1;
+  transform: none;
 }
 .lp-label {
   flex: none;
-  max-width: 140px;
+  align-self: flex-start;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10.5px;
+  white-space: nowrap;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
-  font-size: 11px;
-  color: #9aa3b8;
 }
 .lp-text {
   flex: 1;
   min-width: 0;
-  font-size: 12.5px;
-  line-height: 1.5;
-  color: #e5e5e5;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text);
   word-break: break-word;
-  display: -webkit-box;
-  -webkit-line-clamp: 3;
-  -webkit-box-orient: vertical;
-  overflow: hidden;
 }
 .lb-pin {
   font-size: 13px;

@@ -158,6 +158,17 @@ function hitDropTarget(x: number, y: number): DropHit | null {
       }
       return { kind: 'zone', key, label, el: hot }
     }
+    // 提示词文本框（data-txt-drop = 字段 key）：仅外部文件拖入时命中——内部拖资产卡
+    // 经过文本框不显示 txt 提示（拖图松手仍走原有图片上传/反查路由）
+    const txtEl = el?.closest('[data-txt-drop]') as HTMLElement | null
+    if (txtEl && !dragGhost.item) {
+      return {
+        kind: 'zone',
+        key: 'txt:' + (txtEl.getAttribute('data-txt-drop') ?? ''),
+        label: '读入 txt 提示词到本框（多文件/文件夹整组读入，弹拆行确认）',
+        el: txtEl,
+      }
+    }
     const cardEl = el?.closest('[data-image-key]') as HTMLElement | null
     if (cardEl) {
       const key = cardEl.getAttribute('data-image-key') ?? ''
@@ -3137,7 +3148,14 @@ export function applyAssetParams(a: Asset): number {
   for (const f of state.fields) {
     const v = a.params[f.key]
     if (v === undefined) continue
-    f.value = Array.isArray(v) ? [...v] : v
+    // 多图字段：任务级快照存的是「这条任务实际用的那一张」（单字符串）——
+    // 直接灌回字符串，submit() 的 Array.isArray 检查会当成没图、误报「多图节点还没有上传图片」，
+    // 「再来一次/载入参数」必挂。单字符串包装成 1 项数组（旧版整批快照本来就是数组，[...v] 原样）
+    if (f.kind === 'multiimage') {
+      f.value = Array.isArray(v) ? [...v] : v ? [String(v)] : []
+    } else {
+      f.value = Array.isArray(v) ? [...v] : v
+    }
     n++
   }
   snapshotFieldValues()

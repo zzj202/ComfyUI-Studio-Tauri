@@ -3,7 +3,12 @@
  *
  * 两种模式（自动识别，无需选择）：
  * 1. 编号块模式——分镜/步骤类文本：每块以编号起始行开头（跨多行），整块 = 一条提示词。
- *    识别的编号形式：`1️⃣ 标题`、`1. / 1、/ 1) / 1） / 1: / 1： / 01｜标题`、`01【分类】标题`、`【1】`、
+ *    识别的编号形式：`1️⃣ 标题`、`1. / 1、/ 1) / 1） / 1: / 1： / 01｜标题`、
+ *    `1. 【标题】正文`（编号+点号+【】标题，2026-11-27 升强起点免递增——多稿拼接
+ *    编号各自从 1 重置也能整组识别）、
+ *    `01 标题`（裸编号+空格+标题，无分隔符——双人 GIF 三字段稿「01 红绳拔河 +
+ *    integrated_multimodal_description: …」2026-11-26；弱模式需递增校验，标题不跟数字防
+ *    撞时间轴/序数行）、`01【分类】标题`、`【1】`、
  *    `【1. 标题】`（【】包裹编号+点号，2026-11-21；编号分隔符后不跟数字——0.0-1.2s 这类
  *    时间轴行不是编号，防止把整稿的编号序列打断回落按行拆）、`【图1｜下班进门 · 有字版】标题`（前缀词+数字+竖线，四格漫画格子批量稿；
  *    分隔符扩到 ·・:：、——`【参考图1 · 小金毛抱臂生气】正文` 2026-11-23 同支持；
@@ -96,6 +101,10 @@ function blockStartNum(line: string): BlockStart | null {
   }
   m = line.match(/^\s*(\d{1,3})\s*[【\[][^】\]]*[】\]]/) // 01【双人互动】标题（行首编号+【分类】包裹，表情包批量稿常用）
   if (m) return { n: Number(m[1]), strong: true }
+  m = line.match(/^\s*(\d{1,3})\s*[.、．]\s*[【\[]/) // 1. 【标题】正文（编号+点号+【】标题，参考图批量稿常用；
+  if (m) return { n: Number(m[1]), strong: true } // 【】标题特征强 → 强模式免递增校验：多个 txt/多稿拼接时
+  // 各自从 1 重置也能整组识别（2026-11-27 30031/30032 双稿拖入实测：弱模式递增校验
+  // 会被第二稿的重置编号打断，整体回落按行拆，头部/通用要求全变条目）
   m = line.match(/^\s*[-=_*]{3,}\s*(\d{1,3})\s*[｜|]\s*\S/) // ========== 01 | 标题 ==========（分隔线行内包裹编号式，英文批量稿常用）
   if (m) return { n: Number(m[1]), strong: true }
   m = line.match(/^\s*[-=_*]{3,}\s*提示词\s*(\d{1,3})(?:-\d{1,3})?\s*[-=_*]{3,}/) // --- 提示词 1-1 ---（分隔线包裹提示词编号，英文视频字段块批量稿；不修复会被字段块锚点把标题行与 For the target video 行丢块外）
@@ -113,6 +122,8 @@ function blockStartNum(line: string): BlockStart | null {
     const mdhead = /^\s*#{2,4}\s*\d+\b\s*[.、．]?\s*\S/.test(line)
     return { n: Number(m[1]), strong: true, kind: mdhead ? 'mdhead' : undefined }
   }
+  m = line.match(/^\s*(\d{1,3})\s+(?!\d)(\S.*)$/) // 01 标题（裸编号+空格+标题，无任何分隔符；
+  if (m) return { n: Number(m[1]), strong: false } // 弱模式递增校验；(?!\d) 防撞「1 2 3」并列数字行）
   return null
 }
 
@@ -136,6 +147,17 @@ export function splitBatchLines(text: string): string[] {
       // 中文标签不会撞 FIELD_LABEL_RE 的 ASCII 字段块锚点，两类模式互不干扰）
       const t = l.match(/^\s*标题\s*[：:]\s*(\S.*)$/)
       if (t) return { i, n: ++titleSeq, strong: true, kind: undefined }
+      // 裸标题行 + 字段块（2026-11-27 农场稿「农场·播种」+ integrated_multimodal_description：
+      // 无任何编号/包裹的独立标题行，下一个非空行是 ASCII 字段标签 → 该行是条目起点，
+      // 标题随块保留——原行为下标题行掉进上一块尾部、首条标题丢失）。
+      // 约束防误判：无空白、无句末标点、2-20 字、CJK 开头（英文说明行带空格进不来）
+      if (/^[一-鿿][一-鿿·・×—\-0-9]{1,19}$/.test(l)) {
+        let k = i + 1
+        while (k < lines.length && !lines[k].trim()) k++
+        if (k < lines.length && FIELD_LABEL_RE.test(lines[k])) {
+          return { i, n: ++titleSeq, strong: true, kind: undefined }
+        }
+      }
       return { i, n: null, strong: false, kind: undefined }
     })
     .filter((x): x is { i: number; n: number; strong: boolean; kind?: 'mdhead' | 'shot' } => x.n != null)
@@ -145,16 +167,39 @@ export function splitBatchLines(text: string): string[] {
     for (let i = starts.length - 1; i >= 0; i--) if (starts[i].kind === 'shot') starts.splice(i, 1)
   }
   if (starts.length >= 2) {
-    const nums = starts.map((s) => s.n)
-    const allStrong = starts.every((s) => s.strong)
+    // 弱编号前言段吞并（2026-11-27 30033+ 参考图稿）：正文条目是强模式 `N. 【标题】`，
+    // 但稿子头部带弱编号的「通用要求」逐条说明（1. 角色召唤… 6. 每条内…），弱模式递增
+    // 校验会被强条目的重置编号打断 → 整体回落按行拆。规则：一段严格递增的弱起点，
+    // 紧跟一个编号 ≤ 其末尾的强起点（= 正文条目重新从 1 计数）→ 该弱段是前言：
+    // 整段吞掉不产生条目，其内容随段丢弃（多稿拼接时也不粘进上一稿末条）。
+    const skip = new Set<number>()
+    {
+      let i = 0
+      while (i < starts.length) {
+        if (starts[i].strong) {
+          i++
+          continue
+        }
+        let j = i
+        while (j + 1 < starts.length && !starts[j + 1].strong && starts[j + 1].n > starts[j].n) j++
+        if (j + 1 < starts.length && starts[j + 1].strong && starts[j + 1].n <= starts[j].n) {
+          for (let k = i; k <= j; k++) skip.add(k)
+        }
+        i = j + 1
+      }
+    }
+    const eff = starts.filter((_, k) => !skip.has(k))
+    const nums = eff.map((s) => s.n)
+    const allStrong = eff.every((s) => s.strong)
     const increasing = nums.every((n, i) => i === 0 || n > nums[i - 1])
-    if (allStrong || increasing) {
+    if (eff.length >= 2 && (allStrong || increasing)) {
       // 块首行若为「分隔线+编号+标题+分隔线」包裹式，剥掉首尾分隔线段
       // （========== 01 | 标题 ========== → 01 | 标题），提交的提示词不带 ==== 前后缀
       const stripWrappedSep = (l: string) =>
         l.replace(/^\s*[-=_*]{3,}\s*/, '').replace(/\s*[-=_*]{3,}\s*$/, '')
       const blocks: string[] = []
       starts.forEach((s, k) => {
+        if (skip.has(k)) return // 前言弱编号段：连同其内容整段丢弃，不产生条目
         const end = k + 1 < starts.length ? starts[k + 1].i : lines.length
         const chunk = lines
           .slice(s.i, end)
@@ -253,6 +298,7 @@ function sanitizeFileName(s: string): string {
  *  识别 splitBatchLines 同款的块首标题语法（整行匹配，行内 anywhere 也兜底）：
  *  - 【第 31 条｜携手拜年：《春节拜年词表》】 → 「31 携手拜年：《春节拜年词表》」
  *  - 【01｜双人互动】 / 01｜标题            → 「01 双人互动」
+ *  - 01 红绳拔河（裸编号+空格，无分隔符）    → 「01 红绳拔河」
  *  - ## 1. 坐下（Markdown 标题编号）        → 「1 坐下」
  *  - 提示词 3：标题                          → 「3 标题」
  *  - 【纯标题至少四字】（无数字整行包裹）    → 「纯标题」
@@ -314,9 +360,10 @@ export function extractPromptTitle(text: string): string | null {
       const tail = m[3].trim()
       return sanitizeFileName(`${m[1]}${m[2]} ${tail.length <= 60 ? tail : tail.slice(0, 60)}`)
     }
-    // 01【双人互动】击掌！说定了（行首编号+【分类】+标题）：建议 = 编号 分类 标题；
+    // 01【双人互动】击掌！说定了（行首编号+【分类】+标题）/ 1. 【伸爪击掌】小金毛……
+    // （编号+点号分隔+【标题】，2026-11-26 伸爪测试稿）：建议 = 编号 分类 标题；
     // 标题超长（正文粘成一行）时只取分类，避免建议名被正文撑爆
-    m = line.match(/^(\d{1,3})\s*[【\[]\s*([^】\]]{1,30})\s*[】\]]\s*(.*)$/)
+    m = line.match(/^(\d{1,3})\s*[.、)）：:｜]?\s*[【\[]\s*([^】\]]{1,30})\s*[】\]]\s*(.*)$/)
     if (m) {
       const tail = m[3].trim()
       return sanitizeFileName(tail && tail.length <= 60 ? `${m[1]} ${m[2]} ${tail}` : `${m[1]} ${m[2]}`)
@@ -344,6 +391,17 @@ export function extractPromptTitle(text: string): string | null {
       const title = m[2].split(/\s*[｜|]\s*/).pop() ?? m[2]
       return sanitizeFileName(`${m[1]} ${title}`)
     }
+    // 01 红绳拔河（裸编号+空格+标题，无分隔符无包裹；2026-11-26 双人 GIF 三字段稿条目行）
+    // 与 splitBatchLines 同款分支：标题过长（正文粘行）截到 60 字
+    m = line.match(/^(\d{1,3})\s+(?!\d)(\S.*)$/)
+    if (m) {
+      const tail = m[2].trim()
+      return sanitizeFileName(`${m[1]} ${tail.length <= 60 ? tail : tail.slice(0, 60)}`)
+    }
+    // 农场·播种（无编号裸标题行独立成行；与 splitBatchLines 同款约束：无空白、CJK 开头、
+    // 2-20 字、无句末标点。2026-11-27 农场三字段稿，建议 = 标题本身）
+    m = line.match(/^([一-鿿][一-鿿·・×—\-0-9]{1,19})$/)
+    if (m) return sanitizeFileName(m[1])
   }
   return null
 }

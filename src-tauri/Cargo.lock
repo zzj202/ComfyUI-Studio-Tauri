@@ -498,6 +498,7 @@ dependencies = [
  "base64 0.22.1",
  "clipboard-win",
  "dirs 5.0.1",
+ "encoding_rs",
  "flate2",
  "png 0.17.16",
  "reqwest 0.12.28",
